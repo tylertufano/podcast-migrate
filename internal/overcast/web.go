@@ -98,12 +98,34 @@ func Login(ctx context.Context, email, password string) (*http.Client, error) {
 	return client, nil
 }
 
+// RateLimitError is returned when Overcast responds with HTTP 429.
+// The Wait field holds how long to pause before the next attempt.
+type RateLimitError struct {
+	Wait time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("overcast/web: rate limited (HTTP 429) — retry after %v", e.Wait)
+}
+
+// rateLimitWait extracts the Retry-After delay from a 429 response, falling back
+// to defaultWait if the header is absent or unparseable.
+func rateLimitWait(resp *http.Response, defaultWait time.Duration) time.Duration {
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return defaultWait
+}
+
 // FetchEpisodeNumericID loads an Overcast episode page and extracts the internal
 // numeric ID from the data-item-id HTML attribute. The numeric ID is required by
 // the set_progress endpoint.
 //
 // episodeURL must be of the form "https://overcast.fm/+XXXXXXXX". The client must
 // be authenticated (obtained from Login) so Overcast serves the player page.
+// Returns *RateLimitError if the server responds with HTTP 429.
 func FetchEpisodeNumericID(ctx context.Context, client *http.Client, episodeURL string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, episodeURL, nil)
 	if err != nil {
@@ -115,15 +137,14 @@ func FetchEpisodeNumericID(ctx context.Context, client *http.Client, episodeURL 
 	if err != nil {
 		return "", fmt.Errorf("overcast/web: GET %s: %w", episodeURL, err)
 	}
-	defer func() { _, _ = io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	_ = resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return "", &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("overcast/web: GET %s returned HTTP %d", episodeURL, resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("overcast/web: read body for %s: %w", episodeURL, err)
 	}
 
 	m := numericIDRe.FindSubmatch(body)
@@ -165,6 +186,9 @@ func SetProgress(ctx context.Context, client *http.Client, numericID string, pos
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	_ = resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		excerpt := bodyExcerpt(body)
 		return fmt.Errorf("overcast/web: set_progress %s returned HTTP %d: %s", numericID, resp.StatusCode, excerpt)
@@ -269,6 +293,9 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("overcast/web: GET %s returned HTTP %d", podcastPageURL, resp.StatusCode)
 	}

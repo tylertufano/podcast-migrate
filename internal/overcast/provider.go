@@ -2,10 +2,10 @@ package overcast
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/model"
@@ -198,14 +198,31 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 			pos = PlayedSentinel
 		}
 
-		if err := SetProgress(ctx, httpClient, numericID, pos); err != nil {
+		var setErr error
+		for attempt := 0; attempt < 4; attempt++ {
+			setErr = SetProgress(ctx, httpClient, numericID, pos)
+			if setErr == nil {
+				break
+			}
+			var rl *RateLimitError
+			if errors.As(setErr, &rl) {
+				fmt.Printf("\n  rate limited (429) — pausing %v before retry...\n", rl.Wait)
+				select {
+				case <-ctx.Done():
+					return updated, ctx.Err()
+				case <-time.After(rl.Wait):
+				}
+				continue
+			}
+			break // non-rate-limit error — don't retry
+		}
+		if setErr != nil {
 			fmt.Printf("  [%d/%d] FAILED %q (id=%s): %v\n",
-				updated+apiSkipped+1, toUpdate, ep.Title, numericID, err)
+				updated+apiSkipped+1, toUpdate, ep.Title, numericID, setErr)
 			apiSkipped++
 
-			// If the first call already indicates an auth failure, abort immediately
-			// rather than attempting the remaining ~1200 calls against a dead session.
-			if updated == 0 && apiSkipped == 1 && strings.Contains(err.Error(), "login") {
+			// If the first call already indicates an auth failure, abort immediately.
+			if updated == 0 && apiSkipped == 1 && strings.Contains(setErr.Error(), "login") {
 				return 0, fmt.Errorf("overcast: aborting — first set_progress call redirected to login page.\n" +
 					"This usually means the password is wrong or the account requires 2FA.\n" +
 					"Verify your credentials and try again")
@@ -228,9 +245,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 			fmt.Printf("  [%d/%d] ✓ %q → %s\n", updated, toUpdate, title, posStr)
 		}
 
-		// Brief pause between requests — be polite to Overcast's servers and
-		// avoid triggering any rate limiting on the unofficial endpoint.
-		time.Sleep(80 * time.Millisecond)
+		// 150 ms between set_progress calls — polite to Overcast's servers.
+		time.Sleep(150 * time.Millisecond)
 	}
 
 	if apiSkipped > 0 {
@@ -305,10 +321,19 @@ func augmentIndexFromPodcastPages(
 
 		listings, err := FetchPodcastEpisodes(ctx, client, pageURL)
 		if err != nil {
-			fmt.Printf("  warning: %s: %v\n", pageURL, err)
-			continue
+			var rl *RateLimitError
+			if errors.As(err, &rl) {
+				fmt.Printf("  rate limited fetching podcast page — waiting %v...\n", rl.Wait)
+				time.Sleep(rl.Wait)
+				// Retry once
+				listings, err = FetchPodcastEpisodes(ctx, client, pageURL)
+			}
+			if err != nil {
+				fmt.Printf("  warning: %s: %v\n", pageURL, err)
+				continue
+			}
 		}
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond) // 2 podcast pages/sec max
 
 		// Build date → episode URL map for this podcast page.
 		// Key is "YYYY-MM-DD"; Overcast pages use day-level precision.
@@ -347,47 +372,69 @@ func augmentIndexFromPodcastPages(
 	}
 	fmt.Printf("overcast: fetching numeric IDs for %d additional episode(s) via podcast pages...\n", len(pending))
 
-	// Step 3: resolve hashes → numeric IDs with a worker pool.
-	const webWorkers = 8
-	type result struct {
-		idx       int
-		numericID string
-		err       error
-	}
+	// Step 3: resolve hashes → numeric IDs sequentially with retry on 429.
+	// Sequential (one request at a time) keeps us well within Overcast's
+	// undocumented rate limit. At ~300ms per request, 10 K episodes ≈ 50 min.
+	const (
+		fetchInterval  = 300 * time.Millisecond
+		maxFetchRetries = 4
+	)
 
-	jobs := make(chan int, len(pending))
-	for i := range pending {
-		jobs <- i
-	}
-	close(jobs)
-
-	results := make([]result, len(pending))
-	var wg sync.WaitGroup
-	for w := 0; w < webWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range jobs {
-				id, err := FetchEpisodeNumericID(ctx, client, pending[i].episodeURL)
-				results[i] = result{i, id, err}
-				time.Sleep(50 * time.Millisecond) // per-worker rate limit
-			}
-		}()
-	}
-	wg.Wait()
-
-	// Merge resolved IDs into the index.
 	added := 0
-	for _, r := range results {
-		if r.err != nil || r.numericID == "" {
-			continue
+	consecutiveErrors := 0
+	for i, item := range pending {
+		var numericID string
+		for attempt := 0; attempt < maxFetchRetries; attempt++ {
+			if attempt > 0 {
+				// Exponential backoff: 30 s, 60 s, 120 s.
+				wait := time.Duration(1<<uint(attempt)) * 30 * time.Second
+				fmt.Printf("  rate limited — waiting %v before retry (attempt %d/%d)...\n",
+					wait, attempt+1, maxFetchRetries)
+				select {
+				case <-ctx.Done():
+					return added
+				case <-time.After(wait):
+				}
+			}
+
+			id, err := FetchEpisodeNumericID(ctx, client, item.episodeURL)
+			if err != nil {
+				var rl *RateLimitError
+				if errors.As(err, &rl) {
+					fmt.Printf("  rate limited (429) — waiting %v\n", rl.Wait)
+					select {
+					case <-ctx.Done():
+						return added
+					case <-time.After(rl.Wait):
+					}
+					continue // retry same attempt slot
+				}
+				consecutiveErrors++
+				if consecutiveErrors > 10 {
+					fmt.Printf("  too many consecutive errors, stopping extended matching\n")
+					return added
+				}
+				break // non-rate-limit error — skip this episode
+			}
+			numericID = id
+			consecutiveErrors = 0
+			break
 		}
-		p := pending[r.idx]
-		key := "feeddate:" + p.feedURL + "|" + p.dateRFC3339
-		if _, exists := index[key]; !exists {
-			index[key] = overcastIndexEntry{numericID: r.numericID}
-			added++
+
+		if numericID != "" {
+			key := "feeddate:" + item.feedURL + "|" + item.dateRFC3339
+			if _, exists := index[key]; !exists {
+				index[key] = overcastIndexEntry{numericID: numericID}
+				added++
+			}
 		}
+
+		if (i+1)%200 == 0 {
+			fmt.Printf("  resolved %d/%d episode IDs (%d added to index)\n",
+				i+1, len(pending), added)
+		}
+
+		time.Sleep(fetchInterval)
 	}
 
 	_ = matched // matched is the upper bound; added is the confirmed count

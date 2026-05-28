@@ -155,7 +155,7 @@ func TestOvercastOPMLReader_PlayedDominatesProgress(t *testing.T) {
 	}
 }
 
-func TestOvercastOPMLReader_ParsesPubDate(t *testing.T) {
+func TestOvercastOPMLReader_ParsesPubDateRFC1123Z(t *testing.T) {
 	path := writeOvercastOPML(t, `<?xml version="1.0" encoding="UTF-8"?>
 <opml version="2.0">
   <body>
@@ -172,9 +172,42 @@ func TestOvercastOPMLReader_ParsesPubDate(t *testing.T) {
 		t.Fatalf("Read: %v", err)
 	}
 	ep := lib.Episodes[0]
-	want, _ := time.Parse(time.RFC1123, "Mon, 15 Jan 2024 12:00:00 +0000")
+	want, err := time.Parse(time.RFC1123Z, "Mon, 15 Jan 2024 12:00:00 +0000")
+	if err != nil {
+		t.Fatalf("parse want: %v", err)
+	}
 	if !ep.PubDate.Equal(want) {
 		t.Errorf("PubDate: got %v, want %v", ep.PubDate, want)
+	}
+}
+
+func TestOvercastOPMLReader_ParsesPubDateRFC3339(t *testing.T) {
+	// The extended OPML export uses RFC3339 format — this is the common case.
+	path := writeOvercastOPML(t, `<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <body>
+    <outline text="Show A" type="rss" xmlUrl="https://feeds.example.com/show-a">
+      <outline type="podcast" title="Episode One" url="https://media.example.com/ep1.mp3"
+               overcastId="oc-1" played="1" progress="0"
+               pubDate="2024-01-15T12:00:00-05:00"/>
+    </outline>
+  </body>
+</opml>`)
+
+	lib, err := overcast.NewOPMLReader(path).Read(context.Background())
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	ep := lib.Episodes[0]
+	want, err := time.Parse(time.RFC3339, "2024-01-15T12:00:00-05:00")
+	if err != nil {
+		t.Fatalf("parse want: %v", err)
+	}
+	if !ep.PubDate.Equal(want) {
+		t.Errorf("PubDate: got %v, want %v", ep.PubDate, want)
+	}
+	if ep.PubDate.IsZero() {
+		t.Error("PubDate must not be zero for RFC3339 input")
 	}
 }
 

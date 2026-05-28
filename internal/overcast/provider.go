@@ -124,9 +124,9 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 // then posts set_progress for each matched episode that has play state.
 // Returns the number of episodes successfully updated.
 func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dryRun bool) (int, error) {
-	// 1. Read the Overcast OPML to build a (pubDate+feedURL → overcastURL) index.
-	//    We deliberately don't use overcastId as the GUID key here because it won't
-	//    match the RSS GUIDs in lib (which came from Apple Podcasts or another source).
+	// 1. Read the Overcast extended OPML to build a (pubDate+feedURL → numericID) index.
+	//    We match by pub date and feed URL rather than GUID because the overcastId in
+	//    the OPML is Overcast's internal numeric ID, not the RSS <guid> value.
 	overcastLib, err := NewOPMLReader(p.importOPMLPath).Read(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("overcast: read OPML for play state matching: %w", err)
@@ -155,10 +155,10 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 		return 0, fmt.Errorf("overcast: authentication failed: %w", err)
 	}
 
-	// 3. For each episode with play state, find its Overcast URL, fetch the numeric
-	//    ID, and post set_progress. Failures on individual episodes are logged and
-	//    skipped rather than aborting the whole run.
-	numericIDCache := map[string]string{} // overcastURL → numericID
+	// 3. For each episode with play state, look up its Overcast numeric ID and post
+	//    set_progress. The numeric ID (overcastId) comes directly from the OPML and
+	//    equals data-item-id — no per-episode page fetch needed.
+	//    Failures on individual episodes are logged and skipped rather than aborting.
 	updated := 0
 	skipped := 0
 
@@ -167,24 +167,10 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 			continue
 		}
 
-		overcastURL, ok := findInOvercastIndex(index, ep)
+		numericID, ok := findInOvercastIndex(index, ep)
 		if !ok {
 			skipped++
 			continue
-		}
-
-		// Fetch numeric ID (cached to avoid re-fetching the same page).
-		numericID, cached := numericIDCache[overcastURL]
-		if !cached {
-			id, err := FetchEpisodeNumericID(ctx, httpClient, overcastURL)
-			if err != nil {
-				fmt.Printf("  warning: episode %d/%d (%q): %v — skipping\n",
-					i+1, len(lib.Episodes), ep.Title, err)
-				skipped++
-				continue
-			}
-			numericIDCache[overcastURL] = id
-			numericID = id
 		}
 
 		pos := int(ep.PlayPosition.Seconds())
@@ -207,23 +193,26 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 	return updated, nil
 }
 
-// overcastIndexEntry holds a resolved Overcast episode URL alongside its index keys.
+// overcastIndexEntry holds the Overcast numeric ID needed to update an episode's progress.
+// The numeric ID (overcastId from the OPML) equals the data-item-id HTML attribute and is
+// used directly in POST /podcasts/set_progress/{numericID} — no page fetch required.
 type overcastIndexEntry struct {
-	overcastURL string // "https://overcast.fm/+XXXXXXXX"
+	numericID string // overcastId value, e.g. "2891974064154832"
 }
 
-// buildOvercastIndex creates a lookup map from match keys to Overcast episode URLs.
-// Each Overcast episode is indexed by pubDate+feedURL and title+feedURL (as fallback).
-// The GUID key is intentionally omitted because the overcastId ≠ RSS GUID.
+// buildOvercastIndex creates a lookup map from match keys to Overcast numeric episode IDs.
+// Each Overcast episode is indexed by pubDate+feedURL (primary) and title+feedURL (fallback).
+// The GUID key is intentionally omitted: overcastId ≠ RSS GUID, so GUID keys from Apple
+// Podcasts will never match an overcastId.
 func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 	index := make(map[string]overcastIndexEntry)
 	for _, ep := range lib.Episodes {
 		if ep.GUID == "" {
-			continue // need overcastId to construct the URL
+			continue // need overcastId to call set_progress
 		}
-		entry := overcastIndexEntry{
-			overcastURL: overcastBaseURL + "/+" + ep.GUID,
-		}
+		// ep.GUID stores the overcastId value (confirmed == data-item-id for set_progress).
+		entry := overcastIndexEntry{numericID: ep.GUID}
+
 		// Primary key: pubDate + feedURL (most precise).
 		if !ep.PubDate.IsZero() && ep.FeedURL != "" {
 			key := "feeddate:" + ep.FeedURL + "|" + ep.PubDate.UTC().Format(time.RFC3339)
@@ -242,18 +231,19 @@ func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 	return index
 }
 
-// findInOvercastIndex looks up an episode using pubDate+feedURL then title+feedURL.
+// findInOvercastIndex looks up an episode by pubDate+feedURL then title+feedURL.
+// Returns the Overcast numeric ID (for use in set_progress) and whether a match was found.
 func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState) (string, bool) {
 	if !ep.PubDate.IsZero() && ep.FeedURL != "" {
 		key := "feeddate:" + ep.FeedURL + "|" + ep.PubDate.UTC().Format(time.RFC3339)
 		if entry, ok := index[key]; ok {
-			return entry.overcastURL, true
+			return entry.numericID, true
 		}
 	}
 	if ep.FeedURL != "" && ep.Title != "" {
 		key := "feedtitle:" + ep.FeedURL + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
 		if entry, ok := index[key]; ok {
-			return entry.overcastURL, true
+			return entry.numericID, true
 		}
 	}
 	return "", false

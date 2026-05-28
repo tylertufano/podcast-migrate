@@ -1,0 +1,9 @@
+# Build output
+podcast-migrate
+
+# Go test cache and coverage artifacts
+*.out
+*.test
+
+# macOS
+.DS_Store

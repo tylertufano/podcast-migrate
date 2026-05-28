@@ -7,3 +7,4 @@ podcast-migrate
 
 # macOS
 .DS_Store
+dist/

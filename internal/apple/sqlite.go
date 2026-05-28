@@ -67,16 +67,20 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 	//
 	// Excluded feed patterns (counted in skippedPodcasts):
 	//   "internal://" — Apple-exclusive shows with no public RSS feed.
-	//   "%.plus.npr.org%" — NPR Plus membership feeds that embed a user-specific
-	//       auth token in the URL path. No other podcast app can subscribe to these
-	//       because the token is Apple-account-specific; Overcast's OPML importer
-	//       will fail to validate them and abort the entire import.
+	//   "%/eyJ%" — Feeds whose URL path contains a JWT authentication token
+	//       (base64-encoded JSON; "eyJ" decodes to '{"'). Several podcast
+	//       subscription platforms embed a user-specific signed token directly
+	//       in the feed URL (NPR Plus, Slate Plus via supportingcast.fm, etc.).
+	//       These URLs are Apple-account-specific and fail to validate in any
+	//       other app — Overcast's OPML importer aborts the entire import batch
+	//       when it encounters them. Search for these shows by name in Overcast
+	//       to subscribe via their public feeds.
 	const q = `
 		SELECT ZFEEDURL, ZTITLE, ZAUTHOR, ZIMAGEURL
 		FROM ZMTPODCAST
 		WHERE ZSUBSCRIBED = 1
 		  AND (ZFEEDURL LIKE 'http://%' OR ZFEEDURL LIKE 'https://%')
-		  AND ZFEEDURL NOT LIKE '%.plus.npr.org%'
+		  AND ZFEEDURL NOT LIKE '%/eyJ%'
 		ORDER BY ZTITLE`
 
 	rows, err := db.QueryContext(ctx, q)
@@ -111,7 +115,7 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 		  AND ZFEEDURL IS NOT NULL
 		  AND (
 		        ZFEEDURL NOT LIKE 'http://%' AND ZFEEDURL NOT LIKE 'https://%'
-		        OR ZFEEDURL LIKE '%.plus.npr.org%'
+		        OR ZFEEDURL LIKE '%/eyJ%'
 		      )`
 
 	var skipped int

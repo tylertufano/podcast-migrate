@@ -27,7 +27,9 @@ func (r Result) String() string {
 	s := fmt.Sprintf("%ssubscriptions added: %d  episodes updated: %d  skipped: %d",
 		prefix, r.SubscriptionsAdded, r.EpisodesUpdated, r.EpisodesSkipped)
 	if r.SkippedInternalPodcasts > 0 {
-		s += fmt.Sprintf("\nnote: %d podcast(s) were excluded — they use Apple-internal feed URLs (no public RSS feed exists).",
+		s += fmt.Sprintf("\nnote: %d podcast(s) were excluded — they use Apple-internal or platform-authenticated feed URLs\n"+
+			"      (internal:// Apple-exclusive shows, NPR Plus membership feeds, etc.) that no other app can subscribe to.\n"+
+			"      Search for these shows by name in Overcast to find their public feeds.",
 			r.SkippedInternalPodcasts)
 	}
 	if r.SkippedPaywalledEpisodes > 0 {

@@ -34,7 +34,7 @@ type overcastFeedOutline struct {
 	Text    string                   `xml:"text,attr"`
 	Type    string                   `xml:"type,attr"`
 	XMLURL  string                   `xml:"xmlUrl,attr"`
-	HTMLURL string                   `xml:"htmlUrl,attr"`
+	HTMLURL string                   `xml:"htmlUrl,attr,omitempty"` // omit when empty — some parsers reject empty attributes
 	// Overcast nests episode outlines inside each feed outline.
 	Episodes []overcastEpisodeOutline `xml:"outline"`
 }

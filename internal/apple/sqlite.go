@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/model"
@@ -61,15 +63,20 @@ func (r *SQLiteReader) Read(ctx context.Context) (*model.Library, error) {
 }
 
 func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Podcast, int, error) {
-	// Restrict to http/https feeds. The "internal://" scheme is used by
-	// Apple-exclusive shows that have no public RSS feed — no other app can
-	// subscribe to them, so including them in an export would produce invalid
-	// entries. Any future non-HTTP schemes are excluded by the same filter.
+	// Restrict to publicly subscribable http/https feeds.
+	//
+	// Excluded feed patterns (counted in skippedPodcasts):
+	//   "internal://" — Apple-exclusive shows with no public RSS feed.
+	//   "%.plus.npr.org%" — NPR Plus membership feeds that embed a user-specific
+	//       auth token in the URL path. No other podcast app can subscribe to these
+	//       because the token is Apple-account-specific; Overcast's OPML importer
+	//       will fail to validate them and abort the entire import.
 	const q = `
 		SELECT ZFEEDURL, ZTITLE, ZAUTHOR, ZIMAGEURL
 		FROM ZMTPODCAST
 		WHERE ZSUBSCRIBED = 1
 		  AND (ZFEEDURL LIKE 'http://%' OR ZFEEDURL LIKE 'https://%')
+		  AND ZFEEDURL NOT LIKE '%.plus.npr.org%'
 		ORDER BY ZTITLE`
 
 	rows, err := db.QueryContext(ctx, q)
@@ -88,23 +95,55 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 		if imageURL.Valid {
 			p.ImageURL = imageURL.String
 		}
+		// Strip Apple-added cache-buster parameters (e.g. ?t=1234567890) that
+		// are appended to feed URLs to force a refresh. They are not part of the
+		// canonical feed URL and can break feed resolution in other apps.
+		p.FeedURL = cleanFeedURL(p.FeedURL)
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
 
-	const countInternal = `
+	const countSkipped = `
 		SELECT COUNT(*) FROM ZMTPODCAST
 		WHERE ZSUBSCRIBED = 1
 		  AND ZFEEDURL IS NOT NULL
-		  AND ZFEEDURL NOT LIKE 'http://%'
-		  AND ZFEEDURL NOT LIKE 'https://%'`
+		  AND (
+		        ZFEEDURL NOT LIKE 'http://%' AND ZFEEDURL NOT LIKE 'https://%'
+		        OR ZFEEDURL LIKE '%.plus.npr.org%'
+		      )`
 
 	var skipped int
-	_ = db.QueryRowContext(ctx, countInternal).Scan(&skipped)
+	_ = db.QueryRowContext(ctx, countSkipped).Scan(&skipped)
 
 	return out, skipped, nil
+}
+
+// cleanFeedURL removes transient query parameters that Apple Podcasts appends to
+// feed URLs (currently "t", a millisecond timestamp used as a cache-buster).
+// These parameters are not part of the canonical feed URL and cause failures when
+// other apps try to subscribe.
+func cleanFeedURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.RawQuery == "" {
+		return rawURL
+	}
+	q := u.Query()
+	dirty := false
+	for _, key := range []string{"t", "_t"} {
+		if q.Has(key) {
+			q.Del(key)
+			dirty = true
+		}
+	}
+	if !dirty {
+		return rawURL
+	}
+	u.RawQuery = q.Encode()
+	// If stripping left an empty query string, remove the trailing "?".
+	result := u.String()
+	return strings.TrimSuffix(result, "?")
 }
 
 func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.EpisodeState, int, error) {

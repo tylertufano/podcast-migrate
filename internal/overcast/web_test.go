@@ -295,3 +295,95 @@ func (t rewriteHostTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	rewritten.URL.Host = targetURL.Host
 	return http.DefaultTransport.RoundTrip(rewritten)
 }
+
+// ---- Extended matching tests ----
+
+const mockPodcastsPage = `<!DOCTYPE html><html><body>
+<a class="feedcell" href="/itunes1551206847/sistersinlaw">
+  <div class="cellcontent"><div class="titlestack"><div class="title">#SistersInLaw</div></div></div>
+</a>
+<a class="feedcell" href="/itunes295912710/the-moth">
+  <div class="cellcontent"><div class="titlestack"><div class="title">The Moth</div></div></div>
+</a>
+<a class="feedcell" href="/itunes1368737097/big-brains">
+  <div class="cellcontent"><div class="titlestack"><div class="title">Big Brains &amp; Friends</div></div></div>
+</a>
+</body></html>`
+
+const mockPodcastEpisodePage = `<!DOCTYPE html><html><body>
+<a class="extendedepisodecell usernewepisode" href="/+pGPC7LKNA">
+  <div><span class="caption2">May 27 &#x2022; 12 min</span></div>
+</a>
+<a class="extendedepisodecell" href="/+pGPBzIBYk">
+  <div><span class="caption2">May 20 • 23 min</span></div>
+</a>
+<a class="extendedepisodecell" href="/+pGPCojqaA">
+  <div><span class="caption2">Mar 26, 2021 • 76 min</span></div>
+</a>
+</body></html>`
+
+func TestFetchSubscribedPodcasts_ParsesTitlesAndPaths(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/podcasts" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(mockPodcastsPage))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	got, err := overcast.FetchSubscribedPodcasts(context.Background(), client)
+	if err != nil {
+		t.Fatalf("FetchSubscribedPodcasts: %v", err)
+	}
+	tests := []struct{ title, wantPath string }{
+		{"#sistersinlaw", "/itunes1551206847/sistersinlaw"},
+		{"the moth", "/itunes295912710/the-moth"},
+		{"big brains & friends", "/itunes1368737097/big-brains"}, // HTML entity decoded
+	}
+	for _, tc := range tests {
+		if got[tc.title] != tc.wantPath {
+			t.Errorf("title %q: got path %q, want %q", tc.title, got[tc.title], tc.wantPath)
+		}
+	}
+}
+
+func TestFetchPodcastEpisodes_ParsesHashesAndDates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(mockPodcastEpisodePage))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	listings, err := overcast.FetchPodcastEpisodes(context.Background(), client, srv.URL+"/itunes1551206847/sistersinlaw")
+	if err != nil {
+		t.Fatalf("FetchPodcastEpisodes: %v", err)
+	}
+	if len(listings) != 3 {
+		t.Fatalf("got %d listings, want 3", len(listings))
+	}
+	// Check episode with full-year date
+	last := listings[2]
+	if last.DateStr != "2021-03-26" {
+		t.Errorf("listings[2].DateStr = %q, want %q", last.DateStr, "2021-03-26")
+	}
+	if !strings.Contains(last.OvercastURL, "/+pGPCojqaA") {
+		t.Errorf("listings[2].OvercastURL = %q, should contain /+pGPCojqaA", last.OvercastURL)
+	}
+}
+
+func TestFetchPodcastEpisodes_HTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	_, err := overcast.FetchPodcastEpisodes(context.Background(), client, srv.URL+"/itunes999/nope")
+	if err == nil {
+		t.Error("expected error for 404 response")
+	}
+}

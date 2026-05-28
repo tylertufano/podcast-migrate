@@ -6,13 +6,16 @@ package overcast
 // notice if Overcast changes its backend.
 //
 // Endpoints used:
-//   POST https://overcast.fm/login               — authenticate, get session cookie
-//   GET  https://overcast.fm/+{overcastId}       — fetch episode page for numeric ID
+//   GET  https://overcast.fm/podcasts              — list subscribed podcasts (page paths)
+//   GET  https://overcast.fm/itunes{id}/{slug}     — podcast episode listing
+//   POST https://overcast.fm/login                 — authenticate, get session cookie
+//   GET  https://overcast.fm/+{hash}               — episode player page (contains data-item-id)
 //   POST https://overcast.fm/podcasts/set_progress/{numericId} — update position
 
 import (
 	"context"
 	"fmt"
+	htmlpkg "html"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -190,4 +193,135 @@ func bodyExcerpt(b []byte) string {
 		return s[:200] + "…"
 	}
 	return s
+}
+
+// ---- Extended matching: scrape podcast/episode pages for numeric IDs ----
+
+// PodcastPageEntry holds the podcast page path extracted from the /podcasts listing.
+// Path is relative, e.g. "/itunes1551206847/sistersinlaw".
+type PodcastPageEntry struct {
+	Path  string
+	Title string // normalised (lowercase, trimmed)
+}
+
+// feedcellRe matches a subscribed podcast link on the /podcasts page.
+// Captures the path (/itunes…) and the title text inside <div class="title">.
+var feedcellRe = regexp.MustCompile(`(?s)class="feedcell"[^>]*href="(/itunes[^"]+)"[^>]*>.*?class="title"[^>]*>([^<]+)</div>`)
+
+// FetchSubscribedPodcasts returns the Overcast podcast page paths for all subscribed
+// podcasts, keyed by normalised (lowercase, trimmed) title.
+// The client must be authenticated (from Login).
+func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) (map[string]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, overcastBaseURL+"/podcasts", nil)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: build /podcasts request: %w", err)
+	}
+	req.Header.Set("User-Agent", overcastUA)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: GET /podcasts: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("overcast/web: GET /podcasts returned HTTP %d", resp.StatusCode)
+	}
+
+	result := make(map[string]string)
+	for _, m := range feedcellRe.FindAllSubmatch(body, -1) {
+		path := string(m[1])
+		title := strings.ToLower(strings.TrimSpace(htmlpkg.UnescapeString(string(m[2]))))
+		if title != "" && path != "" {
+			result[title] = path
+		}
+	}
+	return result, nil
+}
+
+// PodcastEpisodeListing holds the minimal data for one episode extracted from a podcast page.
+type PodcastEpisodeListing struct {
+	OvercastURL string // "https://overcast.fm/+HASH"
+	DateStr     string // "YYYY-MM-DD" — day-level precision
+}
+
+// episodeHrefRe matches <a class="extendedepisodecell…" href="/+HASH"> links.
+var episodeHrefRe = regexp.MustCompile(`class="extendedepisodecell[^"]*"[^>]*href="(/\+[^"]+)"`)
+
+// caption2Re matches the date text inside <span class="caption2">…</span>.
+var caption2Re = regexp.MustCompile(`class="caption2"[^>]*>([^<]+)`)
+
+// FetchPodcastEpisodes returns all episode listings from an Overcast podcast page.
+// Episodes are returned in the order they appear on the page (most recent first).
+// The client must be authenticated.
+func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageURL string) ([]PodcastEpisodeListing, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, podcastPageURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: build podcast page request: %w", err)
+	}
+	req.Header.Set("User-Agent", overcastUA)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: GET %s: %w", podcastPageURL, err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("overcast/web: GET %s returned HTTP %d", podcastPageURL, resp.StatusCode)
+	}
+
+	hrefs := episodeHrefRe.FindAllSubmatch(body, -1)
+	dates := caption2Re.FindAllSubmatch(body, -1)
+
+	n := len(hrefs)
+	if len(dates) < n {
+		n = len(dates)
+	}
+
+	var listings []PodcastEpisodeListing
+	for i := 0; i < n; i++ {
+		hash := string(hrefs[i][1])
+		dateText := strings.TrimSpace(htmlpkg.UnescapeString(string(dates[i][1])))
+		dateStr, ok := parseOvercastPageDate(dateText)
+		if !ok {
+			continue
+		}
+		listings = append(listings, PodcastEpisodeListing{
+			OvercastURL: overcastBaseURL + hash,
+			DateStr:     dateStr,
+		})
+	}
+	return listings, nil
+}
+
+// parseOvercastPageDate parses the date text from Overcast's podcast episode cells.
+// Handles "Mar 26, 2021 • 76 min" (past year) and "May 27 • 12 min" (current year).
+// Returns a "YYYY-MM-DD" string and whether parsing succeeded.
+func parseOvercastPageDate(s string) (string, bool) {
+	// Strip " • duration/progress" suffix
+	if i := strings.Index(s, "•"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	// "Jan 2, 2006" — explicit year
+	if t, err := time.Parse("Jan 2, 2006", s); err == nil {
+		return t.Format("2006-01-02"), true
+	}
+	// "Jan 2" — assume current year; roll back one year if the result is > 14 days in the future
+	if t, err := time.Parse("Jan 2", s); err == nil {
+		now := time.Now().UTC()
+		year := now.Year()
+		candidate := time.Date(year, t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+		if candidate.After(now.AddDate(0, 0, 14)) {
+			candidate = time.Date(year-1, t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+		}
+		return candidate.Format("2006-01-02"), true
+	}
+	return "", false
 }

@@ -3,7 +3,9 @@ package overcast
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/model"
@@ -155,10 +157,16 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 		return 0, fmt.Errorf("overcast: authentication failed: %w", err)
 	}
 
-	// 3. For each episode with play state, look up its Overcast numeric ID and post
-	//    set_progress. The numeric ID (overcastId) comes directly from the OPML and
-	//    equals data-item-id — no per-episode page fetch needed.
-	//    Failures on individual episodes are logged and skipped rather than aborting.
+	// 3. Augment the index with episode IDs from Overcast podcast pages.
+	//    This handles episodes in shared feeds that weren't in the OPML export
+	//    (i.e. episodes the user listened to in Apple but never touched in Overcast).
+	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, lib.Episodes, index)
+	if added > 0 {
+		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
+	}
+
+	// 5. For each episode with play state, look up its Overcast numeric ID and post
+	//    set_progress. Failures on individual episodes are logged and skipped.
 
 	// Pre-count so we can show X/total progress.
 	toUpdate := 0
@@ -229,6 +237,161 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 		fmt.Printf("overcast: %d episode(s) failed during write (see warnings above)\n", apiSkipped)
 	}
 	return updated, nil
+}
+
+// augmentIndexFromPodcastPages extends index with entries for Apple episodes whose
+// Overcast numeric ID was not in the OPML export. It does this by:
+//
+//  1. Fetching /podcasts to map podcast titles → Overcast podcast page URLs.
+//  2. For each shared podcast (in both Apple play history and Overcast), fetching
+//     the podcast page to build a date → episode-hash map.
+//  3. Resolving episode hashes to numeric IDs by fetching each episode page in
+//     parallel (up to webWorkers concurrent requests).
+//
+// Entries are added directly into index (by feeddate key).
+// Returns the number of new entries added.
+func augmentIndexFromPodcastPages(
+	ctx context.Context,
+	client *http.Client,
+	overcastLib *model.Library,
+	episodes []model.EpisodeState,
+	index map[string]overcastIndexEntry,
+) int {
+	// Build per-feed Apple episode set (only episodes with play state, by feed).
+	appleByFeed := make(map[string][]model.EpisodeState)
+	for _, ep := range episodes {
+		if ep.PlayState != model.PlayStateUnplayed && ep.FeedURL != "" && !ep.PubDate.IsZero() {
+			appleByFeed[ep.FeedURL] = append(appleByFeed[ep.FeedURL], ep)
+		}
+	}
+	if len(appleByFeed) == 0 {
+		return 0
+	}
+
+	// Step 1: fetch /podcasts to get title → Overcast page path.
+	fmt.Printf("overcast: fetching podcast list for extended episode matching...\n")
+	podcastPaths, err := FetchSubscribedPodcasts(ctx, client)
+	if err != nil {
+		fmt.Printf("  warning: could not fetch /podcasts (%v) — skipping extended matching\n", err)
+		return 0
+	}
+
+	// Build a lookup: feedURL → Overcast podcast page URL.
+	// Match OPML podcasts to /podcasts page entries by normalised title.
+	feedToPageURL := make(map[string]string)
+	for _, pod := range overcastLib.Podcasts {
+		norm := strings.ToLower(strings.TrimSpace(pod.Title))
+		if path, ok := podcastPaths[norm]; ok {
+			feedToPageURL[pod.FeedURL] = overcastBaseURL + path
+		}
+	}
+
+	// Step 2: for each shared feed, fetch the podcast page and collect
+	// (feedURL, dateStr "YYYY-MM-DD", episodeURL) triples where the episode
+	// is not already in the index.
+	type pendingFetch struct {
+		feedURL     string
+		dateRFC3339 string // used as index key
+		episodeURL  string // "https://overcast.fm/+HASH"
+	}
+	var pending []pendingFetch
+
+	matched := 0
+	for feedURL, apEps := range appleByFeed {
+		pageURL, ok := feedToPageURL[feedURL]
+		if !ok {
+			continue // podcast not found in Overcast subscription list
+		}
+
+		listings, err := FetchPodcastEpisodes(ctx, client, pageURL)
+		if err != nil {
+			fmt.Printf("  warning: %s: %v\n", pageURL, err)
+			continue
+		}
+		time.Sleep(40 * time.Millisecond)
+
+		// Build date → episode URL map for this podcast page.
+		// Key is "YYYY-MM-DD"; Overcast pages use day-level precision.
+		dateToURL := make(map[string]string, len(listings))
+		for _, l := range listings {
+			if _, exists := dateToURL[l.DateStr]; !exists {
+				dateToURL[l.DateStr] = l.OvercastURL
+			}
+		}
+
+		for _, ap := range apEps {
+			dateKey := "feeddate:" + feedURL + "|" + ap.PubDate.UTC().Format(time.RFC3339)
+			if _, exists := index[dateKey]; exists {
+				continue // already have the numeric ID from OPML
+			}
+			// Try to find the episode by the date portion of its UTC pubDate (±1 day tolerance).
+			apDate := ap.PubDate.UTC().Format("2006-01-02")
+			epURL := dateToURL[apDate]
+			if epURL == "" {
+				epURL = dateToURL[ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02")]
+			}
+			if epURL == "" {
+				epURL = dateToURL[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]
+			}
+			if epURL == "" {
+				continue
+			}
+			pending = append(pending, pendingFetch{feedURL, ap.PubDate.UTC().Format(time.RFC3339), epURL})
+			matched++
+		}
+	}
+
+	if len(pending) == 0 {
+		fmt.Printf("overcast: extended matching found no additional episodes\n")
+		return 0
+	}
+	fmt.Printf("overcast: fetching numeric IDs for %d additional episode(s) via podcast pages...\n", len(pending))
+
+	// Step 3: resolve hashes → numeric IDs with a worker pool.
+	const webWorkers = 8
+	type result struct {
+		idx       int
+		numericID string
+		err       error
+	}
+
+	jobs := make(chan int, len(pending))
+	for i := range pending {
+		jobs <- i
+	}
+	close(jobs)
+
+	results := make([]result, len(pending))
+	var wg sync.WaitGroup
+	for w := 0; w < webWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				id, err := FetchEpisodeNumericID(ctx, client, pending[i].episodeURL)
+				results[i] = result{i, id, err}
+				time.Sleep(50 * time.Millisecond) // per-worker rate limit
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Merge resolved IDs into the index.
+	added := 0
+	for _, r := range results {
+		if r.err != nil || r.numericID == "" {
+			continue
+		}
+		p := pending[r.idx]
+		key := "feeddate:" + p.feedURL + "|" + p.dateRFC3339
+		if _, exists := index[key]; !exists {
+			index[key] = overcastIndexEntry{numericID: r.numericID}
+			added++
+		}
+	}
+
+	_ = matched // matched is the upper bound; added is the confirmed count
+	return added
 }
 
 // overcastIndexEntry holds the Overcast numeric ID needed to update an episode's progress.

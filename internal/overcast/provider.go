@@ -138,13 +138,14 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 
 	// 2. Authenticate.
 	if dryRun {
-		// In dry-run mode, report what would be written without making any web requests.
+		// In dry-run mode, count OPML-based matches only (no web requests).
 		n := 0
 		for _, ep := range lib.Episodes {
-			if ep.PlayState == model.PlayStateUnplayed {
+			entry, ok := findInOvercastIndex(index, ep)
+			if !ok {
 				continue
 			}
-			if _, ok := findInOvercastIndex(index, ep); ok {
+			if ep.PlayState != model.PlayStateUnplayed || entry.overcastPlayed {
 				n++
 			}
 		}
@@ -171,10 +172,11 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 	// Pre-count so we can show X/total progress.
 	toUpdate := 0
 	for _, ep := range lib.Episodes {
-		if ep.PlayState == model.PlayStateUnplayed {
+		entry, ok := findInOvercastIndex(index, ep)
+		if !ok {
 			continue
 		}
-		if _, ok := findInOvercastIndex(index, ep); ok {
+		if ep.PlayState != model.PlayStateUnplayed || entry.overcastPlayed {
 			toUpdate++
 		}
 	}
@@ -184,17 +186,19 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 	apiSkipped := 0
 
 	for _, ep := range lib.Episodes {
-		if ep.PlayState == model.PlayStateUnplayed {
-			continue
-		}
-
-		numericID, ok := findInOvercastIndex(index, ep)
+		entry, ok := findInOvercastIndex(index, ep)
 		if !ok {
 			continue // unmatched — not in Overcast's history
 		}
 
+		// Skip if neither Apple nor Overcast considers this episode played or in-progress.
+		if ep.PlayState == model.PlayStateUnplayed && !entry.overcastPlayed {
+			continue
+		}
+
+		numericID := entry.numericID
 		pos := int(ep.PlayPosition.Seconds())
-		if ep.PlayState == model.PlayStatePlayed {
+		if ep.PlayState == model.PlayStatePlayed || entry.overcastPlayed {
 			pos = PlayedSentinel
 		}
 
@@ -273,10 +277,12 @@ func augmentIndexFromPodcastPages(
 	episodes []model.EpisodeState,
 	index map[string]overcastIndexEntry,
 ) int {
-	// Build per-feed Apple episode set (only episodes with play state, by feed).
+	// Build per-feed Apple episode set — include ALL episodes (not just played ones)
+	// because Overcast's podcast page may show an episode as played even when Apple
+	// has no record of it (e.g. listened on iPhone without syncing, or played in Overcast).
 	appleByFeed := make(map[string][]model.EpisodeState)
 	for _, ep := range episodes {
-		if ep.PlayState != model.PlayStateUnplayed && ep.FeedURL != "" && !ep.PubDate.IsZero() {
+		if ep.FeedURL != "" && !ep.PubDate.IsZero() {
 			appleByFeed[ep.FeedURL] = append(appleByFeed[ep.FeedURL], ep)
 		}
 	}
@@ -306,9 +312,10 @@ func augmentIndexFromPodcastPages(
 	// (feedURL, dateStr "YYYY-MM-DD", episodeURL) triples where the episode
 	// is not already in the index.
 	type pendingFetch struct {
-		feedURL     string
-		dateRFC3339 string // used as index key
-		episodeURL  string // "https://overcast.fm/+HASH"
+		feedURL        string
+		dateRFC3339    string // used as index key
+		episodeURL     string // "https://overcast.fm/+HASH"
+		overcastPlayed bool   // podcast page shows userdeletedepisode
 	}
 	var pending []pendingFetch
 
@@ -335,33 +342,58 @@ func augmentIndexFromPodcastPages(
 		}
 		time.Sleep(500 * time.Millisecond) // 2 podcast pages/sec max
 
-		// Build date → episode URL map for this podcast page.
-		// Key is "YYYY-MM-DD"; Overcast pages use day-level precision.
-		dateToURL := make(map[string]string, len(listings))
+		// Build date → listing map for this podcast page (day-level precision keys).
+		dateToListing := make(map[string]PodcastEpisodeListing, len(listings))
 		for _, l := range listings {
-			if _, exists := dateToURL[l.DateStr]; !exists {
-				dateToURL[l.DateStr] = l.OvercastURL
+			if _, exists := dateToListing[l.DateStr]; !exists {
+				dateToListing[l.DateStr] = l
 			}
 		}
 
 		for _, ap := range apEps {
 			dateKey := "feeddate:" + feedURL + "|" + ap.PubDate.UTC().Format(time.RFC3339)
-			if _, exists := index[dateKey]; exists {
-				continue // already have the numeric ID from OPML
-			}
-			// Try to find the episode by the date portion of its UTC pubDate (±1 day tolerance).
-			apDate := ap.PubDate.UTC().Format("2006-01-02")
-			epURL := dateToURL[apDate]
-			if epURL == "" {
-				epURL = dateToURL[ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02")]
-			}
-			if epURL == "" {
-				epURL = dateToURL[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]
-			}
-			if epURL == "" {
+
+			// If already in index, update overcastPlayed flag if the page shows it played.
+			if existing, exists := index[dateKey]; exists {
+				apDate := ap.PubDate.UTC().Format("2006-01-02")
+				listing := dateToListing[apDate]
+				if listing.OvercastURL == "" {
+					listing = dateToListing[ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02")]
+				}
+				if listing.OvercastURL == "" {
+					listing = dateToListing[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]
+				}
+				if listing.Played && !existing.overcastPlayed {
+					existing.overcastPlayed = true
+					index[dateKey] = existing
+				}
 				continue
 			}
-			pending = append(pending, pendingFetch{feedURL, ap.PubDate.UTC().Format(time.RFC3339), epURL})
+
+			// Look for a podcast page entry for this Apple episode (±1 day tolerance).
+			apDate := ap.PubDate.UTC().Format("2006-01-02")
+			listing := dateToListing[apDate]
+			if listing.OvercastURL == "" {
+				listing = dateToListing[ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02")]
+			}
+			if listing.OvercastURL == "" {
+				listing = dateToListing[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]
+			}
+			if listing.OvercastURL == "" {
+				continue // no podcast page entry for this date
+			}
+
+			// Skip if neither Apple nor Overcast page has play state for this episode.
+			if ap.PlayState == model.PlayStateUnplayed && !listing.Played {
+				continue
+			}
+
+			pending = append(pending, pendingFetch{
+				feedURL:     feedURL,
+				dateRFC3339: ap.PubDate.UTC().Format(time.RFC3339),
+				episodeURL:  listing.OvercastURL,
+				overcastPlayed: listing.Played,
+			})
 			matched++
 		}
 	}
@@ -424,7 +456,10 @@ func augmentIndexFromPodcastPages(
 		if numericID != "" {
 			key := "feeddate:" + item.feedURL + "|" + item.dateRFC3339
 			if _, exists := index[key]; !exists {
-				index[key] = overcastIndexEntry{numericID: numericID}
+				index[key] = overcastIndexEntry{
+					numericID:      numericID,
+					overcastPlayed: item.overcastPlayed,
+				}
 				added++
 			}
 		}
@@ -441,11 +476,10 @@ func augmentIndexFromPodcastPages(
 	return added
 }
 
-// overcastIndexEntry holds the Overcast numeric ID needed to update an episode's progress.
-// The numeric ID (overcastId from the OPML) equals the data-item-id HTML attribute and is
-// used directly in POST /podcasts/set_progress/{numericID} — no page fetch required.
+// overcastIndexEntry holds the Overcast numeric ID and play state needed to update progress.
 type overcastIndexEntry struct {
-	numericID string // overcastId value, e.g. "2891974064154832"
+	numericID     string // overcastId value, e.g. "2891974064154832"
+	overcastPlayed bool  // true when Overcast's podcast page shows this as userdeletedepisode
 }
 
 // buildOvercastIndex creates a lookup map from match keys to Overcast numeric episode IDs.
@@ -480,19 +514,19 @@ func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 }
 
 // findInOvercastIndex looks up an episode by pubDate+feedURL then title+feedURL.
-// Returns the Overcast numeric ID (for use in set_progress) and whether a match was found.
-func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState) (string, bool) {
+// Returns the full index entry and whether a match was found.
+func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState) (overcastIndexEntry, bool) {
 	if !ep.PubDate.IsZero() && ep.FeedURL != "" {
 		key := "feeddate:" + ep.FeedURL + "|" + ep.PubDate.UTC().Format(time.RFC3339)
 		if entry, ok := index[key]; ok {
-			return entry.numericID, true
+			return entry, true
 		}
 	}
 	if ep.FeedURL != "" && ep.Title != "" {
 		key := "feedtitle:" + ep.FeedURL + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
 		if entry, ok := index[key]; ok {
-			return entry.numericID, true
+			return entry, true
 		}
 	}
-	return "", false
+	return overcastIndexEntry{}, false
 }

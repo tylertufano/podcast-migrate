@@ -159,18 +159,30 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 	//    set_progress. The numeric ID (overcastId) comes directly from the OPML and
 	//    equals data-item-id — no per-episode page fetch needed.
 	//    Failures on individual episodes are logged and skipped rather than aborting.
-	updated := 0
-	skipped := 0
 
-	for i, ep := range lib.Episodes {
+	// Pre-count so we can show X/total progress.
+	toUpdate := 0
+	for _, ep := range lib.Episodes {
+		if ep.PlayState == model.PlayStateUnplayed {
+			continue
+		}
+		if _, ok := findInOvercastIndex(index, ep); ok {
+			toUpdate++
+		}
+	}
+	fmt.Printf("overcast: writing play state for %d matched episode(s)...\n", toUpdate)
+
+	updated := 0
+	apiSkipped := 0
+
+	for _, ep := range lib.Episodes {
 		if ep.PlayState == model.PlayStateUnplayed {
 			continue
 		}
 
 		numericID, ok := findInOvercastIndex(index, ep)
 		if !ok {
-			skipped++
-			continue
+			continue // unmatched — not in Overcast's history
 		}
 
 		pos := int(ep.PlayPosition.Seconds())
@@ -179,16 +191,42 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 		}
 
 		if err := SetProgress(ctx, httpClient, numericID, pos); err != nil {
-			fmt.Printf("  warning: episode %d/%d (%q): set_progress failed: %v — skipping\n",
-				i+1, len(lib.Episodes), ep.Title, err)
-			skipped++
+			fmt.Printf("  [%d/%d] FAILED %q (id=%s): %v\n",
+				updated+apiSkipped+1, toUpdate, ep.Title, numericID, err)
+			apiSkipped++
+
+			// If the first call already indicates an auth failure, abort immediately
+			// rather than attempting the remaining ~1200 calls against a dead session.
+			if updated == 0 && apiSkipped == 1 && strings.Contains(err.Error(), "login") {
+				return 0, fmt.Errorf("overcast: aborting — first set_progress call redirected to login page.\n" +
+					"This usually means the password is wrong or the account requires 2FA.\n" +
+					"Verify your credentials and try again")
+			}
 			continue
 		}
 		updated++
+
+		// Log the first 5 successes and then every 50th so the user can verify
+		// things are working without drowning in lines.
+		if updated <= 5 || updated%50 == 0 {
+			posStr := fmt.Sprintf("%ds", pos)
+			if ep.PlayState == model.PlayStatePlayed {
+				posStr = "played"
+			}
+			title := ep.Title
+			if len(title) > 60 {
+				title = title[:57] + "..."
+			}
+			fmt.Printf("  [%d/%d] ✓ %q → %s\n", updated, toUpdate, title, posStr)
+		}
+
+		// Brief pause between requests — be polite to Overcast's servers and
+		// avoid triggering any rate limiting on the unofficial endpoint.
+		time.Sleep(80 * time.Millisecond)
 	}
 
-	if skipped > 0 {
-		fmt.Printf("overcast: %d episode(s) could not be matched or updated (unmatched or network error)\n", skipped)
+	if apiSkipped > 0 {
+		fmt.Printf("overcast: %d episode(s) failed during write (see warnings above)\n", apiSkipped)
 	}
 	return updated, nil
 }

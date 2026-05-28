@@ -132,7 +132,7 @@ func FetchEpisodeNumericID(ctx context.Context, client *http.Client, episodeURL 
 
 // SetProgress updates the playback position for an episode on Overcast.
 //
-//   - numericID: the data-item-id value from the episode page (via FetchEpisodeNumericID).
+//   - numericID: the data-item-id value / overcastId from the OPML.
 //   - positionSeconds: playhead in whole seconds. Use PlayedSentinel to mark as played,
 //     or 0 to mark as unplayed.
 //
@@ -157,10 +157,37 @@ func SetProgress(ctx context.Context, client *http.Client, numericID string, pos
 	if err != nil {
 		return fmt.Errorf("overcast/web: set_progress %s: %w", numericID, err)
 	}
-	defer func() { _, _ = io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+
+	// Read up to 4 KB of the body for error diagnostics.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("overcast/web: set_progress %s returned HTTP %d", numericID, resp.StatusCode)
+		excerpt := bodyExcerpt(body)
+		return fmt.Errorf("overcast/web: set_progress %s returned HTTP %d: %s", numericID, resp.StatusCode, excerpt)
 	}
+
+	// Detect a silent redirect to the login page (session expired or wrong credentials).
+	if resp.Request != nil && strings.Contains(resp.Request.URL.Path, "/login") {
+		return fmt.Errorf("overcast/web: set_progress %s was redirected to login — session may have expired; check credentials", numericID)
+	}
+
+	// Detect explicit error payloads in the response body.
+	if lower := strings.ToLower(string(body)); strings.Contains(lower, `"error"`) || strings.Contains(lower, `"status":"error"`) {
+		return fmt.Errorf("overcast/web: set_progress %s: server returned error: %s", numericID, bodyExcerpt(body))
+	}
+
 	return nil
+}
+
+// bodyExcerpt returns a short printable excerpt of a response body for use in error messages.
+func bodyExcerpt(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) == 0 {
+		return "(empty body)"
+	}
+	if len(s) > 200 {
+		return s[:200] + "…"
+	}
+	return s
 }

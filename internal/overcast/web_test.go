@@ -65,7 +65,9 @@ func newMockOvercast(t *testing.T) (*httptest.Server, *[]string) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
 	srv := httptest.NewServer(mux)
@@ -253,6 +255,30 @@ func TestSetProgress_RequestBody(t *testing.T) {
 func TestSetProgress_PlayedSentinelValue(t *testing.T) {
 	if overcast.PlayedSentinel != 2147483647 {
 		t.Errorf("PlayedSentinel = %d, want 2147483647 (INT32_MAX)", overcast.PlayedSentinel)
+	}
+}
+
+func TestSetProgress_RedirectToLoginDetected(t *testing.T) {
+	// When the session is invalid, Overcast redirects set_progress to /login (HTTP 200).
+	// SetProgress must detect this and return an error rather than silently succeeding.
+	loginRedirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/podcasts/set_progress/") {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		// Simulate the login page landing
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html><body>login form</body></html>"))
+	}))
+	defer loginRedirectSrv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: loginRedirectSrv.URL}}
+	err := overcast.SetProgress(context.Background(), client, "12345", overcast.PlayedSentinel)
+	if err == nil {
+		t.Error("expected error when set_progress redirects to login (expired session), got nil")
+	}
+	if err != nil && !strings.Contains(err.Error(), "login") {
+		t.Errorf("error should mention login redirect, got: %v", err)
 	}
 }
 

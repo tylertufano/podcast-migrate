@@ -268,13 +268,10 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) (map[stri
 type PodcastEpisodeListing struct {
 	OvercastURL string // "https://overcast.fm/+HASH"
 	DateStr     string // "YYYY-MM-DD" — day-level precision
-	Played      bool   // true when CSS class includes "userdeletedepisode" (played/consumed)
 }
 
-// episodeCellRe matches an episode cell, capturing (classes, href).
-// Overcast uses class="extendedepisodecell userdeletedepisode" for played episodes
-// and class="extendedepisodecell usernewepisode" for unplayed ones.
-var episodeCellRe = regexp.MustCompile(`class="(extendedepisodecell[^"]*)"[^>]*href="(/\+[^"]+)"`)
+// episodeHrefRe matches <a class="extendedepisodecell…" href="/+HASH"> links.
+var episodeHrefRe = regexp.MustCompile(`class="extendedepisodecell[^"]*"[^>]*href="(/\+[^"]+)"`)
 
 // caption2Re matches the date text inside <span class="caption2">…</span>.
 var caption2Re = regexp.MustCompile(`class="caption2"[^>]*>([^<]+)`)
@@ -303,18 +300,17 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 		return nil, fmt.Errorf("overcast/web: GET %s returned HTTP %d", podcastPageURL, resp.StatusCode)
 	}
 
-	cells := episodeCellRe.FindAllSubmatch(body, -1)
+	hrefs := episodeHrefRe.FindAllSubmatch(body, -1)
 	dates := caption2Re.FindAllSubmatch(body, -1)
 
-	n := len(cells)
+	n := len(hrefs)
 	if len(dates) < n {
 		n = len(dates)
 	}
 
 	var listings []PodcastEpisodeListing
 	for i := 0; i < n; i++ {
-		classes := string(cells[i][1])
-		hash := string(cells[i][2])
+		hash := string(hrefs[i][1])
 		dateText := strings.TrimSpace(htmlpkg.UnescapeString(string(dates[i][1])))
 		dateStr, ok := parseOvercastPageDate(dateText)
 		if !ok {
@@ -323,7 +319,6 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 		listings = append(listings, PodcastEpisodeListing{
 			OvercastURL: overcastBaseURL + hash,
 			DateStr:     dateStr,
-			Played:      strings.Contains(classes, "userdeletedepisode"),
 		})
 	}
 	return listings, nil

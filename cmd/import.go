@@ -37,7 +37,7 @@ func importCmd() *cobra.Command {
 				return fmt.Errorf("import: parse JSON: %w", err)
 			}
 
-			dst, err := buildProvider(to, "", "", "", overcastOut)
+			dst, err := buildProvider(to, "", "", "", overcastOut, "", "")
 			if err != nil {
 				return err
 			}

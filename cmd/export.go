@@ -23,7 +23,7 @@ func exportCmd() *cobra.Command {
 		Short: "Export a provider's library to a portable JSON file",
 		Example: `  podcast-migrate export --from podcasts --out ~/Desktop/my-podcasts.json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := buildProvider(from, sqlitePath, opmlFallback, overcastExport, "")
+			p, err := buildProvider(from, sqlitePath, opmlFallback, overcastExport, "", "", "")
 			if err != nil {
 				return err
 			}

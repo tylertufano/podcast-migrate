@@ -125,6 +125,48 @@ func TestOvercastProvider_SetLibrary_OnlyPlayState_ReturnsUnsupported(t *testing
 	p := overcast.NewProvider("", "/tmp/out.opml")
 	err := p.SetLibrary(context.Background(), &model.Library{}, provider.WriteOptions{OnlyPlayState: true})
 	if err == nil {
-		t.Error("expected unsupported error for OnlyPlayState — Overcast has no play state write API")
+		t.Error("expected unsupported error for OnlyPlayState when no credentials configured")
+	}
+}
+
+func TestOvercastProvider_WithCredentials_Capabilities(t *testing.T) {
+	importPath := writeMinimalOvercastOPML(t)
+	outPath := filepath.Join(t.TempDir(), "out.opml")
+
+	p := overcast.NewProviderWithCredentials(importPath, outPath, "user@example.com", "secret")
+	caps := p.Capabilities()
+
+	if !caps.WritePlayState {
+		t.Error("WritePlayState should be true when credentials and importOPMLPath are set")
+	}
+	if !caps.ReadSubscriptions {
+		t.Error("ReadSubscriptions should be true when importOPMLPath is set")
+	}
+	if !caps.WriteSubscriptions {
+		t.Error("WriteSubscriptions should be true when exportOPMLPath is set")
+	}
+}
+
+func TestOvercastProvider_WithCredentials_NoOPML_WritePlayStateFalse(t *testing.T) {
+	// Credentials alone are not enough — an OPML is needed for episode matching.
+	p := overcast.NewProviderWithCredentials("", "/tmp/out.opml", "user@example.com", "secret")
+	caps := p.Capabilities()
+	if caps.WritePlayState {
+		t.Error("WritePlayState should be false when importOPMLPath is empty (no episode matching possible)")
+	}
+}
+
+func TestOvercastProvider_SetLibrary_PlayStateDryRun(t *testing.T) {
+	// Dry-run play state write: should count matched episodes without making any HTTP calls.
+	importPath := writeMinimalOvercastOPML(t)
+	outPath := filepath.Join(t.TempDir(), "out.opml")
+	p := overcast.NewProviderWithCredentials(importPath, outPath, "user@example.com", "secret")
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: "https://feeds.example.com/show-a", Title: "Show A"}},
+		// No episodes with play state — dry-run should complete with zero updates.
+	}
+	if err := p.SetLibrary(context.Background(), lib, provider.WriteOptions{DryRun: true}); err != nil {
+		t.Fatalf("SetLibrary dry-run with credentials: %v", err)
 	}
 }

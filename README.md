@@ -22,7 +22,7 @@ podcast-migrate reads your library directly from the source app's local data, me
 
 - Generates an OPML file ready to import via Overcast › Settings › Import OPML
 - Can also read an Overcast OPML export for inspection or two-way merging
-- **Play state write is not yet implemented.** Overcast has no public API for setting episode positions. The groundwork is in place; see [Future work](#future-work).
+- **Play state write is implemented** via the unofficial Overcast web API (the same endpoint the Overcast web player uses internally). Pass `--play-state` with your credentials to enable it. See [Play state write](#overcast-play-state-write-unofficial) for details and caveats.
 
 **Sync engine**
 
@@ -38,7 +38,7 @@ podcast-migrate reads your library directly from the source app's local data, me
 | Provider | Read subscriptions | Read play state | Write subscriptions | Write play state |
 |---|:---:|:---:|:---:|:---:|
 | Apple Podcasts | ✅ | ✅ | — | — |
-| Overcast | ✅ | ✅ | ✅ (OPML) | 🚧 |
+| Overcast | ✅ | ✅ | ✅ (OPML) | ✅ (unofficial web API) |
 
 ## Installation
 
@@ -79,7 +79,31 @@ podcast-migrate migrate --from podcasts --to overcast \
 
 Then in Overcast: **Settings › Import OPML** and select the generated file.
 
-> **Note:** Play state is not written to Overcast yet — only subscriptions are imported. See [Future work](#future-work).
+### Overcast play state write (unofficial)
+
+```sh
+# Export your extended OPML from overcast.fm/account/export_opml/extended first,
+# then run with --play-state. Credentials via env vars (recommended):
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
+
+podcast-migrate migrate --from podcasts --to overcast \
+  --overcast-out ~/Desktop/overcast-import.opml \
+  --overcast-export ~/Downloads/overcast.opml \
+  --play-state
+
+# Or pass credentials as flags:
+podcast-migrate migrate --from podcasts --to overcast \
+  --overcast-out ~/Desktop/overcast-import.opml \
+  --overcast-export ~/Downloads/overcast.opml \
+  --play-state \
+  --overcast-email you@example.com \
+  --overcast-password yourpassword
+```
+
+**How it works:** The tool authenticates with your Overcast account and calls the same internal API endpoint the Overcast web player uses to save episode positions. For each episode with play state, it fetches the episode's Overcast page to resolve the internal numeric ID, then POSTs the position.
+
+> **Disclaimer:** This uses an undocumented Overcast endpoint that Overcast has not publicly supported. It works as of the implementation date but may break without notice if Marco Arment changes the backend. Use `--dry-run` to preview what would be written before committing.
 
 ### Export your library to JSON
 
@@ -115,11 +139,11 @@ podcast-migrate import --to overcast \
 | `--conflict` | Conflict resolution: `furthest` (default), `source`, `target` |
 | `--sqlite` | Custom path to `MTLibrary.sqlite` (auto-detected by default) |
 | `--opml-fallback` | Apple Podcasts OPML export to use if SQLite is inaccessible |
+| `--play-state` | Write episode play state via the unofficial Overcast web API |
+| `--overcast-email` | Overcast account email (or `OVERCAST_EMAIL` env var) |
+| `--overcast-password` | Overcast account password (or `OVERCAST_PASSWORD` env var) |
 
 ## Future work
-
-### Overcast play state write
-Overcast has no documented public API for setting episode positions or played status. The plan is to reverse-engineer the web endpoints used by the Overcast Mac app and implement them behind an `--play-state` flag with a clear disclaimer that the approach is unofficial and may break without notice.
 
 ### Additional providers
 The `Provider` interface makes adding new services straightforward. Planned:
@@ -159,4 +183,4 @@ main.go
 go test ./...
 ```
 
-97 tests; coverage: `apple` 90%, `overcast` 95%, `sync` 99%.
+111 tests; coverage: `apple` 90%, `overcast` 95%, `sync` 99%.

@@ -14,6 +14,7 @@ Run 'podcast-migrate help <command>' for details on a specific command.`,
 
 	root.AddCommand(
 		migrateCmd(),
+		markPlayedCmd(),
 		exportCmd(),
 		importCmd(),
 	)

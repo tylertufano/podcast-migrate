@@ -325,26 +325,34 @@ func augmentIndexFromPodcastPages(
 	}
 	var pending []pendingFetch
 
+	// Count feeds that have episodes not yet in the index.
+	unmatched := 0
+	for feedURL, apEps := range appleByFeed {
+		for _, ap := range apEps {
+			key := "feeddate:" + feedURL + "|" + ap.PubDate.UTC().Format(time.RFC3339)
+			if _, exists := index[key]; !exists {
+				unmatched++
+				break
+			}
+		}
+	}
+	if unmatched > 0 {
+		fmt.Printf("overcast: extended matching: %d feed(s) have episodes not in OPML — fetching podcast pages...\n", unmatched)
+	}
+
 	matched := 0
+	skippedFeeds := 0
 	for feedURL, apEps := range appleByFeed {
 		pageURL, ok := feedToPageURL[feedURL]
 		if !ok {
+			skippedFeeds++
 			continue // podcast not found in Overcast subscription list
 		}
 
-		listings, err := FetchPodcastEpisodes(ctx, client, pageURL)
+		listings, err := fetchPodcastEpisodesWithRetry(ctx, client, pageURL, requestDelay)
 		if err != nil {
-			var rl *RateLimitError
-			if errors.As(err, &rl) {
-				fmt.Printf("  rate limited fetching podcast page — waiting %v...\n", rl.Wait)
-				time.Sleep(rl.Wait)
-				// Retry once
-				listings, err = FetchPodcastEpisodes(ctx, client, pageURL)
-			}
-			if err != nil {
-				fmt.Printf("  warning: %s: %v\n", pageURL, err)
-				continue
-			}
+			fmt.Printf("  warning: could not fetch podcast page %s: %v\n", pageURL, err)
+			continue
 		}
 		time.Sleep(requestDelay)
 
@@ -379,6 +387,9 @@ func augmentIndexFromPodcastPages(
 		}
 	}
 
+	if skippedFeeds > 0 {
+		fmt.Printf("overcast: extended matching: %d feed(s) not found in Overcast subscription list (not subscribed or title mismatch)\n", skippedFeeds)
+	}
 	if len(pending) == 0 {
 		fmt.Printf("overcast: extended matching found no additional episodes\n")
 		return 0
@@ -487,6 +498,50 @@ func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 		}
 	}
 	return index
+}
+
+// fetchPodcastEpisodesWithRetry calls FetchPodcastEpisodes with exponential backoff
+// on 429 responses. It attempts up to 4 times with delays of 30 s, 60 s, and 120 s.
+func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client, pageURL string, requestDelay time.Duration) ([]PodcastEpisodeListing, error) {
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 30 s, 60 s, 120 s.
+			wait := time.Duration(1<<uint(attempt)) * 30 * time.Second
+			fmt.Printf("  rate limited fetching podcast page — waiting %v before retry (attempt %d/%d)...\n",
+				wait, attempt+1, maxAttempts)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+
+		listings, err := FetchPodcastEpisodes(ctx, client, pageURL)
+		if err == nil {
+			return listings, nil
+		}
+
+		var rl *RateLimitError
+		if errors.As(err, &rl) {
+			wait := rl.Wait
+			if attempt == 0 {
+				// First 429: use Retry-After, then continue to exponential backoff.
+				fmt.Printf("  rate limited fetching podcast page — waiting %v...\n", wait)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(wait):
+				}
+			}
+			lastErr = err
+			continue
+		}
+		// Non-rate-limit error: give up immediately.
+		return nil, err
+	}
+	return nil, lastErr
 }
 
 // findInOvercastIndex looks up an episode by pubDate+feedURL then title+feedURL.

@@ -2,11 +2,13 @@ package overcast_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tyler/podcast-migrate/internal/overcast"
 )
@@ -372,6 +374,51 @@ func TestFetchPodcastEpisodes_ParsesHashesAndDates(t *testing.T) {
 	}
 	if !strings.Contains(last.OvercastURL, "/+pGPCojqaA") {
 		t.Errorf("listings[2].OvercastURL = %q, should contain /+pGPCojqaA", last.OvercastURL)
+	}
+}
+
+func TestFetchPodcastEpisodes_OrphanCaption2InHeader(t *testing.T) {
+	// Some podcast pages include a caption2 element in the header area (e.g. the
+	// podcast website URL) that is not inside any episode cell. The previous
+	// implementation used two parallel global regex arrays, so this extra element
+	// shifted every date index by one — the last episode's date was never paired
+	// and the episode was silently dropped from extended matching.
+	const pageWithOrphan = `<!DOCTYPE html><html><body>
+<div class="caption2">www.politicon.com</div>
+<a class="extendedepisodecell usernewepisode" href="/+AAAA">
+  <div><span class="caption2">May 27 • 32 min</span></div>
+</a>
+<a class="extendedepisodecell userdeletedepisode" href="/+BBBB">
+  <div><span class="caption2">May 20 • 23 min</span></div>
+</a>
+<a class="extendedepisodecell userdeletedepisode" href="/+CCCC">
+  <div><span class="caption2">Apr 25 • 83 min</span></div>
+</a>
+</body></html>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(pageWithOrphan))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	listings, err := overcast.FetchPodcastEpisodes(context.Background(), client, srv.URL+"/itunes1551206847/sistersinlaw")
+	if err != nil {
+		t.Fatalf("FetchPodcastEpisodes: %v", err)
+	}
+	if len(listings) != 3 {
+		t.Fatalf("got %d listings, want 3 — orphan caption2 in header must not shift episode pairings", len(listings))
+	}
+	// The last episode must pair with its own date, not the second episode's date.
+	last := listings[2]
+	if !strings.Contains(last.OvercastURL, "/+CCCC") {
+		t.Errorf("listings[2].OvercastURL = %q, want /+CCCC", last.OvercastURL)
+	}
+	wantYear := time.Now().UTC().Year()
+	wantDate := fmt.Sprintf("%d-04-25", wantYear)
+	if last.DateStr != wantDate {
+		t.Errorf("listings[2].DateStr = %q, want %q", last.DateStr, wantDate)
 	}
 }
 

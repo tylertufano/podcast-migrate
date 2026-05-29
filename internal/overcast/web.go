@@ -270,11 +270,20 @@ type PodcastEpisodeListing struct {
 	DateStr     string // "YYYY-MM-DD" — day-level precision
 }
 
-// episodeHrefRe matches <a class="extendedepisodecell…" href="/+HASH"> links.
-var episodeHrefRe = regexp.MustCompile(`class="extendedepisodecell[^"]*"[^>]*href="(/\+[^"]+)"`)
-
-// caption2Re matches the date text inside <span class="caption2">…</span>.
-var caption2Re = regexp.MustCompile(`class="caption2"[^>]*>([^<]+)`)
+// episodeCellRe matches a single extendedepisodecell anchor and captures both
+// the episode URL hash and the nested caption2 date text in one match.
+//
+// Using a single combined match (rather than two parallel global arrays) avoids
+// an off-by-one bug: some podcast pages include caption2 elements outside of
+// episode cells (e.g. the podcast website URL in the header). A global caption2
+// scan would count those extra elements, shifting every date index by one and
+// causing the last episode's date to fall off the end entirely.
+//
+// The (?s) flag makes . match newlines so the lazy .*? can cross line boundaries
+// within a cell. Each cell contains exactly one caption2 element, so the lazy
+// match always stops at the correct one.
+var episodeCellRe = regexp.MustCompile(
+	`(?s)class="extendedepisodecell[^"]*"[^>]*href="(/\+[^"]+)"[^>]*>.*?class="caption2"[^>]*>([^<]+)<`)
 
 // FetchPodcastEpisodes returns all episode listings from an Overcast podcast page.
 // Episodes are returned in the order they appear on the page (most recent first).
@@ -300,18 +309,10 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 		return nil, fmt.Errorf("overcast/web: GET %s returned HTTP %d", podcastPageURL, resp.StatusCode)
 	}
 
-	hrefs := episodeHrefRe.FindAllSubmatch(body, -1)
-	dates := caption2Re.FindAllSubmatch(body, -1)
-
-	n := len(hrefs)
-	if len(dates) < n {
-		n = len(dates)
-	}
-
 	var listings []PodcastEpisodeListing
-	for i := 0; i < n; i++ {
-		hash := string(hrefs[i][1])
-		dateText := strings.TrimSpace(htmlpkg.UnescapeString(string(dates[i][1])))
+	for _, m := range episodeCellRe.FindAllSubmatch(body, -1) {
+		hash := string(m[1])
+		dateText := strings.TrimSpace(htmlpkg.UnescapeString(string(m[2])))
 		dateStr, ok := parseOvercastPageDate(dateText)
 		if !ok {
 			continue

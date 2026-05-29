@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/tyler/podcast-migrate/internal/apple"
@@ -26,6 +27,7 @@ func migrateCmd() *cobra.Command {
 		overcastEmail    string
 		overcastPassword string
 		conflictStrategy string
+		requestDelay     time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -71,6 +73,7 @@ func migrateCmd() *cobra.Command {
 				DryRun:            dryRun,
 				OnlySubscriptions: onlySubs,
 				ConflictStrategy:  parseConflictStrategy(conflictStrategy),
+				RequestDelay:      requestDelay,
 			}
 
 			engine := sync.New(src, dst)
@@ -103,6 +106,7 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&overcastEmail, "overcast-email", "", "Overcast account email (or set OVERCAST_EMAIL env var)")
 	cmd.Flags().StringVar(&overcastPassword, "overcast-password", "", "Overcast account password (or set OVERCAST_PASSWORD env var)")
 	cmd.Flags().StringVar(&conflictStrategy, "conflict", "furthest", "conflict resolution: furthest | source | target")
+	cmd.Flags().DurationVar(&requestDelay, "request-delay", overcast.DefaultRequestDelay, "delay between consecutive Overcast API requests (increase if you hit 429 rate limits)")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")

@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"time"
 
 	"github.com/tyler/podcast-migrate/internal/model"
 )
@@ -26,6 +27,12 @@ type WriteOptions struct {
 
 	// ConflictStrategy determines the winner when both sides have data.
 	ConflictStrategy ConflictStrategy
+
+	// RequestDelay is the minimum pause between consecutive outbound API
+	// requests during a write. Providers that call remote APIs (e.g. the
+	// Overcast play-state writer) use this to stay within rate limits.
+	// Zero means use the provider's built-in default.
+	RequestDelay time.Duration
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

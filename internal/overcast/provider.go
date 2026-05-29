@@ -12,6 +12,11 @@ import (
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
 
+// DefaultRequestDelay is the pause between consecutive Overcast API requests
+// when WriteOptions.RequestDelay is not set. 500 ms keeps the client well
+// within Overcast's undocumented rate limit (2 requests/second).
+const DefaultRequestDelay = 500 * time.Millisecond
+
 // Provider implements provider.Provider for Overcast.
 //
 // Reading: parses the OPML export from overcast.fm/account/export_opml.
@@ -108,7 +113,7 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 		if p.importOPMLPath == "" {
 			return fmt.Errorf("overcast: writing play state requires an Overcast extended OPML export (use --overcast-export with a file from overcast.fm/account/export_opml/extended)")
 		}
-		n, err := p.doWritePlayState(ctx, lib, opts.DryRun)
+		n, err := p.doWritePlayState(ctx, lib, opts)
 		if err != nil {
 			return err
 		}
@@ -125,7 +130,7 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 // doWritePlayState matches lib's episodes against the Overcast OPML, authenticates,
 // then posts set_progress for each matched episode that has play state.
 // Returns the number of episodes successfully updated.
-func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dryRun bool) (int, error) {
+func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opts provider.WriteOptions) (int, error) {
 	// 1. Read the Overcast extended OPML to build a (pubDate+feedURL → numericID) index.
 	//    We match by pub date and feed URL rather than GUID because the overcastId in
 	//    the OPML is Overcast's internal numeric ID, not the RSS <guid> value.
@@ -137,7 +142,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 	index := buildOvercastIndex(overcastLib)
 
 	// 2. Authenticate.
-	if dryRun {
+	if opts.DryRun {
 		// In dry-run mode, report what would be written without making any web requests.
 		n := 0
 		for _, ep := range lib.Episodes {
@@ -157,16 +162,24 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 		return 0, fmt.Errorf("overcast: authentication failed: %w", err)
 	}
 
-	// 3. Augment the index with episode IDs from Overcast podcast pages.
+	// 3. Resolve the request delay: honour the caller's preference, or fall
+	//    back to the conservative default.
+	requestDelay := opts.RequestDelay
+	if requestDelay <= 0 {
+		requestDelay = DefaultRequestDelay
+	}
+
+	// 4. Augment the index with episode IDs from Overcast podcast pages.
 	//    This handles episodes in shared feeds that weren't in the OPML export
 	//    (i.e. episodes the user listened to in Apple but never touched in Overcast).
-	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, lib.Episodes, index)
+	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, lib.Episodes, index, requestDelay)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
 
 	// 5. For each episode with play state, look up its Overcast numeric ID and post
 	//    set_progress. Failures on individual episodes are logged and skipped.
+	fmt.Printf("overcast: request delay: %v between calls\n", requestDelay)
 
 	// Pre-count so we can show X/total progress.
 	toUpdate := 0
@@ -245,8 +258,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, dry
 			fmt.Printf("  [%d/%d] ✓ %q → %s\n", updated, toUpdate, title, posStr)
 		}
 
-		// 150 ms between set_progress calls — polite to Overcast's servers.
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(requestDelay)
 	}
 
 	if apiSkipped > 0 {
@@ -272,6 +284,7 @@ func augmentIndexFromPodcastPages(
 	overcastLib *model.Library,
 	episodes []model.EpisodeState,
 	index map[string]overcastIndexEntry,
+	requestDelay time.Duration,
 ) int {
 	// Build per-feed Apple episode set (only episodes with play state, by feed).
 	appleByFeed := make(map[string][]model.EpisodeState)
@@ -333,7 +346,7 @@ func augmentIndexFromPodcastPages(
 				continue
 			}
 		}
-		time.Sleep(500 * time.Millisecond) // 2 podcast pages/sec max
+		time.Sleep(requestDelay)
 
 		// Build date → episode URL map for this podcast page.
 		// Key is "YYYY-MM-DD"; Overcast pages use day-level precision.
@@ -375,10 +388,7 @@ func augmentIndexFromPodcastPages(
 	// Step 3: resolve hashes → numeric IDs sequentially with retry on 429.
 	// Sequential (one request at a time) keeps us well within Overcast's
 	// undocumented rate limit. At ~300ms per request, 10 K episodes ≈ 50 min.
-	const (
-		fetchInterval  = 300 * time.Millisecond
-		maxFetchRetries = 4
-	)
+	const maxFetchRetries = 4
 
 	added := 0
 	consecutiveErrors := 0
@@ -434,7 +444,7 @@ func augmentIndexFromPodcastPages(
 				i+1, len(pending), added)
 		}
 
-		time.Sleep(fetchInterval)
+		time.Sleep(requestDelay)
 	}
 
 	_ = matched // matched is the upper bound; added is the confirmed count

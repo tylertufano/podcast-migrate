@@ -54,6 +54,7 @@ func setupSQLiteDB(t *testing.T) string {
 		ZPUBDATE        REAL,
 		ZDURATION       REAL,
 		ZPLAYSTATE      INTEGER DEFAULT 0,
+		ZPLAYCOUNT      INTEGER DEFAULT 0,
 		ZPLAYHEAD       REAL    DEFAULT 0.0,
 		ZLASTDATEPLAYED REAL,
 		ZPRICETYPE      TEXT
@@ -73,11 +74,11 @@ func setupSQLiteDB(t *testing.T) string {
 		}
 	}
 
-	insertEpisode := func(pk, podcastPK int, guid interface{}, title string, pubDate, duration float64, playState int, playHead float64, lastPlayed interface{}, priceType string) {
+	insertEpisode := func(pk, podcastPK int, guid interface{}, title string, pubDate, duration float64, playState, playCount int, playHead float64, lastPlayed interface{}, priceType string) {
 		t.Helper()
 		_, err := db.Exec(
-			`INSERT INTO ZMTEPISODE VALUES (?,?,?,?,?,?,?,?,?,?)`,
-			pk, podcastPK, guid, title, pubDate, duration, playState, playHead, lastPlayed, priceType,
+			`INSERT INTO ZMTEPISODE VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			pk, podcastPK, guid, title, pubDate, duration, playState, playCount, playHead, lastPlayed, priceType,
 		)
 		if err != nil {
 			t.Fatalf("insert episode pk=%d: %v", pk, err)
@@ -97,22 +98,26 @@ func setupSQLiteDB(t *testing.T) string {
 	insertPodcast(5, 1, nil, "No Feed Show", nil, nil)
 
 	// --- Episodes ---
-	// ep1: played, has a non-zero playhead and lastPlayed timestamp
-	insertEpisode(1, 1, "rss-guid-1", "Played Episode", 700000000.0, 3600.0, 1, 3500.0, 700100000.0, "STDQ")
-	// ep2: in-progress
-	insertEpisode(2, 1, "rss-guid-2", "In-Progress Episode", 699000000.0, 1800.0, 2, 900.0, nil, "STDQ")
-	// ep3: unplayed state but has a non-zero playhead → still included
-	insertEpisode(3, 1, "rss-guid-3", "Has Position Only", 698000000.0, 2400.0, 0, 300.0, nil, "STDQ")
+	// ep1: fully played (ZPLAYSTATE=2, ZPLAYHEAD=0) → PlayStatePlayed, PlayPosition=0
+	insertEpisode(1, 1, "rss-guid-1", "Played Episode", 700000000.0, 3600.0, 2, 0, 0.0, 700100000.0, "STDQ")
+	// ep2: in-progress (ZPLAYSTATE=1, ZPLAYHEAD=900) → PlayStateInProgress, PlayPosition=900s
+	insertEpisode(2, 1, "rss-guid-2", "In-Progress Episode", 699000000.0, 1800.0, 1, 0, 900.0, nil, "STDQ")
+	// ep3: ZPLAYSTATE=0 but ZPLAYHEAD=300 → PlayStateInProgress (ZPLAYHEAD>0 implies in-progress)
+	insertEpisode(3, 1, "rss-guid-3", "Has Position Only", 698000000.0, 2400.0, 0, 0, 300.0, nil, "STDQ")
 	// ep4: no user interaction at all → excluded
-	insertEpisode(4, 1, "rss-guid-4", "Untouched", 697000000.0, 1200.0, 0, 0.0, nil, "STDQ")
+	insertEpisode(4, 1, "rss-guid-4", "Untouched", 697000000.0, 1200.0, 0, 0, 0.0, nil, "STDQ")
 	// ep5: null GUID → excluded
-	insertEpisode(5, 1, nil, "No GUID Episode", 696000000.0, 0, 1, 0.0, nil, "STDQ")
+	insertEpisode(5, 1, nil, "No GUID Episode", 696000000.0, 0, 1, 0, 0.0, nil, "STDQ")
 	// ep6: PSUB on public feed → excluded from episodes, counted in SkippedPaywalledEpisodes
-	insertEpisode(6, 2, "psub-guid-1", "PSUB Episode", 695000000.0, 2000.0, 1, 0.0, nil, "PSUB")
+	insertEpisode(6, 2, "psub-guid-1", "PSUB Episode", 695000000.0, 2000.0, 1, 0, 0.0, nil, "PSUB")
 	// ep7: PLUS on public feed → excluded from episodes, counted in SkippedPaywalledEpisodes
-	insertEpisode(7, 2, "plus-guid-1", "PLUS Episode", 694000000.0, 1500.0, 2, 500.0, nil, "PLUS")
+	insertEpisode(7, 2, "plus-guid-1", "PLUS Episode", 694000000.0, 1500.0, 2, 0, 500.0, nil, "PLUS")
 	// ep8: PSUB on internal:// podcast → excluded (paywalled), counted in SkippedPaywalledEpisodes
-	insertEpisode(8, 3, "internal-psub-1", "Internal PSUB", 693000000.0, 3000.0, 1, 0.0, nil, "PSUB")
+	insertEpisode(8, 3, "internal-psub-1", "Internal PSUB", 693000000.0, 3000.0, 1, 0, 0.0, nil, "PSUB")
+	// ep9: "shadow played" — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1, ZLASTDATEPLAYED set.
+	//      Mirrors the real-world case where an episode was played on another device but
+	//      ZPLAYSTATE was never updated (e.g. episode 298 of #SistersInLaw).
+	insertEpisode(9, 1, "rss-guid-9", "Shadow Played", 692000000.0, 3000.0, 0, 1, 0.0, 692100000.0, "STDQ")
 
 	return path
 }
@@ -228,14 +233,28 @@ func TestSQLiteReader_SourceProvider(t *testing.T) {
 func TestSQLiteReader_IncludesPlayedEpisodes(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if !hasEpisodeGUID(lib, "rss-guid-1") {
-		t.Error("played episode (ZPLAYSTATE=1) should be included")
+		t.Error("played episode (ZPLAYSTATE=2) should be included")
 	}
 }
 
 func TestSQLiteReader_IncludesInProgressEpisodes(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if !hasEpisodeGUID(lib, "rss-guid-2") {
-		t.Error("in-progress episode (ZPLAYSTATE=2) should be included")
+		t.Error("in-progress episode (ZPLAYSTATE=1) should be included")
+	}
+}
+
+func TestSQLiteReader_IncludesShadowPlayedEpisodes(t *testing.T) {
+	lib := readLibrary(t, setupSQLiteDB(t))
+	// ep9 has ZPLAYSTATE=0 and ZPLAYHEAD=0 but ZPLAYCOUNT=1 and ZLASTDATEPLAYED set.
+	// This is the "shadow played" pattern: episode played on another device where
+	// ZPLAYSTATE was not updated. It must be included and reported as PlayStatePlayed.
+	if !hasEpisodeGUID(lib, "rss-guid-9") {
+		t.Error("shadow-played episode (ZPLAYSTATE=0, ZPLAYCOUNT=1) should be included")
+	}
+	ep := findEpisode(lib, "rss-guid-9")
+	if ep != nil && ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("shadow-played episode: PlayState got %d, want %d (Played)", ep.PlayState, model.PlayStatePlayed)
 	}
 }
 
@@ -286,9 +305,9 @@ func TestSQLiteReader_CountsPaywalledEpisodes(t *testing.T) {
 
 func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
-	// ep1 (played) + ep2 (in-progress) + ep3 (has position) = 3 included
-	if len(lib.Episodes) != 3 {
-		t.Errorf("got %d episodes, want 3 (played + in-progress + has-position)", len(lib.Episodes))
+	// ep1 (played) + ep2 (in-progress) + ep3 (has position) + ep9 (shadow played) = 4 included
+	if len(lib.Episodes) != 4 {
+		t.Errorf("got %d episodes, want 4 (played + in-progress + has-position + shadow-played)", len(lib.Episodes))
 	}
 }
 
@@ -296,28 +315,41 @@ func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 
 func TestSQLiteReader_PlayStateValues(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
+
+	// ep1: fully played (ZPLAYSTATE=2, ZPLAYHEAD=0) → PlayStatePlayed
 	ep := findEpisode(lib, "rss-guid-1")
 	if ep == nil {
 		t.Fatal("rss-guid-1 not found")
 	}
 	if ep.PlayState != model.PlayStatePlayed {
-		t.Errorf("PlayState: got %d, want %d (Played)", ep.PlayState, model.PlayStatePlayed)
+		t.Errorf("rss-guid-1 PlayState: got %d, want %d (Played)", ep.PlayState, model.PlayStatePlayed)
 	}
 
+	// ep2: in-progress (ZPLAYSTATE=1, ZPLAYHEAD=900) → PlayStateInProgress
 	ep = findEpisode(lib, "rss-guid-2")
 	if ep == nil {
 		t.Fatal("rss-guid-2 not found")
 	}
 	if ep.PlayState != model.PlayStateInProgress {
-		t.Errorf("PlayState: got %d, want %d (InProgress)", ep.PlayState, model.PlayStateInProgress)
+		t.Errorf("rss-guid-2 PlayState: got %d, want %d (InProgress)", ep.PlayState, model.PlayStateInProgress)
 	}
 
+	// ep3: ZPLAYSTATE=0 but ZPLAYHEAD=300 → PlayStateInProgress (non-zero playhead wins)
 	ep = findEpisode(lib, "rss-guid-3")
 	if ep == nil {
 		t.Fatal("rss-guid-3 not found")
 	}
-	if ep.PlayState != model.PlayStateUnplayed {
-		t.Errorf("PlayState: got %d, want %d (Unplayed)", ep.PlayState, model.PlayStateUnplayed)
+	if ep.PlayState != model.PlayStateInProgress {
+		t.Errorf("rss-guid-3 PlayState: got %d, want %d (InProgress, ZPLAYHEAD>0)", ep.PlayState, model.PlayStateInProgress)
+	}
+
+	// ep9: shadow played (ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1) → PlayStatePlayed
+	ep = findEpisode(lib, "rss-guid-9")
+	if ep == nil {
+		t.Fatal("rss-guid-9 not found")
+	}
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("rss-guid-9 PlayState: got %d, want %d (Played, ZPLAYCOUNT>0)", ep.PlayState, model.PlayStatePlayed)
 	}
 }
 
@@ -335,17 +367,13 @@ func TestSQLiteReader_PlayPosition(t *testing.T) {
 
 func TestSQLiteReader_ZeroPlayHeadIsZeroDuration(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
+	// ep1 is fully played with ZPLAYHEAD=0; PlayPosition must be zero.
 	ep := findEpisode(lib, "rss-guid-1")
 	if ep == nil {
 		t.Fatal("rss-guid-1 not found")
 	}
-	// ep1 has playhead=3500 so it should be non-zero
-	if ep.PlayPosition == 0 {
-		t.Error("PlayPosition should be non-zero for ep1 with ZPLAYHEAD=3500")
-	}
-	want := 3500 * time.Second
-	if ep.PlayPosition != want {
-		t.Errorf("PlayPosition: got %v, want %v", ep.PlayPosition, want)
+	if ep.PlayPosition != 0 {
+		t.Errorf("fully-played episode with ZPLAYHEAD=0 should have zero PlayPosition, got %v", ep.PlayPosition)
 	}
 }
 

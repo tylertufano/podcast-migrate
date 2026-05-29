@@ -151,9 +151,19 @@ func cleanFeedURL(rawURL string) string {
 }
 
 func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.EpisodeState, int, error) {
-	// Only fetch episodes that have some user interaction (played, in-progress,
-	// or with a non-zero play position). Unplayed-and-untouched episodes
-	// don't carry meaningful state to migrate.
+	// Fetch all episodes with any evidence of having been played. Apple Podcasts
+	// uses several fields to track play history — no single column is authoritative:
+	//
+	//   ZPLAYSTATE != 0  — explicit state set by the app (1=in-progress, 2=played)
+	//   ZPLAYHEAD > 0    — non-zero playback position (in-progress)
+	//   ZPLAYCOUNT > 0   — episode has been played at least once (e.g. played on
+	//                      another device or app; ZPLAYSTATE may still be 0)
+	//   ZLASTDATEPLAYED  — timestamp of last play (set when play completes or syncs
+	//                      from another device; also set when ZPLAYSTATE is 0)
+	//
+	// The Mac Podcasts app shows an episode as "played" when any of these indicate
+	// prior listening, regardless of ZPLAYSTATE. Relying on ZPLAYSTATE alone misses
+	// episodes played on other devices or via iCloud sync.
 	//
 	// PSUB (Apple Podcasts Subscription) and PLUS episodes are excluded:
 	// their GUIDs are Apple-internal hex IDs (not RSS <guid> values) and their
@@ -166,14 +176,14 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			e.ZTITLE,
 			e.ZPUBDATE,
 			e.ZDURATION,
-			e.ZPLAYSTATE,
 			e.ZPLAYHEAD,
 			e.ZLASTDATEPLAYED
 		FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
-		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0)
+		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
 		  AND e.ZGUID IS NOT NULL
 		  AND p.ZFEEDURL IS NOT NULL
+		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
 		  AND e.ZPRICETYPE NOT IN ('PSUB', 'PLUS')
 		ORDER BY e.ZPUBDATE DESC`
 
@@ -191,24 +201,21 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			title         string
 			pubDateRaw    sql.NullFloat64
 			durationSec   sql.NullFloat64
-			playStateRaw  int
 			playHeadSec   sql.NullFloat64
 			lastPlayedRaw sql.NullFloat64
 		)
 		if err := rows.Scan(
 			&guid, &feedURL, &title,
 			&pubDateRaw, &durationSec,
-			&playStateRaw, &playHeadSec,
-			&lastPlayedRaw,
+			&playHeadSec, &lastPlayedRaw,
 		); err != nil {
 			return nil, 0, fmt.Errorf("apple/sqlite: scan episode: %w", err)
 		}
 
 		ep := model.EpisodeState{
-			GUID:      guid,
-			FeedURL:   feedURL,
-			Title:     title,
-			PlayState: model.PlayState(playStateRaw),
+			GUID:    guid,
+			FeedURL: feedURL,
+			Title:   title,
 		}
 
 		if pubDateRaw.Valid {
@@ -218,7 +225,14 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			ep.Duration = time.Duration(durationSec.Float64 * float64(time.Second))
 		}
 		if playHeadSec.Valid && playHeadSec.Float64 > 0 {
+			// Non-zero playhead means the episode is partially listened to.
 			ep.PlayPosition = time.Duration(playHeadSec.Float64 * float64(time.Second))
+			ep.PlayState = model.PlayStateInProgress
+		} else {
+			// No active playhead — episode was played to completion (or marked played).
+			// The WHERE clause guarantees at least one play indicator is set, so this
+			// row represents a listened-to episode even if ZPLAYSTATE happens to be 0.
+			ep.PlayState = model.PlayStatePlayed
 		}
 		if lastPlayedRaw.Valid {
 			ep.LastPlayed = coreDataEpoch.Add(time.Duration(lastPlayedRaw.Float64 * float64(time.Second)))
@@ -234,7 +248,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 	const countPaywalled = `
 		SELECT COUNT(*) FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
-		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0)
+		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
 		  AND e.ZGUID IS NOT NULL
 		  AND p.ZFEEDURL IS NOT NULL
 		  AND e.ZPRICETYPE IN ('PSUB', 'PLUS')`

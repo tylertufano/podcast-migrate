@@ -149,7 +149,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			if ep.PlayState == model.PlayStateUnplayed {
 				continue
 			}
-			if _, ok := findInOvercastIndex(index, ep); ok {
+			entry, ok := findInOvercastIndex(index, ep)
+			if ok && !overcastAlreadySatisfied(ep, entry) {
 				n++
 			}
 		}
@@ -181,17 +182,27 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	//    set_progress. Failures on individual episodes are logged and skipped.
 	fmt.Printf("overcast: request delay: %v between calls\n", requestDelay)
 
-	// Pre-count so we can show X/total progress.
+	// Pre-count: how many episodes need an API call vs. are already satisfied.
 	toUpdate := 0
+	alreadyDone := 0
 	for _, ep := range lib.Episodes {
 		if ep.PlayState == model.PlayStateUnplayed {
 			continue
 		}
-		if _, ok := findInOvercastIndex(index, ep); ok {
+		entry, ok := findInOvercastIndex(index, ep)
+		if !ok {
+			continue // unmatched — not in Overcast's history
+		}
+		if overcastAlreadySatisfied(ep, entry) {
+			alreadyDone++
+		} else {
 			toUpdate++
 		}
 	}
-	fmt.Printf("overcast: writing play state for %d matched episode(s)...\n", toUpdate)
+	if alreadyDone > 0 {
+		fmt.Printf("overcast: skipping %d already-satisfied episode(s) (Overcast state matches or exceeds source)\n", alreadyDone)
+	}
+	fmt.Printf("overcast: writing play state for %d episode(s)...\n", toUpdate)
 
 	updated := 0
 	apiSkipped := 0
@@ -201,11 +212,19 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			continue
 		}
 
-		numericID, ok := findInOvercastIndex(index, ep)
+		entry, ok := findInOvercastIndex(index, ep)
 		if !ok {
 			continue // unmatched — not in Overcast's history
 		}
 
+		// Skip episodes that Overcast already has in the desired state.
+		// This dramatically reduces API calls on re-runs when most episodes
+		// are already marked as played in Overcast.
+		if overcastAlreadySatisfied(ep, entry) {
+			continue
+		}
+
+		numericID := entry.numericID
 		pos := int(ep.PlayPosition.Seconds())
 		if ep.PlayState == model.PlayStatePlayed {
 			pos = PlayedSentinel
@@ -462,14 +481,15 @@ func augmentIndexFromPodcastPages(
 	return added
 }
 
-// overcastIndexEntry holds the Overcast numeric ID needed to update an episode's progress.
-// The numeric ID (overcastId from the OPML) equals the data-item-id HTML attribute and is
-// used directly in POST /podcasts/set_progress/{numericID} — no page fetch required.
+// overcastIndexEntry holds the data needed to update an episode's progress in Overcast.
+// currentState is populated from the OPML export so we can skip no-op API calls.
 type overcastIndexEntry struct {
-	numericID string // overcastId value, e.g. "2891974064154832"
+	numericID    string            // overcastId value, e.g. "2891974064154832"
+	currentState model.PlayState   // play state already in Overcast (from OPML)
+	currentPos   time.Duration     // current playback position in Overcast (from OPML)
 }
 
-// buildOvercastIndex creates a lookup map from match keys to Overcast numeric episode IDs.
+// buildOvercastIndex creates a lookup map from match keys to Overcast episode data.
 // Each Overcast episode is indexed by pubDate+feedURL (primary) and title+feedURL (fallback).
 // The GUID key is intentionally omitted: overcastId ≠ RSS GUID, so GUID keys from Apple
 // Podcasts will never match an overcastId.
@@ -480,7 +500,11 @@ func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 			continue // need overcastId to call set_progress
 		}
 		// ep.GUID stores the overcastId value (confirmed == data-item-id for set_progress).
-		entry := overcastIndexEntry{numericID: ep.GUID}
+		entry := overcastIndexEntry{
+			numericID:    ep.GUID,
+			currentState: ep.PlayState,
+			currentPos:   ep.PlayPosition,
+		}
 
 		// Primary key: pubDate + feedURL (most precise).
 		if !ep.PubDate.IsZero() && ep.FeedURL != "" {
@@ -545,19 +569,39 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client, pag
 }
 
 // findInOvercastIndex looks up an episode by pubDate+feedURL then title+feedURL.
-// Returns the Overcast numeric ID (for use in set_progress) and whether a match was found.
-func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState) (string, bool) {
+// Returns the index entry and whether a match was found.
+func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState) (overcastIndexEntry, bool) {
 	if !ep.PubDate.IsZero() && ep.FeedURL != "" {
 		key := "feeddate:" + ep.FeedURL + "|" + ep.PubDate.UTC().Format(time.RFC3339)
 		if entry, ok := index[key]; ok {
-			return entry.numericID, true
+			return entry, true
 		}
 	}
 	if ep.FeedURL != "" && ep.Title != "" {
 		key := "feedtitle:" + ep.FeedURL + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
 		if entry, ok := index[key]; ok {
-			return entry.numericID, true
+			return entry, true
 		}
 	}
-	return "", false
+	return overcastIndexEntry{}, false
+}
+
+// overcastAlreadySatisfied reports whether Overcast's current state for an episode
+// already matches or exceeds what we want to write, making the set_progress call a no-op.
+//
+// Played beats everything. For in-progress, we skip if Overcast is already at
+// or ahead of the desired position.
+func overcastAlreadySatisfied(desired model.EpisodeState, current overcastIndexEntry) bool {
+	switch desired.PlayState {
+	case model.PlayStatePlayed:
+		return current.currentState == model.PlayStatePlayed
+	case model.PlayStateInProgress:
+		if current.currentState == model.PlayStatePlayed {
+			return true // already further
+		}
+		if current.currentState == model.PlayStateInProgress {
+			return current.currentPos >= desired.PlayPosition
+		}
+	}
+	return false
 }

@@ -130,8 +130,9 @@ func (r *OPMLReader) Read(_ context.Context) (*model.Library, error) {
 				name = feed.Title
 			}
 			podcasts = append(podcasts, model.Podcast{
-				FeedURL: feed.XMLURL,
-				Title:   name,
+				FeedURL:    feed.XMLURL,
+				Title:      name,
+				OvercastID: feed.OvercastID,
 			})
 			for _, ep := range feed.Children {
 				es := parseOpmlNode(ep, feed.XMLURL)

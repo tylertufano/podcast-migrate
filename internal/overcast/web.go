@@ -14,6 +14,7 @@ package overcast
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	htmlpkg "html"
 	"io"
@@ -221,47 +222,67 @@ func bodyExcerpt(b []byte) string {
 
 // ---- Extended matching: scrape podcast/episode pages for numeric IDs ----
 
-// PodcastPageEntry holds the podcast page path extracted from the /podcasts listing.
-// Path is relative, e.g. "/itunes1551206847/sistersinlaw".
-type PodcastPageEntry struct {
-	Path  string
-	Title string // normalised (lowercase, trimmed)
-}
-
-// feedcellRe matches a subscribed podcast link on the /podcasts page.
-// Captures the path (/itunes…) and the title text inside <div class="title">.
-var feedcellRe = regexp.MustCompile(`(?s)class="feedcell"[^>]*href="(/itunes[^"]+)"[^>]*>.*?class="title"[^>]*>([^<]+)</div>`)
-
-// FetchSubscribedPodcasts returns the Overcast podcast page paths for all subscribed
-// podcasts, keyed by normalised (lowercase, trimmed) title.
-// The client must be authenticated (from Login).
-func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) (map[string]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, overcastBaseURL+"/podcasts", nil)
+// SearchPodcastITunesID calls the Overcast search autocomplete JSON endpoint and
+// returns the iTunes ID for the podcast identified by title and/or overcastID.
+//
+// Matching priority:
+//  1. Overcast podcast ID exact match (overcastID field from the OPML)
+//  2. Case-insensitive exact title match
+//
+// Returns "" (no error) when the podcast is not found in the search results.
+// Returns *RateLimitError when the server responds with HTTP 429.
+// The client must be authenticated (obtained from Login).
+func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, overcastID string) (string, error) {
+	endpoint := overcastBaseURL + "/podcasts/search_autocomplete?q=" + url.QueryEscape(title)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("overcast/web: build /podcasts request: %w", err)
+		return "", fmt.Errorf("overcast/web: build search request: %w", err)
 	}
 	req.Header.Set("User-Agent", overcastUA)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("overcast/web: GET /podcasts: %w", err)
+		return "", fmt.Errorf("overcast/web: GET search: %w", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
 	_ = resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return "", &RateLimitError{Wait: rateLimitWait(resp, 30*time.Second)}
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("overcast/web: GET /podcasts returned HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("overcast/web: search returned HTTP %d", resp.StatusCode)
 	}
 
-	result := make(map[string]string)
-	for _, m := range feedcellRe.FindAllSubmatch(body, -1) {
-		path := string(m[1])
-		title := strings.ToLower(strings.TrimSpace(htmlpkg.UnescapeString(string(m[2]))))
-		if title != "" && path != "" {
-			result[title] = path
+	var payload struct {
+		Results []struct {
+			ID       string `json:"id"`
+			ITunesID string `json:"iTunesID"`
+			Title    string `json:"title"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("overcast/web: parse search response: %w", err)
+	}
+
+	// Prefer matching by Overcast podcast ID (unambiguous).
+	if overcastID != "" {
+		for _, r := range payload.Results {
+			if r.ID == overcastID {
+				return r.ITunesID, nil
+			}
 		}
 	}
-	return result, nil
+
+	// Fallback: case-insensitive exact title match.
+	titleNorm := strings.ToLower(strings.TrimSpace(title))
+	for _, r := range payload.Results {
+		if strings.ToLower(strings.TrimSpace(r.Title)) == titleNorm {
+			return r.ITunesID, nil
+		}
+	}
+
+	return "", nil // not found
 }
 
 // PodcastEpisodeListing holds the minimal data for one episode extracted from a podcast page.

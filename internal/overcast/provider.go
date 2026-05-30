@@ -301,11 +301,18 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 // augmentIndexFromPodcastPages extends index with entries for Apple episodes whose
 // Overcast numeric ID was not in the OPML export. It does this by:
 //
-//  1. Fetching /podcasts to map podcast titles → Overcast podcast page URLs.
-//  2. For each shared podcast (in both Apple play history and Overcast), fetching
-//     the podcast page to build a date → episode-hash map.
-//  3. Resolving episode hashes to numeric IDs by fetching each episode page in
-//     parallel (up to webWorkers concurrent requests).
+//  1. Building a feedURL → OPML podcast lookup from overcastLib.
+//  2. For each Apple feed with unmatched episodes, calling the Overcast search
+//     JSON API (/podcasts/search_autocomplete) to find the podcast's iTunes ID,
+//     then constructing the podcast listing page URL as /itunes{iTunesID}.
+//  3. Fetching each podcast listing page to build a date → episode-hash map.
+//  4. Resolving episode hashes to numeric IDs by fetching each episode page.
+//
+// The search API (structured JSON) replaces the previous /podcasts HTML scrape,
+// which was fragile (regex against HTML) and only worked for iTunes-linked podcasts.
+// Matching is by Overcast podcast ID (from the OPML overcastId attribute) first,
+// then by exact title. This handles all subscribed podcasts regardless of their
+// URL format (/itunes vs /p/).
 //
 // Entries are added directly into index (by feeddate key).
 // Returns the number of new entries added.
@@ -328,35 +335,20 @@ func augmentIndexFromPodcastPages(
 		return 0
 	}
 
-	// Step 1: fetch /podcasts to get title → Overcast page path.
-	fmt.Printf("overcast: fetching podcast list for extended episode matching...\n")
-	podcastPaths, err := FetchSubscribedPodcasts(ctx, client)
-	if err != nil {
-		fmt.Printf("  warning: could not fetch /podcasts (%v) — skipping extended matching\n", err)
-		return 0
+	// Step 1: build feedURL → OPML podcast info.
+	// OvercastID (from the OPML overcastId attribute) is used to verify search results.
+	type opmlPodInfo struct {
+		title      string
+		overcastID string
 	}
-
-	// Build a lookup: feedURL → Overcast podcast page URL.
-	// Match OPML podcasts to /podcasts page entries by normalised title.
-	feedToPageURL := make(map[string]string)
+	opmlByFeed := make(map[string]opmlPodInfo, len(overcastLib.Podcasts))
 	for _, pod := range overcastLib.Podcasts {
-		norm := strings.ToLower(strings.TrimSpace(pod.Title))
-		if path, ok := podcastPaths[norm]; ok {
-			feedToPageURL[pod.FeedURL] = overcastBaseURL + path
+		if pod.FeedURL != "" {
+			opmlByFeed[pod.FeedURL] = opmlPodInfo{title: pod.Title, overcastID: pod.OvercastID}
 		}
 	}
 
-	// Step 2: for each shared feed, fetch the podcast page and collect
-	// (feedURL, dateStr "YYYY-MM-DD", episodeURL) triples where the episode
-	// is not already in the index.
-	type pendingFetch struct {
-		feedURL     string
-		dateRFC3339 string // used as index key
-		episodeURL  string // "https://overcast.fm/+HASH"
-	}
-	var pending []pendingFetch
-
-	// Count feeds that have episodes not yet in the index.
+	// Count feeds that have episodes not yet in the index, for the progress log.
 	unmatched := 0
 	for feedURL, apEps := range appleByFeed {
 		for _, ap := range apEps {
@@ -367,17 +359,65 @@ func augmentIndexFromPodcastPages(
 			}
 		}
 	}
-	if unmatched > 0 {
-		fmt.Printf("overcast: extended matching: %d feed(s) have episodes not in OPML — fetching podcast pages...\n", unmatched)
+	if unmatched == 0 {
+		return 0
+	}
+	fmt.Printf("overcast: extended matching: %d feed(s) have episodes not in OPML — resolving via search API...\n", unmatched)
+
+	// Step 2: for each feed with unmatched episodes, search for the podcast by
+	// title+overcastID to get its iTunes ID, then construct the episode listing URL.
+	feedToPageURL := make(map[string]string)
+	skippedFeeds := 0
+	for feedURL, apEps := range appleByFeed {
+		// Only process feeds that actually have unmatched episodes.
+		hasUnmatched := false
+		for _, ap := range apEps {
+			key := "feeddate:" + feedURL + "|" + ap.PubDate.UTC().Format(time.RFC3339)
+			if _, exists := index[key]; !exists {
+				hasUnmatched = true
+				break
+			}
+		}
+		if !hasUnmatched {
+			continue
+		}
+
+		info, ok := opmlByFeed[feedURL]
+		if !ok {
+			skippedFeeds++
+			continue // not subscribed in Overcast
+		}
+
+		iTunesID, err := searchPodcastITunesIDWithRetry(ctx, client, info.title, info.overcastID, requestDelay)
+		if err != nil {
+			fmt.Printf("  warning: search failed for %q: %v\n", info.title, err)
+			skippedFeeds++
+			continue
+		}
+		if iTunesID == "" {
+			fmt.Printf("  warning: %q not found in Overcast search results\n", info.title)
+			skippedFeeds++
+			continue
+		}
+		feedToPageURL[feedURL] = overcastBaseURL + "/itunes" + iTunesID
+		time.Sleep(requestDelay)
 	}
 
+	// Step 3: for each shared feed, fetch the podcast page and collect
+	// (feedURL, dateStr "YYYY-MM-DD", episodeURL) triples where the episode
+	// is not already in the index.
+	type pendingFetch struct {
+		feedURL     string
+		dateRFC3339 string // used as index key
+		episodeURL  string // "https://overcast.fm/+HASH"
+	}
+	var pending []pendingFetch
+
 	matched := 0
-	skippedFeeds := 0
 	for feedURL, apEps := range appleByFeed {
 		pageURL, ok := feedToPageURL[feedURL]
 		if !ok {
-			skippedFeeds++
-			continue // podcast not found in Overcast subscription list
+			continue // not subscribed or search failed
 		}
 
 		listings, err := fetchPodcastEpisodesWithRetry(ctx, client, pageURL, requestDelay)
@@ -419,15 +459,15 @@ func augmentIndexFromPodcastPages(
 	}
 
 	if skippedFeeds > 0 {
-		fmt.Printf("overcast: extended matching: %d feed(s) not found in Overcast subscription list (not subscribed or title mismatch)\n", skippedFeeds)
+		fmt.Printf("overcast: extended matching: %d feed(s) not found in Overcast or search (not subscribed / no iTunes ID)\n", skippedFeeds)
 	}
 	if len(pending) == 0 {
 		fmt.Printf("overcast: extended matching found no additional episodes\n")
 		return 0
 	}
-	fmt.Printf("overcast: fetching numeric IDs for %d additional episode(s) via podcast pages...\n", len(pending))
+	fmt.Printf("overcast: fetching numeric IDs for %d additional episode(s) via episode pages...\n", len(pending))
 
-	// Step 3: resolve hashes → numeric IDs sequentially with retry on 429.
+	// Step 4: resolve hashes → numeric IDs sequentially with retry on 429.
 	// Sequential (one request at a time) keeps us well within Overcast's
 	// undocumented rate limit. At ~300ms per request, 10 K episodes ≈ 50 min.
 	const maxFetchRetries = 4
@@ -534,6 +574,30 @@ func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 		}
 	}
 	return index
+}
+
+// searchPodcastITunesIDWithRetry calls SearchPodcastITunesID with a single 429 retry.
+// On rate-limit, it waits the Retry-After period then tries once more.
+func searchPodcastITunesIDWithRetry(ctx context.Context, client *http.Client, title, overcastID string, requestDelay time.Duration) (string, error) {
+	id, err := SearchPodcastITunesID(ctx, client, title, overcastID)
+	if err == nil {
+		return id, nil
+	}
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		return "", err
+	}
+	wait := rl.Wait
+	if wait < requestDelay {
+		wait = requestDelay
+	}
+	fmt.Printf("  rate limited searching for %q — waiting %v...\n", title, wait)
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-time.After(wait):
+	}
+	return SearchPodcastITunesID(ctx, client, title, overcastID)
 }
 
 // fetchPodcastEpisodesWithRetry calls FetchPodcastEpisodes with exponential backoff

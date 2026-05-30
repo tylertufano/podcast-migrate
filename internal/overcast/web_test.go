@@ -300,17 +300,13 @@ func (t rewriteHostTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 // ---- Extended matching tests ----
 
-const mockPodcastsPage = `<!DOCTYPE html><html><body>
-<a class="feedcell" href="/itunes1551206847/sistersinlaw">
-  <div class="cellcontent"><div class="titlestack"><div class="title">#SistersInLaw</div></div></div>
-</a>
-<a class="feedcell" href="/itunes295912710/the-moth">
-  <div class="cellcontent"><div class="titlestack"><div class="title">The Moth</div></div></div>
-</a>
-<a class="feedcell" href="/itunes1368737097/big-brains">
-  <div class="cellcontent"><div class="titlestack"><div class="title">Big Brains &amp; Friends</div></div></div>
-</a>
-</body></html>`
+const mockSearchResponse = `{"results":[
+  {"__obj":"feed","id":"2693360","hash":"SK8RIt","iTunesID":"1551206847","title":"#SistersInLaw","author":"Politicon"},
+  {"__obj":"feed","id":"295912710","hash":"abcdef","iTunesID":"295912710","title":"The Moth","author":"PRX"},
+  {"__obj":"feed","id":"1368737097","hash":"ghijkl","iTunesID":"1368737097","title":"Big Brains & Friends","author":"UChicago"}
+]}`
+
+const mockSearchResponseNoMatch = `{"results":[]}`
 
 const mockPodcastEpisodePage = `<!DOCTYPE html><html><body>
 <a class="extendedepisodecell usernewepisode" href="/+pGPC7LKNA">
@@ -324,31 +320,85 @@ const mockPodcastEpisodePage = `<!DOCTYPE html><html><body>
 </a>
 </body></html>`
 
-func TestFetchSubscribedPodcasts_ParsesTitlesAndPaths(t *testing.T) {
+func TestSearchPodcastITunesID_MatchByOvercastID(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/podcasts" {
+		if r.URL.Path != "/podcasts/search_autocomplete" {
 			http.NotFound(w, r)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(mockPodcastsPage))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(mockSearchResponse))
 	}))
 	defer srv.Close()
 
 	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
-	got, err := overcast.FetchSubscribedPodcasts(context.Background(), client)
+
+	// Should find by Overcast ID (most reliable path).
+	id, err := overcast.SearchPodcastITunesID(context.Background(), client, "#SistersInLaw", "2693360")
 	if err != nil {
-		t.Fatalf("FetchSubscribedPodcasts: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	tests := []struct{ title, wantPath string }{
-		{"#sistersinlaw", "/itunes1551206847/sistersinlaw"},
-		{"the moth", "/itunes295912710/the-moth"},
-		{"big brains & friends", "/itunes1368737097/big-brains"}, // HTML entity decoded
+	if id != "1551206847" {
+		t.Errorf("got iTunesID %q, want %q", id, "1551206847")
 	}
-	for _, tc := range tests {
-		if got[tc.title] != tc.wantPath {
-			t.Errorf("title %q: got path %q, want %q", tc.title, got[tc.title], tc.wantPath)
-		}
+}
+
+func TestSearchPodcastITunesID_FallbackToTitleMatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(mockSearchResponse))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+
+	// Empty overcastID → falls back to title match.
+	id, err := overcast.SearchPodcastITunesID(context.Background(), client, "The Moth", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "295912710" {
+		t.Errorf("got iTunesID %q, want %q", id, "295912710")
+	}
+}
+
+func TestSearchPodcastITunesID_NoMatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(mockSearchResponseNoMatch))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+
+	id, err := overcast.SearchPodcastITunesID(context.Background(), client, "Unknown Show", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "" {
+		t.Errorf("expected empty iTunesID for no-match, got %q", id)
+	}
+}
+
+func TestSearchPodcastITunesID_RateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+
+	_, err := overcast.SearchPodcastITunesID(context.Background(), client, "Some Show", "")
+	if err == nil {
+		t.Fatal("expected RateLimitError, got nil")
+	}
+	rl, ok := err.(*overcast.RateLimitError)
+	if !ok {
+		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
+	}
+	if rl.Wait != 5*time.Second {
+		t.Errorf("Wait: got %v, want 5s", rl.Wait)
 	}
 }
 

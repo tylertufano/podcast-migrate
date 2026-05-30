@@ -13,10 +13,11 @@ const (
 
 // Podcast is a subscribed show identified by its feed URL.
 type Podcast struct {
-	FeedURL  string
-	Title    string
-	Author   string
-	ImageURL string
+	FeedURL    string
+	Title      string
+	Author     string
+	ImageURL   string
+	OvercastID string // Overcast's internal podcast ID (from OPML overcastId attribute)
 }
 
 // EpisodeState captures everything we migrate about a single episode.

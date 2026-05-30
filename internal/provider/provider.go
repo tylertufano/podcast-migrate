@@ -33,6 +33,11 @@ type WriteOptions struct {
 	// Overcast play-state writer) use this to stay within rate limits.
 	// Zero means use the provider's built-in default.
 	RequestDelay time.Duration
+
+	// PodcastFilter, when non-empty, restricts play-state writes to episodes
+	// from podcasts whose title contains at least one of the filter strings
+	// (case-insensitive substring match). An empty slice means "all podcasts".
+	PodcastFilter []string
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -28,6 +30,8 @@ func migrateCmd() *cobra.Command {
 		overcastPassword string
 		conflictStrategy string
 		requestDelay     time.Duration
+		podcastFilter    []string // --podcast (repeatable)
+		podcastListFile  string   // --podcast-list (file path)
 	)
 
 	cmd := &cobra.Command{
@@ -43,7 +47,17 @@ func migrateCmd() *cobra.Command {
     --overcast-export ~/Downloads/overcast.opml \
     --play-state
   # Credentials: set OVERCAST_EMAIL and OVERCAST_PASSWORD environment variables,
-  # or pass --overcast-email and --overcast-password flags.`,
+  # or pass --overcast-email and --overcast-password flags.
+
+  # Sync play state for a single podcast (word match, case-insensitive)
+  podcast-migrate migrate --from podcasts --to overcast \
+    --overcast-export ~/Downloads/overcast.opml --play-state \
+    --podcast "sistersinlaw"
+
+  # Sync play state for podcasts listed in a file (one title/word per line)
+  podcast-migrate migrate --from podcasts --to overcast \
+    --overcast-export ~/Downloads/overcast.opml --play-state \
+    --podcast-list ~/my-podcasts.txt`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Resolve Overcast credentials from flags → env vars.
 			if overcastEmail == "" {
@@ -60,6 +74,12 @@ func migrateCmd() *cobra.Command {
 				return fmt.Errorf("--play-state requires --overcast-export (path to your extended OPML from overcast.fm/account/export_opml/extended) for episode matching")
 			}
 
+			// Merge podcast filter patterns from --podcast flags and --podcast-list file.
+			allFilters, err := buildPodcastFilter(podcastFilter, podcastListFile)
+			if err != nil {
+				return err
+			}
+
 			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastExport, "", "", "")
 			if err != nil {
 				return fmt.Errorf("source: %w", err)
@@ -74,6 +94,7 @@ func migrateCmd() *cobra.Command {
 				OnlySubscriptions: onlySubs,
 				ConflictStrategy:  parseConflictStrategy(conflictStrategy),
 				RequestDelay:      requestDelay,
+				PodcastFilter:     allFilters,
 			}
 
 			engine := sync.New(src, dst)
@@ -107,11 +128,49 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&overcastPassword, "overcast-password", "", "Overcast account password (or set OVERCAST_PASSWORD env var)")
 	cmd.Flags().StringVar(&conflictStrategy, "conflict", "furthest", "conflict resolution: furthest | source | target")
 	cmd.Flags().DurationVar(&requestDelay, "request-delay", overcast.DefaultRequestDelay, "delay between consecutive Overcast API requests (increase if you hit 429 rate limits)")
+	cmd.Flags().StringArrayVar(&podcastFilter, "podcast", nil, "limit play-state sync to podcasts whose title contains this word/phrase (case-insensitive, repeatable)")
+	cmd.Flags().StringVar(&podcastListFile, "podcast-list", "", "path to a file with one podcast title/word per line; combined with --podcast")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")
 
 	return cmd
+}
+
+// buildPodcastFilter merges CLI patterns and a list file into a single deduplicated
+// slice of lowercase filter strings. Returns an error if the file cannot be read.
+func buildPodcastFilter(cliPatterns []string, listFile string) ([]string, error) {
+	seen := make(map[string]bool)
+	var out []string
+
+	add := func(s string) {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+
+	for _, p := range cliPatterns {
+		add(p)
+	}
+
+	if listFile != "" {
+		f, err := os.Open(listFile)
+		if err != nil {
+			return nil, fmt.Errorf("--podcast-list: open %s: %w", listFile, err)
+		}
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			add(sc.Text())
+		}
+		if err := sc.Err(); err != nil {
+			return nil, fmt.Errorf("--podcast-list: read %s: %w", listFile, err)
+		}
+	}
+
+	return out, nil
 }
 
 func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, overcastEmail, overcastPassword string) (provider.Provider, error) {

@@ -141,11 +141,22 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 
 	index := buildOvercastIndex(overcastLib)
 
+	// Build a feedURL → podcast title lookup used for podcast filtering.
+	feedToTitle := buildFeedToTitle(lib)
+
+	// Apply the podcast filter: if any patterns were specified, keep only
+	// episodes from podcasts whose title matches at least one pattern.
+	episodes := filterEpisodesByPodcast(lib.Episodes, feedToTitle, opts.PodcastFilter)
+	if len(opts.PodcastFilter) > 0 {
+		fmt.Printf("overcast: podcast filter active — %q — %d/%d episode(s) in scope\n",
+			opts.PodcastFilter, len(episodes), len(lib.Episodes))
+	}
+
 	// 2. Authenticate.
 	if opts.DryRun {
 		// In dry-run mode, report what would be written without making any web requests.
 		n := 0
-		for _, ep := range lib.Episodes {
+		for _, ep := range episodes {
 			if ep.PlayState == model.PlayStateUnplayed {
 				continue
 			}
@@ -173,7 +184,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	// 4. Augment the index with episode IDs from Overcast podcast pages.
 	//    This handles episodes in shared feeds that weren't in the OPML export
 	//    (i.e. episodes the user listened to in Apple but never touched in Overcast).
-	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, lib.Episodes, index, requestDelay)
+	//    Pass the filtered episode list so we only fetch pages for in-scope podcasts.
+	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, episodes, index, requestDelay)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
@@ -185,7 +197,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	// Pre-count: how many episodes need an API call vs. are already satisfied.
 	toUpdate := 0
 	alreadyDone := 0
-	for _, ep := range lib.Episodes {
+	for _, ep := range episodes {
 		if ep.PlayState == model.PlayStateUnplayed {
 			continue
 		}
@@ -207,7 +219,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	updated := 0
 	apiSkipped := 0
 
-	for _, ep := range lib.Episodes {
+	for _, ep := range episodes {
 		if ep.PlayState == model.PlayStateUnplayed {
 			continue
 		}
@@ -584,6 +596,44 @@ func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeSt
 		}
 	}
 	return overcastIndexEntry{}, false
+}
+
+// buildFeedToTitle returns a map from feed URL to lowercased podcast title, built
+// from lib.Podcasts. Used to resolve which podcast an episode belongs to for filtering.
+func buildFeedToTitle(lib *model.Library) map[string]string {
+	m := make(map[string]string, len(lib.Podcasts))
+	for _, pod := range lib.Podcasts {
+		if pod.FeedURL != "" {
+			m[pod.FeedURL] = strings.ToLower(strings.TrimSpace(pod.Title))
+		}
+	}
+	return m
+}
+
+// filterEpisodesByPodcast returns the subset of episodes whose podcast title
+// (looked up via feedToTitle) contains at least one of the filter strings
+// (case-insensitive). If filters is empty, all episodes are returned unchanged.
+func filterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[string]string, filters []string) []model.EpisodeState {
+	if len(filters) == 0 {
+		return episodes
+	}
+	// Normalise filter patterns once.
+	lower := make([]string, len(filters))
+	for i, f := range filters {
+		lower[i] = strings.ToLower(strings.TrimSpace(f))
+	}
+
+	var out []model.EpisodeState
+	for _, ep := range episodes {
+		title := feedToTitle[ep.FeedURL] // already lowercased
+		for _, f := range lower {
+			if f != "" && strings.Contains(title, f) {
+				out = append(out, ep)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // overcastAlreadySatisfied reports whether Overcast's current state for an episode

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -439,17 +441,10 @@ func augmentIndexFromPodcastPages(
 	}
 	var pending []pendingFetch
 
-	// noMatchDiag holds diagnostic info collected when an episode can't be matched
-	// on its Overcast podcast page. Printed when extended matching produces zero results
-	// so the root cause is visible without a separate debug run.
-	type noMatchDiag struct {
-		title      string
-		appleDate  string
-		pageCount  int      // total episode listings on the Overcast page
-		pageDates  []string // up to 5 sample dates from the page (page order)
-		pageTitles []string // up to 3 sample extracted title strings from the page
-	}
-	var noMatchDiags []noMatchDiag
+	// emptyPages collects podcast page URLs that returned 0 episode listings.
+	// When non-empty after step 3, the page is very likely JavaScript-rendered
+	// and the raw HTML has been saved to disk for inspection.
+	var emptyPages []string
 
 	matched := 0
 	for feedURL, apEps := range appleByFeed {
@@ -465,6 +460,13 @@ func augmentIndexFromPodcastPages(
 			continue
 		}
 		time.Sleep(requestDelay)
+
+		if len(listings) == 0 {
+			// No episode cells in the static HTML — the page is almost certainly
+			// JavaScript-rendered. Record it and skip per-episode matching for this feed.
+			emptyPages = append(emptyPages, pageURL)
+			continue
+		}
 
 		// Build date → episode URL map for this podcast page.
 		// Key is "YYYY-MM-DD"; Overcast pages use day-level precision.
@@ -530,24 +532,6 @@ func augmentIndexFromPodcastPages(
 				}
 			}
 			if epURL == "" {
-				// Collect diagnostic info so we can explain the failure when pending stays empty.
-				diag := noMatchDiag{
-					title:     ap.Title,
-					appleDate: apDate,
-					pageCount: len(listings),
-				}
-				for _, l := range listings {
-					if len(diag.pageDates) < 5 {
-						diag.pageDates = append(diag.pageDates, l.DateStr)
-					}
-					if l.Title != "" && len(diag.pageTitles) < 3 {
-						diag.pageTitles = append(diag.pageTitles, l.Title)
-					}
-					if len(diag.pageDates) >= 5 && len(diag.pageTitles) >= 3 {
-						break
-					}
-				}
-				noMatchDiags = append(noMatchDiags, diag)
 				continue
 			}
 			pending = append(pending, pendingFetch{normFeed, ap.PubDate.UTC().Format(time.RFC3339), epURL})
@@ -555,29 +539,24 @@ func augmentIndexFromPodcastPages(
 		}
 	}
 
+	// Report JS-rendered pages. The raw HTML of each was saved to disk by
+	// FetchPodcastEpisodes when it found 0 episode cells, so it can be inspected
+	// to find the actual API endpoint or embedded JSON the JS page uses.
+	if len(emptyPages) > 0 {
+		debugHTML := filepath.Join(os.TempDir(), "overcast-podcast-page-debug.html")
+		fmt.Printf("overcast: %d podcast page(s) returned 0 episode listings (JavaScript-rendered):\n", len(emptyPages))
+		for _, p := range emptyPages {
+			fmt.Printf("  %s\n", p)
+		}
+		fmt.Printf("  raw HTML of last fetched page saved to: %s\n", debugHTML)
+		fmt.Printf("  inspect that file to find the episode-list API endpoint or embedded JSON.\n")
+	}
+
 	if skippedFeeds > 0 {
 		fmt.Printf("overcast: extended matching: %d feed(s) not found in Overcast or search (not subscribed / no iTunes ID)\n", skippedFeeds)
 	}
 	if len(pending) == 0 {
 		fmt.Printf("overcast: extended matching found no additional episodes\n")
-		for _, d := range noMatchDiags {
-			fmt.Printf("  unmatched: %q  Apple pub: %s\n", d.title, d.appleDate)
-			if d.pageCount == 0 {
-				fmt.Printf("    Overcast page returned 0 episode listings\n")
-				fmt.Printf("    (the page may be JavaScript-rendered — static HTML contains no episode cells)\n")
-			} else {
-				fmt.Printf("    Overcast page has %d episode(s); sample dates: [%s]\n",
-					d.pageCount, strings.Join(d.pageDates, ", "))
-			}
-			if len(d.pageTitles) == 0 {
-				fmt.Printf("    no title text was extracted from page cells\n")
-				fmt.Printf("    (title may appear after the date in the HTML, or cells have no text before the date)\n")
-			} else {
-				for i, title := range d.pageTitles {
-					fmt.Printf("    sample page title %d: %q\n", i+1, title)
-				}
-			}
-		}
 		return 0
 	}
 	fmt.Printf("overcast: fetching numeric IDs for %d additional episode(s) via episode pages...\n", len(pending))

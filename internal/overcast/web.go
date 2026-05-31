@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -362,6 +364,15 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 			Title:       title,
 		})
 	}
+	// When no episode cells were found the page is almost certainly JavaScript-rendered.
+	// Save the raw body to a temp file so it can be inspected for API endpoint hints
+	// or embedded JSON. The file is overwritten on every call, so it always contains
+	// the most recent zero-listing page.
+	if len(listings) == 0 && len(body) > 0 {
+		debugPath := filepath.Join(os.TempDir(), "overcast-podcast-page-debug.html")
+		_ = os.WriteFile(debugPath, body, 0644)
+	}
+
 	return listings, nil
 }
 

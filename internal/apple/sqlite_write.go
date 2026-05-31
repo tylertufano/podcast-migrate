@@ -81,11 +81,10 @@ func (w *SQLiteWriter) Write(ctx context.Context, lib *model.Library, opts provi
 
 	// Filter episodes to the requested podcasts.
 	feedToTitle := buildFeedToTitleFromLib(lib)
-	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
 	if len(opts.PodcastFilter) > 0 {
-		fmt.Printf("apple: podcast filter active — %q — %d/%d episode(s) in scope\n",
-			opts.PodcastFilter, len(episodes), len(lib.Episodes))
+		fmt.Printf("apple: podcast filter active — limiting to podcasts matching %q\n", opts.PodcastFilter)
 	}
+	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
 
 	updated := 0
 	skipped := 0
@@ -118,10 +117,10 @@ func (w *SQLiteWriter) Write(ctx context.Context, lib *model.Library, opts provi
 	}
 
 	if skipped > 0 {
-		fmt.Printf("apple: skipping %d episode(s) already at desired state\n", skipped)
+		fmt.Printf("apple: %d episode(s) already at desired state — skipped\n", skipped)
 	}
 	if notFound > 0 {
-		fmt.Printf("apple: %d episode(s) not found in Apple Podcasts database (not downloaded or streamed)\n", notFound)
+		fmt.Printf("apple: %d episode(s) not found in Apple Podcasts database (may not be downloaded/subscribed)\n", notFound)
 	}
 
 	return updated, nil
@@ -141,12 +140,10 @@ func (w *SQLiteWriter) dryRun(ctx context.Context, lib *model.Library, opts prov
 	}
 
 	feedToTitle := buildFeedToTitleFromLib(lib)
-	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
-
 	if len(opts.PodcastFilter) > 0 {
-		fmt.Printf("apple: podcast filter active — %q — %d/%d episode(s) in scope\n",
-			opts.PodcastFilter, len(episodes), len(lib.Episodes))
+		fmt.Printf("apple: podcast filter active — limiting to podcasts matching %q\n", opts.PodcastFilter)
 	}
+	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
 
 	n := 0
 	notFound := 0
@@ -168,10 +165,10 @@ func (w *SQLiteWriter) dryRun(ctx context.Context, lib *model.Library, opts prov
 	}
 
 	if notFound > 0 {
-		fmt.Printf("apple: %d episode(s) not found in Apple Podcasts database (not downloaded or streamed)\n", notFound)
+		fmt.Printf("apple: %d episode(s) not found in Apple Podcasts database (may not be downloaded/subscribed)\n", notFound)
 	}
 	if skipped > 0 {
-		fmt.Printf("apple: skipping %d episode(s) already at desired state\n", skipped)
+		fmt.Printf("apple: %d episode(s) already at desired state — skipped\n", skipped)
 	}
 
 	return n, nil

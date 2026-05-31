@@ -114,6 +114,35 @@ func TestSQLiteWriter_MarkEpisodePlayed_ByTitle(t *testing.T) {
 	}
 }
 
+// TestSQLiteWriter_FurthestWins_SkipsShadowPlayed verifies that "shadow played"
+// episodes (ZPLAYSTATE=0 but ZPLAYCOUNT=1 or ZLASTDATEPLAYED set — played on
+// another device via iCloud sync) are correctly detected as already played by
+// the index and skipped rather than being counted as "would update".
+func TestSQLiteWriter_FurthestWins_SkipsShadowPlayed(t *testing.T) {
+	path := setupSQLiteDB(t)
+
+	// ep9: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1, ZLASTDATEPLAYED=692100000.0
+	// The reader reports this as PlayStatePlayed (shadow played).
+	// The writer must treat it the same way — skip rather than overwrite.
+	pubDate := coreDataTime(692000000.0)
+	lib := buildWriteLib("https://feeds.example.com/show-a", "Show A", []model.EpisodeState{
+		{
+			GUID:      "rss-guid-9",
+			Title:     "Shadow Played",
+			PubDate:   pubDate,
+			PlayState: model.PlayStatePlayed,
+		},
+	})
+
+	n, err := apple.NewSQLiteWriter(path).Write(context.Background(), lib, provider.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shadow-played episode should be skipped (FurthestWins, already played), got %d update(s)", n)
+	}
+}
+
 func TestSQLiteWriter_FurthestWins_SkipsAlreadyPlayed(t *testing.T) {
 	path := setupSQLiteDB(t)
 

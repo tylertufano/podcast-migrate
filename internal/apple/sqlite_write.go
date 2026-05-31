@@ -186,6 +186,10 @@ func (w *SQLiteWriter) dryRun(ctx context.Context, lib *model.Library, opts prov
 // the same show via different feed URLs.
 func (w *SQLiteWriter) buildAppleIndex(ctx context.Context, db *sql.DB) (map[string]appleEpisodeRecord, error) {
 	// Note: both p.ZTITLE and e.ZTITLE exist; alias them to avoid ambiguity.
+	// ZPLAYCOUNT and ZLASTDATEPLAYED are included to detect "shadow played" episodes:
+	// episodes played on another device where iCloud sync set ZPLAYCOUNT/ZLASTDATEPLAYED
+	// but left ZPLAYSTATE=0 and ZPLAYHEAD=0. The reader (sqlite.go) detects these via
+	// the same four-column check used in its WHERE clause; the index must match.
 	const q = `
 		SELECT
 			e.Z_PK,
@@ -195,7 +199,9 @@ func (w *SQLiteWriter) buildAppleIndex(ctx context.Context, db *sql.DB) (map[str
 			e.ZTITLE AS EPISODE_TITLE,
 			e.ZPUBDATE,
 			e.ZPLAYHEAD,
-			e.ZPLAYSTATE
+			e.ZPLAYSTATE,
+			e.ZPLAYCOUNT,
+			e.ZLASTDATEPLAYED
 		FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 		WHERE p.ZSUBSCRIBED = 1
@@ -212,17 +218,19 @@ func (w *SQLiteWriter) buildAppleIndex(ctx context.Context, db *sql.DB) (map[str
 
 	for rows.Next() {
 		var (
-			pk             int64
-			guid           sql.NullString
-			feedURL        string
-			podcastTitle   sql.NullString
-			episodeTitle   sql.NullString
-			pubDateRaw     sql.NullFloat64
-			playHeadSec    sql.NullFloat64
-			playStateSq    sql.NullInt64
+			pk              int64
+			guid            sql.NullString
+			feedURL         string
+			podcastTitle    sql.NullString
+			episodeTitle    sql.NullString
+			pubDateRaw      sql.NullFloat64
+			playHeadSec     sql.NullFloat64
+			playStateSq     sql.NullInt64
+			playCountSq     sql.NullInt64
+			lastPlayedRaw   sql.NullFloat64
 		)
 		if err := rows.Scan(&pk, &guid, &feedURL, &podcastTitle, &episodeTitle,
-			&pubDateRaw, &playHeadSec, &playStateSq); err != nil {
+			&pubDateRaw, &playHeadSec, &playStateSq, &playCountSq, &lastPlayedRaw); err != nil {
 			return nil, fmt.Errorf("apple/sqlite-write: scan: %w", err)
 		}
 
@@ -247,11 +255,25 @@ func (w *SQLiteWriter) buildAppleIndex(ctx context.Context, db *sql.DB) (map[str
 		if pubDateRaw.Valid {
 			rec.pubDate = coreDataEpoch.Add(time.Duration(pubDateRaw.Float64 * float64(time.Second)))
 		}
-		if playHeadSec.Valid && playHeadSec.Float64 > 0 {
+
+		// Replicate the same play-state detection logic as the SQLite reader so
+		// that the index's view of "current state" matches what GetLibrary reports.
+		//
+		//   ZPLAYHEAD > 0                        → in-progress (partially listened)
+		//   ZPLAYSTATE != 0                      → explicitly played (ZPLAYSTATE=2) or in-progress (=1)
+		//   ZPLAYCOUNT > 0                       → played at least once (iCloud sync from another device)
+		//   ZLASTDATEPLAYED IS NOT NULL           → "shadow played" — completed on another device;
+		//                                           ZPLAYSTATE may still be 0 on this Mac
+		//
+		// Failing to detect the shadow-played case causes the writer to treat those
+		// episodes as unplayed and count them as "would update" unnecessarily.
+		switch {
+		case playHeadSec.Valid && playHeadSec.Float64 > 0:
 			rec.playPosition = time.Duration(playHeadSec.Float64 * float64(time.Second))
 			rec.playState = model.PlayStateInProgress
-		} else if playStateSq.Valid && playStateSq.Int64 != 0 {
-			// Non-zero ZPLAYSTATE with no playhead means explicitly played.
+		case (playStateSq.Valid && playStateSq.Int64 != 0) ||
+			(playCountSq.Valid && playCountSq.Int64 > 0) ||
+			lastPlayedRaw.Valid:
 			rec.playState = model.PlayStatePlayed
 		}
 

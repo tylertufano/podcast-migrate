@@ -294,10 +294,19 @@ type PodcastEpisodeListing struct {
 	Title       string // episode title extracted from cell HTML (may be empty)
 }
 
-// episodeCellRe matches a single extendedepisodecell anchor and captures:
-//   - group 1: episode URL path "/+HASH"
-//   - group 2: cell body HTML before the caption2 element (used for title extraction)
-//   - group 3: caption2 date/duration text
+// episodeCellRe matches an episode anchor and captures five groups:
+//
+//   1. attributes before href (may contain class="extendedepisodecell...")
+//   2. episode URL path "/+HASH"
+//   3. attributes after href  (may contain class="extendedepisodecell...")
+//   4. cell body HTML before the caption2 element (used for title extraction)
+//   5. caption2 date/duration text
+//
+// Attribute order in the <a> tag is intentionally unconstrained — Overcast
+// serves href before class on some podcast pages and class before href on
+// others. Rather than requiring a fixed order, FetchPodcastEpisodes checks
+// groups 1 and 3 in code to confirm the "extendedepisodecell" class is present
+// (Go's RE2 engine does not support lookaheads, so we split the check).
 //
 // Using a single combined match (rather than two parallel global arrays) avoids
 // an off-by-one bug: some podcast pages include caption2 elements outside of
@@ -309,7 +318,7 @@ type PodcastEpisodeListing struct {
 // within a cell. Each cell contains exactly one caption2 element, so the lazy
 // match always stops at the correct one.
 var episodeCellRe = regexp.MustCompile(
-	`(?s)class="extendedepisodecell[^"]*"[^>]*href="(/\+[^"]+)"[^>]*>(.*?)<[^>]*class="caption2"[^>]*>([^<]+)<`)
+	`(?s)<a\b([^>]*)\bhref="(/\+[^"]+)"([^>]*)>(.*?)<[^>]*\bclass="[^"]*caption2[^"]*"[^>]*>([^<]+)<`)
 
 // htmlTagRe strips HTML tags for plain-text extraction.
 var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
@@ -349,11 +358,18 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 
 	var listings []PodcastEpisodeListing
 	for _, m := range episodeCellRe.FindAllSubmatch(body, -1) {
-		hash := string(m[1])
-		// m[2] is the cell body HTML before the caption2 element — strip tags to get title.
-		title := extractTextFromHTML(string(m[2]))
-		// m[3] is the date/duration text inside the caption2 element.
-		dateText := strings.TrimSpace(htmlpkg.UnescapeString(string(m[3])))
+		// m[1]: attributes before href; m[3]: attributes after href.
+		// The extendedepisodecell class may appear in either, depending on attribute order.
+		attrsBefore, attrsAfter := string(m[1]), string(m[3])
+		if !strings.Contains(attrsBefore, "extendedepisodecell") &&
+			!strings.Contains(attrsAfter, "extendedepisodecell") {
+			continue // not an episode cell — skip other /+HASH anchors on the page
+		}
+		hash := string(m[2])
+		// m[4] is the cell body HTML before the caption2 element — strip tags to get title.
+		title := extractTextFromHTML(string(m[4]))
+		// m[5] is the date/duration text inside the caption2 element.
+		dateText := strings.TrimSpace(htmlpkg.UnescapeString(string(m[5])))
 		dateStr, ok := parseOvercastPageDate(dateText)
 		if !ok {
 			continue

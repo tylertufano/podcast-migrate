@@ -511,6 +511,43 @@ func TestFetchPodcastEpisodes_TitleExtracted(t *testing.T) {
 	}
 }
 
+func TestFetchPodcastEpisodes_HrefBeforeClass(t *testing.T) {
+	// Overcast serves href before class in the <a> tag on some pages.
+	// The regex must match regardless of attribute order.
+	const pageHrefFirst = `<!DOCTYPE html><html><body>
+<a href="/+HASH1" class="extendedepisodecell">
+  <div>Href-First Episode<span class="caption2">Apr 25, 2026 • 83 min</span></div>
+</a>
+<a href="/+HASH2" class="extendedepisodecell usernewepisode">
+  <div>Another Episode<span class="caption2">Apr 18, 2026 • 45 min</span></div>
+</a>
+</body></html>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(pageHrefFirst))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	listings, err := overcast.FetchPodcastEpisodes(context.Background(), client, srv.URL+"/itunes12345/test")
+	if err != nil {
+		t.Fatalf("FetchPodcastEpisodes: %v", err)
+	}
+	if len(listings) != 2 {
+		t.Fatalf("got %d listings, want 2 (href-before-class not matched)", len(listings))
+	}
+	if !strings.Contains(listings[0].OvercastURL, "/+HASH1") {
+		t.Errorf("listings[0].OvercastURL = %q, should contain /+HASH1", listings[0].OvercastURL)
+	}
+	if listings[0].DateStr != "2026-04-25" {
+		t.Errorf("listings[0].DateStr = %q, want 2026-04-25", listings[0].DateStr)
+	}
+	if listings[0].Title != "Href-First Episode" {
+		t.Errorf("listings[0].Title = %q, want %q", listings[0].Title, "Href-First Episode")
+	}
+}
+
 func TestFetchPodcastEpisodes_HTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

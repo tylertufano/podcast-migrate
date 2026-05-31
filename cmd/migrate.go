@@ -57,7 +57,17 @@ func migrateCmd() *cobra.Command {
   # Sync play state for podcasts listed in a file (one title/word per line)
   podcast-migrate migrate --from podcasts --to overcast \
     --overcast-export ~/Downloads/overcast.opml --play-state \
-    --podcast-list ~/my-podcasts.txt`,
+    --podcast-list ~/my-podcasts.txt
+
+  # Overcast → Podcasts (reverse sync: write Overcast play state back to Apple Podcasts)
+  # Quit Apple Podcasts first, then run:
+  podcast-migrate migrate --from overcast --to podcasts \
+    --overcast-export ~/Downloads/overcast.opml --play-state
+
+  # Reverse sync — single podcast, dry-run first
+  podcast-migrate migrate --from overcast --to podcasts \
+    --overcast-export ~/Downloads/overcast.opml --play-state \
+    --podcast "sistersinlaw" --dry-run`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Resolve Overcast credentials from flags → env vars.
 			if overcastEmail == "" {
@@ -67,11 +77,23 @@ func migrateCmd() *cobra.Command {
 				overcastPassword = os.Getenv("OVERCAST_PASSWORD")
 			}
 
-			if playState && overcastEmail == "" {
-				return fmt.Errorf("--play-state requires Overcast credentials: set OVERCAST_EMAIL and OVERCAST_PASSWORD, or use --overcast-email / --overcast-password")
-			}
-			if playState && overcastExport == "" {
-				return fmt.Errorf("--play-state requires --overcast-export (path to your extended OPML from overcast.fm/account/export_opml/extended) for episode matching")
+			// Direction-aware validation for --play-state:
+			//   Podcasts → Overcast: requires credentials + overcast-export (for episode matching)
+			//   Overcast → Podcasts: requires overcast-export (the OPML is the source); no credentials needed
+			if playState {
+				switch {
+				case (from == "podcasts" || from == "apple") && (to == "overcast"):
+					if overcastEmail == "" {
+						return fmt.Errorf("--play-state requires Overcast credentials: set OVERCAST_EMAIL and OVERCAST_PASSWORD, or use --overcast-email / --overcast-password")
+					}
+					if overcastExport == "" {
+						return fmt.Errorf("--play-state requires --overcast-export (path to your extended OPML from overcast.fm/account/export_opml/extended) for episode matching")
+					}
+				case (from == "overcast") && (to == "podcasts" || to == "apple"):
+					if overcastExport == "" {
+						return fmt.Errorf("--play-state requires --overcast-export (path to your Overcast OPML export from overcast.fm/account/export_opml/extended)")
+					}
+				}
 			}
 
 			// Merge podcast filter patterns from --podcast flags and --podcast-list file.
@@ -84,7 +106,9 @@ func migrateCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("source: %w", err)
 			}
-			dst, err := buildProvider(to, "", "", overcastExport, overcastOut, overcastEmail, overcastPassword)
+			// Pass sqlitePath and opmlFallback for the destination too — needed when
+			// the destination is Apple Podcasts (reverse sync: overcast → podcasts).
+			dst, err := buildProvider(to, sqlitePath, opmlFallback, overcastExport, overcastOut, overcastEmail, overcastPassword)
 			if err != nil {
 				return fmt.Errorf("destination: %w", err)
 			}
@@ -92,9 +116,12 @@ func migrateCmd() *cobra.Command {
 			opts := provider.WriteOptions{
 				DryRun:            dryRun,
 				OnlySubscriptions: onlySubs,
-				ConflictStrategy:  parseConflictStrategy(conflictStrategy),
-				RequestDelay:      requestDelay,
-				PodcastFilter:     allFilters,
+				// When --play-state is set and destination is Apple Podcasts, restrict
+				// writes to play state only (Apple has no subscription write API).
+				OnlyPlayState:    playState && (to == "podcasts" || to == "apple"),
+				ConflictStrategy: parseConflictStrategy(conflictStrategy),
+				RequestDelay:     requestDelay,
+				PodcastFilter:    allFilters,
 			}
 
 			engine := sync.New(src, dst)
@@ -111,6 +138,10 @@ func migrateCmd() *cobra.Command {
 					fmt.Println("Play state has been written directly via the Overcast web API.")
 				}
 			}
+			if !dryRun && (to == "podcasts" || to == "apple") && playState {
+				fmt.Println("\nPlay state has been written to Apple Podcasts' local database.")
+				fmt.Println("Open Apple Podcasts to see the updated episode states.")
+			}
 			return nil
 		},
 	}
@@ -119,7 +150,7 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&to, "to", "", "destination app: overcast (required)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without writing anything")
 	cmd.Flags().BoolVar(&onlySubs, "only-subscriptions", false, "migrate subscriptions only, skip play state")
-	cmd.Flags().BoolVar(&playState, "play-state", false, "also write episode play state via the unofficial Overcast web API (requires credentials)")
+	cmd.Flags().BoolVar(&playState, "play-state", false, "also write episode play state (Podcasts→Overcast: uses unofficial web API, requires credentials; Overcast→Podcasts: writes to local SQLite database)")
 	cmd.Flags().StringVar(&sqlitePath, "sqlite", "", "path to MTLibrary.sqlite (default: auto-detect)")
 	cmd.Flags().StringVar(&opmlFallback, "opml-fallback", "", "path to Apple Podcasts OPML export (fallback if SQLite unavailable)")
 	cmd.Flags().StringVar(&overcastExport, "overcast-export", "", "path to Overcast OPML export (for reading Overcast data or play state matching)")

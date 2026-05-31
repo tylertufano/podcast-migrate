@@ -13,6 +13,11 @@ import (
 // Provider implements provider.Provider for Apple Podcasts.
 // It tries the local SQLite database first; if unavailable (e.g. permission
 // denied or the path does not exist) it falls back to an OPML file.
+//
+// Reading:  SQLite (play state + subscriptions) with OPML fallback (subscriptions only).
+// Writing:  SQLite play state writes are supported when the database is accessible.
+//           Subscription writes are not supported (Apple Podcasts has no public write API
+//           for subscriptions; use the GUI to subscribe).
 type Provider struct {
 	sqlitePath string
 	opmlPath   string // optional fallback; empty disables it
@@ -31,15 +36,22 @@ func NewProvider(sqlitePath, opmlPath string) *Provider {
 func (p *Provider) Name() string { return "Apple Podcasts" }
 
 func (p *Provider) Capabilities() provider.Capabilities {
-	// OPML fallback only supports subscriptions.
-	// SQLite supports play state too; we report true and fail gracefully at
-	// runtime if the DB is inaccessible.
+	// SQLite supports play state reads and writes; we report true and fail
+	// gracefully at runtime if the DB is inaccessible.
+	// OPML fallback only supports subscription reads (no play state, no writes).
+	sqliteAccessible := false
+	if p.sqlitePath != "" {
+		if _, err := os.Stat(p.sqlitePath); err == nil {
+			sqliteAccessible = true
+		}
+	}
 	return provider.Capabilities{
 		ReadSubscriptions: true,
 		ReadPlayState:     true,
-		// Apple Podcasts has no public write API.
+		// Play state writes require the live SQLite database.
+		WritePlayState: sqliteAccessible,
+		// Apple Podcasts has no public subscription write API.
 		WriteSubscriptions: false,
-		WritePlayState:     false,
 	}
 }
 
@@ -59,6 +71,33 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 	return NewOPMLReader(p.opmlPath).Read(ctx)
 }
 
-func (p *Provider) SetLibrary(_ context.Context, _ *model.Library, _ provider.WriteOptions) error {
-	return &provider.ErrCapabilityUnsupported{Provider: p.Name(), Operation: "write"}
+// SetLibrary writes episode play state to the Apple Podcasts SQLite database.
+// Subscription writes are not supported.
+func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
+	// Subscription writes are not supported regardless of options.
+	if opts.OnlySubscriptions {
+		return &provider.ErrCapabilityUnsupported{
+			Provider:  p.Name(),
+			Operation: "write subscriptions (Apple Podcasts has no public subscription write API)",
+		}
+	}
+
+	// Play state writes require the SQLite database.
+	if _, err := os.Stat(p.sqlitePath); err != nil {
+		return fmt.Errorf("apple: SQLite database not accessible at %s: %w\n"+
+			"  Play state writes require the live Apple Podcasts database.\n"+
+			"  Ensure Apple Podcasts has been opened at least once on this Mac.", p.sqlitePath, err)
+	}
+
+	n, err := NewSQLiteWriter(p.sqlitePath).Write(ctx, lib, opts)
+	if err != nil {
+		return err
+	}
+
+	prefix := ""
+	if opts.DryRun {
+		prefix = "[dry-run] "
+	}
+	fmt.Printf("%supdated play state for %d episode(s) in Apple Podcasts\n", prefix, n)
+	return nil
 }

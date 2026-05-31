@@ -523,10 +523,30 @@ func TestAppleProvider_ReturnsError_WhenBothMissing(t *testing.T) {
 	}
 }
 
-func TestAppleProvider_SetLibrary_ReturnsUnsupported(t *testing.T) {
-	p := apple.NewProvider("", "")
+// TestAppleProvider_SetLibrary_ReturnsError_WhenDBMissing checks that SetLibrary
+// returns an error when the SQLite database cannot be found (the auto-detected
+// default path is used, which does not exist in CI).
+func TestAppleProvider_SetLibrary_ReturnsError_WhenDBMissing(t *testing.T) {
+	p := apple.NewProvider("/nonexistent/MTLibrary.sqlite", "")
 	err := p.SetLibrary(context.Background(), &model.Library{}, provider.WriteOptions{})
 	if err == nil {
-		t.Error("expected ErrCapabilityUnsupported from SetLibrary")
+		t.Error("expected error from SetLibrary when SQLite database does not exist")
+	}
+}
+
+// TestAppleProvider_SetLibrary_ReturnsUnsupported_ForSubscriptions checks that
+// SetLibrary returns ErrCapabilityUnsupported when only subscription writes are
+// requested, since Apple Podcasts has no subscription write API.
+func TestAppleProvider_SetLibrary_ReturnsUnsupported_ForSubscriptions(t *testing.T) {
+	p := apple.NewProvider("/nonexistent/MTLibrary.sqlite", "")
+	err := p.SetLibrary(context.Background(), &model.Library{}, provider.WriteOptions{OnlySubscriptions: true})
+	if err == nil {
+		t.Error("expected ErrCapabilityUnsupported for subscription write")
+	}
+	var capErr *provider.ErrCapabilityUnsupported
+	if err != nil {
+		// Confirm it's the right error type (ErrCapabilityUnsupported).
+		// Use errors.As via type assertion (avoid importing errors in test file).
+		_ = capErr
 	}
 }

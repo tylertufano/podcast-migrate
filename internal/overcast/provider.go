@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -185,7 +186,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	//    This handles episodes in shared feeds that weren't in the OPML export
 	//    (i.e. episodes the user listened to in Apple but never touched in Overcast).
 	//    Pass the filtered episode list so we only fetch pages for in-scope podcasts.
-	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, episodes, index, requestDelay)
+	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, episodes, index, requestDelay, feedToTitle)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
@@ -323,6 +324,7 @@ func augmentIndexFromPodcastPages(
 	episodes []model.EpisodeState,
 	index map[string]overcastIndexEntry,
 	requestDelay time.Duration,
+	feedToTitle map[string]string, // Apple feedURL → lowercased podcast title (for title-based fallback)
 ) int {
 	// Build per-feed Apple episode set (only episodes with play state, by feed).
 	appleByFeed := make(map[string][]model.EpisodeState)
@@ -341,18 +343,32 @@ func augmentIndexFromPodcastPages(
 		title      string
 		overcastID string
 	}
-	opmlByFeed := make(map[string]opmlPodInfo, len(overcastLib.Podcasts))
+	// Primary lookup: normalised Overcast feed URL → podcast info.
+	// Normalisation bridges minor differences (http vs https, trailing slash, host case)
+	// between the URL Apple Podcasts has stored and the URL Overcast uses.
+	opmlByNormFeed := make(map[string]opmlPodInfo, len(overcastLib.Podcasts))
+	// Fallback lookup: normalised podcast title → podcast info.
+	// Used when no feed URL (even normalised) matches — e.g. the feed moved entirely
+	// or the two apps resolved a redirect to different endpoints.
+	opmlByTitle := make(map[string]opmlPodInfo, len(overcastLib.Podcasts))
 	for _, pod := range overcastLib.Podcasts {
 		if pod.FeedURL != "" {
-			opmlByFeed[pod.FeedURL] = opmlPodInfo{title: pod.Title, overcastID: pod.OvercastID}
+			opmlByNormFeed[normalizeFeedURL(pod.FeedURL)] = opmlPodInfo{title: pod.Title, overcastID: pod.OvercastID}
+		}
+		if pod.Title != "" {
+			normTitle := strings.ToLower(strings.TrimSpace(pod.Title))
+			if _, exists := opmlByTitle[normTitle]; !exists {
+				opmlByTitle[normTitle] = opmlPodInfo{title: pod.Title, overcastID: pod.OvercastID}
+			}
 		}
 	}
 
 	// Count feeds that have episodes not yet in the index, for the progress log.
 	unmatched := 0
 	for feedURL, apEps := range appleByFeed {
+		normFeed := normalizeFeedURL(feedURL)
 		for _, ap := range apEps {
-			key := "feeddate:" + feedURL + "|" + ap.PubDate.UTC().Format(time.RFC3339)
+			key := "feeddate:" + normFeed + "|" + ap.PubDate.UTC().Format(time.RFC3339)
 			if _, exists := index[key]; !exists {
 				unmatched++
 				break
@@ -369,10 +385,11 @@ func augmentIndexFromPodcastPages(
 	feedToPageURL := make(map[string]string)
 	skippedFeeds := 0
 	for feedURL, apEps := range appleByFeed {
+		normFeed := normalizeFeedURL(feedURL)
 		// Only process feeds that actually have unmatched episodes.
 		hasUnmatched := false
 		for _, ap := range apEps {
-			key := "feeddate:" + feedURL + "|" + ap.PubDate.UTC().Format(time.RFC3339)
+			key := "feeddate:" + normFeed + "|" + ap.PubDate.UTC().Format(time.RFC3339)
 			if _, exists := index[key]; !exists {
 				hasUnmatched = true
 				break
@@ -382,10 +399,19 @@ func augmentIndexFromPodcastPages(
 			continue
 		}
 
-		info, ok := opmlByFeed[feedURL]
+		// Look up Overcast podcast info by normalised feed URL first.
+		info, ok := opmlByNormFeed[normFeed]
 		if !ok {
-			skippedFeeds++
-			continue // not subscribed in Overcast
+			// Feed URL mismatch — try matching by podcast title.
+			// feedToTitle values are already lowercased by buildFeedToTitle.
+			if appleTitle := feedToTitle[feedURL]; appleTitle != "" {
+				info, ok = opmlByTitle[appleTitle]
+			}
+			if !ok {
+				skippedFeeds++
+				continue // not subscribed in Overcast and title not found
+			}
+			fmt.Printf("  note: feed URL mismatch for %q — matched by podcast title\n", info.title)
 		}
 
 		iTunesID, err := searchPodcastITunesIDWithRetry(ctx, client, info.title, info.overcastID, requestDelay)
@@ -407,14 +433,15 @@ func augmentIndexFromPodcastPages(
 	// (feedURL, dateStr "YYYY-MM-DD", episodeURL) triples where the episode
 	// is not already in the index.
 	type pendingFetch struct {
-		feedURL     string
-		dateRFC3339 string // used as index key
+		normFeedURL string // normalised feed URL — used as index key
+		dateRFC3339 string
 		episodeURL  string // "https://overcast.fm/+HASH"
 	}
 	var pending []pendingFetch
 
 	matched := 0
 	for feedURL, apEps := range appleByFeed {
+		normFeed := normalizeFeedURL(feedURL)
 		pageURL, ok := feedToPageURL[feedURL]
 		if !ok {
 			continue // not subscribed or search failed
@@ -451,7 +478,7 @@ func augmentIndexFromPodcastPages(
 		}
 
 		for _, ap := range apEps {
-			dateKey := "feeddate:" + feedURL + "|" + ap.PubDate.UTC().Format(time.RFC3339)
+			dateKey := "feeddate:" + normFeed + "|" + ap.PubDate.UTC().Format(time.RFC3339)
 			if _, exists := index[dateKey]; exists {
 				continue // already have the numeric ID from OPML
 			}
@@ -493,7 +520,7 @@ func augmentIndexFromPodcastPages(
 			if epURL == "" {
 				continue
 			}
-			pending = append(pending, pendingFetch{feedURL, ap.PubDate.UTC().Format(time.RFC3339), epURL})
+			pending = append(pending, pendingFetch{normFeed, ap.PubDate.UTC().Format(time.RFC3339), epURL})
 			matched++
 		}
 	}
@@ -554,7 +581,7 @@ func augmentIndexFromPodcastPages(
 		}
 
 		if numericID != "" {
-			key := "feeddate:" + item.feedURL + "|" + item.dateRFC3339
+			key := "feeddate:" + item.normFeedURL + "|" + item.dateRFC3339
 			if _, exists := index[key]; !exists {
 				index[key] = overcastIndexEntry{numericID: numericID}
 				added++
@@ -599,15 +626,17 @@ func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 		}
 
 		// Primary key: pubDate + feedURL (most precise).
+		// Feed URLs are normalised (http→https, host lowercase, no trailing slash) so
+		// that minor differences between Apple Podcasts and Overcast don't break matching.
 		if !ep.PubDate.IsZero() && ep.FeedURL != "" {
-			key := "feeddate:" + ep.FeedURL + "|" + ep.PubDate.UTC().Format(time.RFC3339)
+			key := "feeddate:" + normalizeFeedURL(ep.FeedURL) + "|" + ep.PubDate.UTC().Format(time.RFC3339)
 			if _, exists := index[key]; !exists {
 				index[key] = entry
 			}
 		}
 		// Fallback key: normalized title + feedURL.
 		if ep.FeedURL != "" && ep.Title != "" {
-			key := "feedtitle:" + ep.FeedURL + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
+			key := "feedtitle:" + normalizeFeedURL(ep.FeedURL) + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
 			if _, exists := index[key]; !exists {
 				index[key] = entry
 			}
@@ -687,14 +716,17 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client, pag
 // findInOvercastIndex looks up an episode by pubDate+feedURL then title+feedURL.
 // Returns the index entry and whether a match was found.
 func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState) (overcastIndexEntry, bool) {
+	// Normalise the Apple feed URL so it matches the normalised Overcast feed URL
+	// stored in the index, bridging minor differences (http vs https, trailing slash).
+	normFeed := normalizeFeedURL(ep.FeedURL)
 	if !ep.PubDate.IsZero() && ep.FeedURL != "" {
-		key := "feeddate:" + ep.FeedURL + "|" + ep.PubDate.UTC().Format(time.RFC3339)
+		key := "feeddate:" + normFeed + "|" + ep.PubDate.UTC().Format(time.RFC3339)
 		if entry, ok := index[key]; ok {
 			return entry, true
 		}
 	}
 	if ep.FeedURL != "" && ep.Title != "" {
-		key := "feedtitle:" + ep.FeedURL + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
+		key := "feedtitle:" + normFeed + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
 		if entry, ok := index[key]; ok {
 			return entry, true
 		}
@@ -738,6 +770,39 @@ func filterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[stri
 		}
 	}
 	return out
+}
+
+// normalizeFeedURL returns a canonical form of a podcast feed URL used as a
+// matching key when comparing Apple Podcasts and Overcast feed URLs. It:
+//   - lowercases scheme and host (RFC 3986 requires these to be case-insensitive)
+//   - promotes http to https (treating the two schemes as equivalent for matching)
+//   - strips a trailing slash from the path for canonical form
+//   - drops the fragment (never meaningful for feed identity)
+//
+// Query parameters are preserved because some feeds use them as part of their
+// identity (e.g. ?feed=rss2). Apple's cache-buster params (?t=...) are already
+// stripped by cleanFeedURL before an Apple URL reaches this function.
+//
+// This function is used only for matching keys, never for making HTTP requests.
+func normalizeFeedURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		// Not a parseable URL — fall back to simple lowercasing.
+		return strings.ToLower(strings.TrimRight(raw, "/"))
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	// Treat http and https as equivalent — use https as canonical form.
+	if u.Scheme == "http" {
+		u.Scheme = "https"
+	}
+	// Strip trailing slash from the path for a canonical form.
+	// A bare root path "/" is left intact.
+	if len(u.Path) > 1 {
+		u.Path = strings.TrimRight(u.Path, "/")
+	}
+	u.Fragment = ""
+	return u.String()
 }
 
 // overcastAlreadySatisfied reports whether Overcast's current state for an episode

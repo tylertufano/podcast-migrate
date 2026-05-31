@@ -289,10 +289,13 @@ func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, over
 type PodcastEpisodeListing struct {
 	OvercastURL string // "https://overcast.fm/+HASH"
 	DateStr     string // "YYYY-MM-DD" — day-level precision
+	Title       string // episode title extracted from cell HTML (may be empty)
 }
 
-// episodeCellRe matches a single extendedepisodecell anchor and captures both
-// the episode URL hash and the nested caption2 date text in one match.
+// episodeCellRe matches a single extendedepisodecell anchor and captures:
+//   - group 1: episode URL path "/+HASH"
+//   - group 2: cell body HTML before the caption2 element (used for title extraction)
+//   - group 3: caption2 date/duration text
 //
 // Using a single combined match (rather than two parallel global arrays) avoids
 // an off-by-one bug: some podcast pages include caption2 elements outside of
@@ -304,7 +307,19 @@ type PodcastEpisodeListing struct {
 // within a cell. Each cell contains exactly one caption2 element, so the lazy
 // match always stops at the correct one.
 var episodeCellRe = regexp.MustCompile(
-	`(?s)class="extendedepisodecell[^"]*"[^>]*href="(/\+[^"]+)"[^>]*>.*?class="caption2"[^>]*>([^<]+)<`)
+	`(?s)class="extendedepisodecell[^"]*"[^>]*href="(/\+[^"]+)"[^>]*>(.*?)<[^>]*class="caption2"[^>]*>([^<]+)<`)
+
+// htmlTagRe strips HTML tags for plain-text extraction.
+var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
+
+// extractTextFromHTML strips HTML tags, unescapes HTML entities, and normalises
+// whitespace to produce a plain-text string. Used to extract episode titles from
+// the HTML content of an episode cell body (the content before the caption2 date element).
+func extractTextFromHTML(html string) string {
+	s := htmlTagRe.ReplaceAllString(html, " ")
+	s = htmlpkg.UnescapeString(s)
+	return strings.Join(strings.Fields(s), " ")
+}
 
 // FetchPodcastEpisodes returns all episode listings from an Overcast podcast page.
 // Episodes are returned in the order they appear on the page (most recent first).
@@ -333,7 +348,10 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 	var listings []PodcastEpisodeListing
 	for _, m := range episodeCellRe.FindAllSubmatch(body, -1) {
 		hash := string(m[1])
-		dateText := strings.TrimSpace(htmlpkg.UnescapeString(string(m[2])))
+		// m[2] is the cell body HTML before the caption2 element — strip tags to get title.
+		title := extractTextFromHTML(string(m[2]))
+		// m[3] is the date/duration text inside the caption2 element.
+		dateText := strings.TrimSpace(htmlpkg.UnescapeString(string(m[3])))
 		dateStr, ok := parseOvercastPageDate(dateText)
 		if !ok {
 			continue
@@ -341,6 +359,7 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 		listings = append(listings, PodcastEpisodeListing{
 			OvercastURL: overcastBaseURL + hash,
 			DateStr:     dateStr,
+			Title:       title,
 		})
 	}
 	return listings, nil

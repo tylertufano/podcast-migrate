@@ -310,13 +310,13 @@ const mockSearchResponseNoMatch = `{"results":[]}`
 
 const mockPodcastEpisodePage = `<!DOCTYPE html><html><body>
 <a class="extendedepisodecell usernewepisode" href="/+pGPC7LKNA">
-  <div><span class="caption2">May 27 &#x2022; 12 min</span></div>
+  <div>Episode One Title<span class="caption2">May 27 &#x2022; 12 min</span></div>
 </a>
 <a class="extendedepisodecell" href="/+pGPBzIBYk">
-  <div><span class="caption2">May 20 • 23 min</span></div>
+  <div>Episode Two Title<span class="caption2">May 20 • 23 min</span></div>
 </a>
 <a class="extendedepisodecell" href="/+pGPCojqaA">
-  <div><span class="caption2">Mar 26, 2021 • 76 min</span></div>
+  <div>Episode Three Title<span class="caption2">Mar 26, 2021 • 76 min</span></div>
 </a>
 </body></html>`
 
@@ -425,6 +425,9 @@ func TestFetchPodcastEpisodes_ParsesHashesAndDates(t *testing.T) {
 	if !strings.Contains(last.OvercastURL, "/+pGPCojqaA") {
 		t.Errorf("listings[2].OvercastURL = %q, should contain /+pGPCojqaA", last.OvercastURL)
 	}
+	if last.Title != "Episode Three Title" {
+		t.Errorf("listings[2].Title = %q, want %q", last.Title, "Episode Three Title")
+	}
 }
 
 func TestFetchPodcastEpisodes_OrphanCaption2InHeader(t *testing.T) {
@@ -436,13 +439,13 @@ func TestFetchPodcastEpisodes_OrphanCaption2InHeader(t *testing.T) {
 	const pageWithOrphan = `<!DOCTYPE html><html><body>
 <div class="caption2">www.politicon.com</div>
 <a class="extendedepisodecell usernewepisode" href="/+AAAA">
-  <div><span class="caption2">May 27 • 32 min</span></div>
+  <div>Ep AAAA Title<span class="caption2">May 27 • 32 min</span></div>
 </a>
 <a class="extendedepisodecell userdeletedepisode" href="/+BBBB">
-  <div><span class="caption2">May 20 • 23 min</span></div>
+  <div>Ep BBBB Title<span class="caption2">May 20 • 23 min</span></div>
 </a>
 <a class="extendedepisodecell userdeletedepisode" href="/+CCCC">
-  <div><span class="caption2">Apr 25 • 83 min</span></div>
+  <div>Ep CCCC Title<span class="caption2">Apr 25 • 83 min</span></div>
 </a>
 </body></html>`
 
@@ -469,6 +472,42 @@ func TestFetchPodcastEpisodes_OrphanCaption2InHeader(t *testing.T) {
 	wantDate := fmt.Sprintf("%d-04-25", wantYear)
 	if last.DateStr != wantDate {
 		t.Errorf("listings[2].DateStr = %q, want %q", last.DateStr, wantDate)
+	}
+}
+
+func TestFetchPodcastEpisodes_TitleExtracted(t *testing.T) {
+	// Verify that episode titles are extracted from the cell body HTML and HTML
+	// entities are unescaped (e.g. &amp; → &).
+	const pageWithTitles = `<!DOCTYPE html><html><body>
+<a class="extendedepisodecell" href="/+HASH1">
+  <div class="cell">Kash Patel &amp; The Liquor Cabinet: Live In Denver<span class="caption2">Apr 25, 2026 • 83 min</span></div>
+</a>
+<a class="extendedepisodecell" href="/+HASH2">
+  <div class="cell">No Title Episode<span class="caption2">Apr 18, 2026 • 45 min</span></div>
+</a>
+</body></html>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(pageWithTitles))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	listings, err := overcast.FetchPodcastEpisodes(context.Background(), client, srv.URL+"/itunes12345/test")
+	if err != nil {
+		t.Fatalf("FetchPodcastEpisodes: %v", err)
+	}
+	if len(listings) != 2 {
+		t.Fatalf("got %d listings, want 2", len(listings))
+	}
+	// Title with HTML entity should be unescaped.
+	if listings[0].Title != "Kash Patel & The Liquor Cabinet: Live In Denver" {
+		t.Errorf("listings[0].Title = %q, want %q",
+			listings[0].Title, "Kash Patel & The Liquor Cabinet: Live In Denver")
+	}
+	if listings[0].DateStr != "2026-04-25" {
+		t.Errorf("listings[0].DateStr = %q, want %q", listings[0].DateStr, "2026-04-25")
 	}
 }
 

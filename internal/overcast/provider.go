@@ -430,9 +430,23 @@ func augmentIndexFromPodcastPages(
 		// Build date → episode URL map for this podcast page.
 		// Key is "YYYY-MM-DD"; Overcast pages use day-level precision.
 		dateToURL := make(map[string]string, len(listings))
+		// Also build a normalised-title list for fallback matching when date matching fails.
+		// The cell body HTML may contain the podcast name before the episode title, so we
+		// use strings.Contains (case-insensitive) rather than an exact map key lookup.
+		type titleEntry struct {
+			normTitle string
+			url       string
+		}
+		var titleEntries []titleEntry
 		for _, l := range listings {
 			if _, exists := dateToURL[l.DateStr]; !exists {
 				dateToURL[l.DateStr] = l.OvercastURL
+			}
+			if l.Title != "" {
+				titleEntries = append(titleEntries, titleEntry{
+					normTitle: strings.ToLower(l.Title),
+					url:       l.OvercastURL,
+				})
 			}
 		}
 
@@ -449,6 +463,32 @@ func augmentIndexFromPodcastPages(
 			}
 			if epURL == "" {
 				epURL = dateToURL[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]
+			}
+			// Fallback: title-based matching when date matching fails.
+			// This handles episodes where the pubDate stored in Apple Podcasts doesn't
+			// align with the date Overcast shows on the podcast page (e.g. timezone
+			// differences in the RSS feed's pubDate field).
+			if epURL == "" && ap.Title != "" {
+				normAppleTitle := strings.ToLower(strings.TrimSpace(ap.Title))
+				// Exact match first (cell text == episode title).
+				for _, te := range titleEntries {
+					if te.normTitle == normAppleTitle {
+						epURL = te.url
+						break
+					}
+				}
+				// Broader contains-match: cell text may include podcast name prefix.
+				if epURL == "" {
+					for _, te := range titleEntries {
+						if strings.Contains(te.normTitle, normAppleTitle) {
+							epURL = te.url
+							break
+						}
+					}
+				}
+				if epURL != "" {
+					fmt.Printf("  title match: %q (date match failed)\n", ap.Title)
+				}
 			}
 			if epURL == "" {
 				continue

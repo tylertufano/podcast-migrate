@@ -138,8 +138,12 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 				out.Episodes = append(out.Episodes, ep)
 			}
 		}
-		// Any dst episodes not in src are kept as-is.
+		// Destination-only episodes (no match in src) are included so the writer
+		// can perform conflict resolution, but they are flagged so writers can
+		// distinguish them from source-originated episodes and skip re-processing
+		// their own data (e.g. the Apple writer ignoring Apple-sourced episodes).
 		for _, ep := range dstIndex {
+			ep.FromDestination = true
 			out.Episodes = append(out.Episodes, ep)
 		}
 	}

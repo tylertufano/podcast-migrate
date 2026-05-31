@@ -35,6 +35,12 @@ type EpisodeState struct {
 	PlayState    PlayState
 	PlayPosition time.Duration // 0 means not started or unknown
 	LastPlayed   time.Time
+
+	// FromDestination is true for episodes that originated exclusively from
+	// the destination provider (i.e. they had no matching episode in the source
+	// library). Writers use this to skip episodes that came from themselves —
+	// there is no source state to apply and re-processing them produces noise.
+	FromDestination bool
 }
 
 // Library is the canonical intermediate representation shared by all providers.

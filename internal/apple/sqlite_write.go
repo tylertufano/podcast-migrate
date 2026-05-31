@@ -99,6 +99,12 @@ func (w *SQLiteWriter) Write(ctx context.Context, lib *model.Library, opts provi
 	notFound := 0
 
 	for _, ep := range episodes {
+		// Skip episodes that originated from Apple's own database. There is no
+		// source state to apply and re-processing them produces spurious log
+		// entries for episodes that never existed in the Overcast OPML.
+		if ep.FromDestination {
+			continue
+		}
 		if ep.PlayState == model.PlayStateUnplayed {
 			continue
 		}
@@ -180,6 +186,9 @@ func (w *SQLiteWriter) dryRun(ctx context.Context, lib *model.Library, opts prov
 	notFound := 0
 	skipped := 0
 	for _, ep := range episodes {
+		if ep.FromDestination {
+			continue
+		}
 		if ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
 		}

@@ -77,13 +77,18 @@ func (e *Engine) Run(ctx context.Context, opts provider.WriteOptions) (*Result, 
 		SkippedPaywalledEpisodes: srcLib.SkippedPaywalledEpisodes,
 		SkippedInternalPodcasts:  srcLib.SkippedInternalPodcasts,
 	}
-	if dstLib != nil {
-		res.SubscriptionsAdded = len(merged.Podcasts) - len(dstLib.Podcasts)
-		if res.SubscriptionsAdded < 0 {
-			res.SubscriptionsAdded = 0
+	// Only count subscriptions added when the destination can actually receive them.
+	// Destinations like Apple Podcasts report WriteSubscriptions=false and have no
+	// subscription write path — counting would produce a misleadingly large number.
+	if dstCaps.WriteSubscriptions {
+		if dstLib != nil {
+			res.SubscriptionsAdded = len(merged.Podcasts) - len(dstLib.Podcasts)
+			if res.SubscriptionsAdded < 0 {
+				res.SubscriptionsAdded = 0
+			}
+		} else {
+			res.SubscriptionsAdded = len(merged.Podcasts)
 		}
-	} else {
-		res.SubscriptionsAdded = len(merged.Podcasts)
 	}
 
 	if err := e.dst.SetLibrary(ctx, merged, opts); err != nil {

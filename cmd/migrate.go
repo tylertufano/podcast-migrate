@@ -116,9 +116,11 @@ func migrateCmd() *cobra.Command {
 			opts := provider.WriteOptions{
 				DryRun:            dryRun,
 				OnlySubscriptions: onlySubs,
-				// When --play-state is set and destination is Apple Podcasts, restrict
-				// writes to play state only (Apple has no subscription write API).
-				OnlyPlayState:    playState && (to == "podcasts" || to == "apple"),
+				// Note: OnlyPlayState is intentionally NOT set here. Setting it causes
+				// merge() to skip the subscription union, which empties merged.Podcasts
+				// and breaks feedToTitle (the episode→podcast title lookup used by
+				// --podcast filters and cross-feed-URL episode matching).
+				// The Apple Podcasts writer ignores subscriptions internally regardless.
 				ConflictStrategy: parseConflictStrategy(conflictStrategy),
 				RequestDelay:     requestDelay,
 				PodcastFilter:    allFilters,

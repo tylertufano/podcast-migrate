@@ -41,7 +41,11 @@ const (
 )
 
 // numericIDRe extracts the internal numeric episode ID from an Overcast episode page.
+// The original attribute was data-item-id; the fallback looks for the ID inside
+// any set_progress URL on the page (form action, href, or JS string literal),
+// which is more robust to page-structure changes.
 var numericIDRe = regexp.MustCompile(`data-item-id="(\d+)"`)
+var numericIDFromSetProgressRe = regexp.MustCompile(`set_progress/(\d+)`)
 
 // Login authenticates with Overcast and returns an *http.Client whose cookie jar
 // holds a valid session. The client must be reused for all subsequent API calls
@@ -140,7 +144,8 @@ func FetchEpisodeNumericID(ctx context.Context, client *http.Client, episodeURL 
 	if err != nil {
 		return "", fmt.Errorf("overcast/web: GET %s: %w", episodeURL, err)
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	// Read the full body — the numeric ID may appear anywhere on the page.
+	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -150,11 +155,22 @@ func FetchEpisodeNumericID(ctx context.Context, client *http.Client, episodeURL 
 		return "", fmt.Errorf("overcast/web: GET %s returned HTTP %d", episodeURL, resp.StatusCode)
 	}
 
-	m := numericIDRe.FindSubmatch(body)
-	if m == nil {
-		return "", fmt.Errorf("overcast/web: data-item-id attribute not found on %s", episodeURL)
+	// Primary: data-item-id attribute (original location).
+	if m := numericIDRe.FindSubmatch(body); m != nil {
+		return string(m[1]), nil
 	}
-	return string(m[1]), nil
+	// Fallback: set_progress URL anywhere on the page (form action, href, JS literal).
+	// Overcast's web player must reference the set_progress endpoint, and that URL
+	// contains the numeric ID directly — more robust to page-structure changes.
+	if m := numericIDFromSetProgressRe.FindSubmatch(body); m != nil {
+		return string(m[1]), nil
+	}
+
+	// Neither pattern found. Save the raw HTML so the page structure can be inspected.
+	debugPath := filepath.Join(os.TempDir(), "overcast-episode-page-debug.html")
+	_ = os.WriteFile(debugPath, body, 0644)
+	return "", fmt.Errorf("overcast/web: numeric episode ID not found on %s (raw HTML saved to %s)",
+		episodeURL, debugPath)
 }
 
 // SetProgress updates the playback position for an episode on Overcast.

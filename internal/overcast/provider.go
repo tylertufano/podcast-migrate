@@ -595,6 +595,10 @@ func augmentIndexFromPodcastPages(
 					}
 					continue // retry same attempt slot
 				}
+				// Log the first few individual errors so the root cause is visible.
+				if consecutiveErrors < 3 {
+					fmt.Printf("  error fetching %s: %v\n", item.episodeURL, err)
+				}
 				consecutiveErrors++
 				if consecutiveErrors > 10 {
 					fmt.Printf("  too many consecutive errors, stopping extended matching\n")

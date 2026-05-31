@@ -4,8 +4,9 @@ import "github.com/spf13/cobra"
 
 func Root() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "podcast-migrate",
-		Short: "Migrate podcast subscriptions and play state between apps",
+		Use:     "podcast-migrate",
+		Version: version,
+		Short:   "Migrate podcast subscriptions and play state between apps",
 		Long: `podcast-migrate moves subscriptions and episode play state between
 podcast applications (Apple Podcasts, Overcast, and more).
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -51,6 +52,11 @@ type appleEpisodeRecord struct {
 	pubDate      time.Time
 	playState    model.PlayState
 	playPosition time.Duration
+	// rawZPlayState is the raw ZPLAYSTATE column value (0/1/2).
+	// playState above uses 4-column detection to include shadow-played episodes;
+	// rawZPlayState is used by applySatisfied to require explicit Apple Podcasts
+	// sign-off (ZPLAYSTATE=2) before considering a "played" episode satisfied.
+	rawZPlayState int64
 }
 
 // Write applies episode play state from lib to the Apple Podcasts SQLite database,
@@ -86,6 +92,8 @@ func (w *SQLiteWriter) Write(ctx context.Context, lib *model.Library, opts provi
 	}
 	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
 
+	writeLogHeader(opts.LogWriter)
+
 	updated := 0
 	skipped := 0
 	notFound := 0
@@ -98,14 +106,23 @@ func (w *SQLiteWriter) Write(ctx context.Context, lib *model.Library, opts provi
 			continue
 		}
 
+		podTitle := feedToTitle[ep.FeedURL]
+
 		appleRec, ok := findInAppleIndex(index, ep, feedToTitle)
 		if !ok {
 			notFound++
+			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+				"no match in Apple Podcasts database")
 			continue
 		}
 
 		if applySatisfied(ep, appleRec, opts.ConflictStrategy) {
 			skipped++
+			writeLogLine(opts.LogWriter, "skipped", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition),
+				playStateLabel(appleRec.playState, appleRec.playPosition),
+				skippedReason(ep, appleRec, opts.ConflictStrategy))
 			continue
 		}
 
@@ -113,6 +130,9 @@ func (w *SQLiteWriter) Write(ctx context.Context, lib *model.Library, opts provi
 			fmt.Printf("  warning: could not update %q (pk=%d): %v\n", ep.Title, appleRec.pk, err)
 			continue
 		}
+		writeLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
+			playStateLabel(ep.PlayState, ep.PlayPosition),
+			playStateLabel(appleRec.playState, appleRec.playPosition), "")
 		updated++
 	}
 
@@ -121,6 +141,15 @@ func (w *SQLiteWriter) Write(ctx context.Context, lib *model.Library, opts provi
 	}
 	if notFound > 0 {
 		fmt.Printf("apple: %d episode(s) not found in Apple Podcasts database (may not be downloaded/subscribed)\n", notFound)
+	}
+
+	// Flush WAL frames to the main database file so Apple Podcasts sees the
+	// changes immediately when it next opens. Without this checkpoint, our writes
+	// sit in MTLibrary.sqlite-wal and could be missed if the WAL is reset.
+	if updated > 0 {
+		if _, err := db.ExecContext(ctx, "PRAGMA wal_checkpoint(FULL)"); err != nil {
+			fmt.Printf("apple: warning: WAL checkpoint failed (%v); changes may not be visible until next iCloud sync\n", err)
+		}
 	}
 
 	return updated, nil
@@ -145,6 +174,8 @@ func (w *SQLiteWriter) dryRun(ctx context.Context, lib *model.Library, opts prov
 	}
 	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
 
+	writeLogHeader(opts.LogWriter)
+
 	n := 0
 	notFound := 0
 	skipped := 0
@@ -152,15 +183,27 @@ func (w *SQLiteWriter) dryRun(ctx context.Context, lib *model.Library, opts prov
 		if ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
 		}
+		podTitle := feedToTitle[ep.FeedURL]
+
 		appleRec, ok := findInAppleIndex(index, ep, feedToTitle)
 		if !ok {
 			notFound++
+			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+				"no match in Apple Podcasts database")
 			continue
 		}
 		if applySatisfied(ep, appleRec, opts.ConflictStrategy) {
 			skipped++
+			writeLogLine(opts.LogWriter, "skipped", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition),
+				playStateLabel(appleRec.playState, appleRec.playPosition),
+				skippedReason(ep, appleRec, opts.ConflictStrategy))
 			continue
 		}
+		writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
+			playStateLabel(ep.PlayState, ep.PlayPosition),
+			playStateLabel(appleRec.playState, appleRec.playPosition), "")
 		n++
 	}
 
@@ -255,6 +298,9 @@ func (w *SQLiteWriter) buildAppleIndex(ctx context.Context, db *sql.DB) (map[str
 		if pubDateRaw.Valid {
 			rec.pubDate = coreDataEpoch.Add(time.Duration(pubDateRaw.Float64 * float64(time.Second)))
 		}
+		if playStateSq.Valid {
+			rec.rawZPlayState = playStateSq.Int64
+		}
 
 		// Replicate the same play-state detection logic as the SQLite reader so
 		// that the index's view of "current state" matches what GetLibrary reports.
@@ -309,28 +355,37 @@ func (w *SQLiteWriter) updateEpisodePlayState(ctx context.Context, db *sql.DB, p
 
 	var playStateVal int64
 	var playHeadVal float64
-	var playCountExpr string
 
 	switch ep.PlayState {
 	case model.PlayStatePlayed:
 		playStateVal = applePlayStatePlayed
 		playHeadVal = 0
-		playCountExpr = "MAX(COALESCE(ZPLAYCOUNT, 0), 1)"
 	case model.PlayStateInProgress:
 		playStateVal = applePlayStateInProgress
 		playHeadVal = ep.PlayPosition.Seconds()
-		playCountExpr = "COALESCE(ZPLAYCOUNT, 0)"
 	default:
 		return nil // nothing to write for unplayed
 	}
 
-	query := fmt.Sprintf(`
+	// ZPLAYCOUNT is intentionally NOT updated. It is Apple's internal play counter
+	// managed by CoreData and iCloud sync; we don't own it. Leaving it untouched
+	// means ZPLAYCOUNT>0 reliably signals a genuine "shadow-played" episode
+	// (played on another Apple device via iCloud) rather than being contaminated
+	// by our writes. This makes the shadow-played detection in buildAppleIndex
+	// trustworthy across multiple runs.
+	//
+	// Z_OPT is CoreData's per-row optimistic locking counter. Incrementing it
+	// signals to CoreData that the row has been modified externally. Without this,
+	// CoreData's next save (even for an unrelated change on the same row) will
+	// write back its cached field values — including the old ZPLAYSTATE — and
+	// silently undo our update.
+	const query = `
 		UPDATE ZMTEPISODE
 		SET ZPLAYSTATE      = ?,
 		    ZPLAYHEAD       = ?,
-		    ZPLAYCOUNT      = %s,
-		    ZLASTDATEPLAYED = ?
-		WHERE Z_PK = ?`, playCountExpr)
+		    ZLASTDATEPLAYED = ?,
+		    Z_OPT           = Z_OPT + 1
+		WHERE Z_PK = ?`
 
 	_, err := db.ExecContext(ctx, query, playStateVal, playHeadVal, nowCD, pk)
 	if err != nil {
@@ -404,6 +459,15 @@ func findInAppleIndex(index map[string]appleEpisodeRecord, ep model.EpisodeState
 
 // applySatisfied reports whether the Apple episode's current state already meets
 // or exceeds the desired state, making an update unnecessary.
+//
+// For the FurthestWins "played" check we require rawZPlayState == 2, not just
+// any playState == PlayStatePlayed. This distinction matters because playState
+// is derived from a 4-column check that also fires on "shadow-played" episodes
+// (ZPLAYSTATE=0, ZPLAYCOUNT>0). If a previous run wrote ZPLAYCOUNT=1 and then
+// CoreData reverted ZPLAYSTATE to 0, the episode would be incorrectly treated as
+// already-satisfied — but Apple would still display it as unplayed. By requiring
+// ZPLAYSTATE=2 we avoid false positives and ensure we write the explicit Apple
+// play state that CoreData (and hence the UI) actually respects.
 func applySatisfied(desired model.EpisodeState, current appleEpisodeRecord, strategy provider.ConflictStrategy) bool {
 	switch strategy {
 	case provider.SourceWins:
@@ -413,9 +477,13 @@ func applySatisfied(desired model.EpisodeState, current appleEpisodeRecord, stra
 	default: // FurthestWins
 		switch desired.PlayState {
 		case model.PlayStatePlayed:
-			return current.playState == model.PlayStatePlayed
+			// Only skip if Apple explicitly marks the episode played (ZPLAYSTATE=2).
+			// Shadow-played (ZPLAYCOUNT>0, ZPLAYSTATE=0) is NOT considered satisfied:
+			// those episodes may show unplayed in the UI after a CoreData save reverts
+			// ZPLAYSTATE. Setting ZPLAYSTATE=2 on them is idempotent and correct.
+			return current.rawZPlayState == applePlayStatePlayed
 		case model.PlayStateInProgress:
-			if current.playState == model.PlayStatePlayed {
+			if current.rawZPlayState == applePlayStatePlayed {
 				return true // Apple already further
 			}
 			if current.playState == model.PlayStateInProgress {
@@ -513,4 +581,74 @@ func podDateKey(normPodTitle string, pubDate time.Time) string {
 
 func podTitleKey(normPodTitle, epTitle string) string {
 	return "podtitle:" + normPodTitle + "|" + strings.ToLower(strings.TrimSpace(epTitle))
+}
+
+// ---------------------------------------------------------------------------
+// Per-episode log helpers
+// ---------------------------------------------------------------------------
+
+// writeLogHeader writes the CSV column header to w. No-op when w is nil.
+func writeLogHeader(w io.Writer) {
+	if w == nil {
+		return
+	}
+	fmt.Fprintln(w, "status,podcast,episode,pub_date,source_state,target_state,note")
+}
+
+// writeLogLine writes one CSV row to w. No-op when w is nil.
+func writeLogLine(w io.Writer, status, podcast, episode string, pubDate time.Time, srcState, tgtState, note string) {
+	if w == nil {
+		return
+	}
+	dateStr := ""
+	if !pubDate.IsZero() {
+		dateStr = pubDate.UTC().Format("2006-01-02")
+	}
+	fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s\n",
+		csvField(status), csvField(podcast), csvField(episode),
+		dateStr,
+		csvField(srcState), csvField(tgtState), csvField(note))
+}
+
+// playStateLabel returns a human-readable string for a play state.
+// For in-progress, the rounded playback position is appended in parentheses.
+func playStateLabel(ps model.PlayState, pos time.Duration) string {
+	switch ps {
+	case model.PlayStatePlayed:
+		return "played"
+	case model.PlayStateInProgress:
+		if pos > 0 {
+			return "in_progress(" + pos.Round(time.Second).String() + ")"
+		}
+		return "in_progress"
+	default:
+		return "unplayed"
+	}
+}
+
+// skippedReason returns a short string explaining why applySatisfied returned true.
+func skippedReason(desired model.EpisodeState, current appleEpisodeRecord, strategy provider.ConflictStrategy) string {
+	if strategy == provider.TargetWins {
+		return "target_wins"
+	}
+	// FurthestWins
+	switch current.playState {
+	case model.PlayStatePlayed:
+		return "already_played"
+	case model.PlayStateInProgress:
+		if desired.PlayState == model.PlayStateInProgress && current.playPosition >= desired.PlayPosition {
+			return fmt.Sprintf("apple_ahead(%.0fs_vs_%.0fs)",
+				current.playPosition.Seconds(), desired.PlayPosition.Seconds())
+		}
+	}
+	return "already_satisfied"
+}
+
+// csvField wraps a field in double-quotes and escapes internal quotes if the
+// value contains a comma, double-quote, or newline; otherwise returns it as-is.
+func csvField(s string) string {
+	if strings.ContainsAny(s, ",\"\n\r") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
 }

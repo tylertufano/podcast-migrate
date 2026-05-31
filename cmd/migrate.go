@@ -32,6 +32,7 @@ func migrateCmd() *cobra.Command {
 		requestDelay     time.Duration
 		podcastFilter    []string // --podcast (repeatable)
 		podcastListFile  string   // --podcast-list (file path)
+		logFile          string   // --log-file (per-episode CSV log)
 	)
 
 	cmd := &cobra.Command{
@@ -126,6 +127,15 @@ func migrateCmd() *cobra.Command {
 				PodcastFilter:    allFilters,
 			}
 
+			if logFile != "" {
+				f, err := os.Create(logFile)
+				if err != nil {
+					return fmt.Errorf("--log-file: %w", err)
+				}
+				defer f.Close()
+				opts.LogWriter = f
+			}
+
 			engine := sync.New(src, dst)
 			result, err := engine.Run(context.Background(), opts)
 			if err != nil {
@@ -163,6 +173,7 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&requestDelay, "request-delay", overcast.DefaultRequestDelay, "delay between consecutive Overcast API requests (increase if you hit 429 rate limits)")
 	cmd.Flags().StringArrayVar(&podcastFilter, "podcast", nil, "limit play-state sync to podcasts whose title contains this word/phrase (case-insensitive, repeatable)")
 	cmd.Flags().StringVar(&podcastListFile, "podcast-list", "", "path to a file with one podcast title/word per line; combined with --podcast")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write per-episode detail to this CSV file (columns: status, podcast, episode, pub_date, source_state, target_state, note)")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")

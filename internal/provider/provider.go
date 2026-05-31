@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/model"
@@ -38,6 +39,14 @@ type WriteOptions struct {
 	// from podcasts whose title contains at least one of the filter strings
 	// (case-insensitive substring match). An empty slice means "all podcasts".
 	PodcastFilter []string
+
+	// LogWriter, when non-nil, receives one CSV line per episode describing
+	// the outcome of the write attempt: updated, skipped (already satisfied),
+	// or not_found (no match in the target database). In dry-run mode the
+	// status is "would_update" instead of "updated".
+	// The writer emits a header row followed by one data row per episode.
+	// nil disables per-episode logging.
+	LogWriter io.Writer
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

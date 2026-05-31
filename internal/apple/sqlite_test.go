@@ -48,6 +48,7 @@ func setupSQLiteDB(t *testing.T) string {
 
 	_, err = db.Exec(`CREATE TABLE ZMTEPISODE (
 		Z_PK            INTEGER PRIMARY KEY,
+		Z_OPT           INTEGER NOT NULL DEFAULT 1,
 		ZPODCAST        INTEGER,
 		ZGUID           TEXT,
 		ZTITLE          TEXT,
@@ -77,7 +78,10 @@ func setupSQLiteDB(t *testing.T) string {
 	insertEpisode := func(pk, podcastPK int, guid interface{}, title string, pubDate, duration float64, playState, playCount int, playHead float64, lastPlayed interface{}, priceType string) {
 		t.Helper()
 		_, err := db.Exec(
-			`INSERT INTO ZMTEPISODE VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			`INSERT INTO ZMTEPISODE
+				(Z_PK, ZPODCAST, ZGUID, ZTITLE, ZPUBDATE, ZDURATION,
+				 ZPLAYSTATE, ZPLAYCOUNT, ZPLAYHEAD, ZLASTDATEPLAYED, ZPRICETYPE)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 			pk, podcastPK, guid, title, pubDate, duration, playState, playCount, playHead, lastPlayed, priceType,
 		)
 		if err != nil {

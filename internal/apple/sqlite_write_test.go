@@ -3,6 +3,7 @@ package apple_test
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,16 +115,20 @@ func TestSQLiteWriter_MarkEpisodePlayed_ByTitle(t *testing.T) {
 	}
 }
 
-// TestSQLiteWriter_FurthestWins_SkipsShadowPlayed verifies that "shadow played"
+// TestSQLiteWriter_FurthestWins_UpdatesShadowPlayed verifies that "shadow played"
 // episodes (ZPLAYSTATE=0 but ZPLAYCOUNT=1 or ZLASTDATEPLAYED set — played on
-// another device via iCloud sync) are correctly detected as already played by
-// the index and skipped rather than being counted as "would update".
-func TestSQLiteWriter_FurthestWins_SkipsShadowPlayed(t *testing.T) {
+// another device via iCloud sync) receive an explicit ZPLAYSTATE=2 write.
+//
+// We intentionally update these: the satisfied check requires rawZPlayState==2 so
+// that episodes where a previous write was silently reverted by CoreData (which
+// leaves ZPLAYSTATE=0 but ZPLAYCOUNT=1) are not incorrectly skipped.
+// Writing ZPLAYSTATE=2 on a shadow-played episode is idempotent — Apple already
+// considers it played, and subsequent runs will see ZPLAYSTATE=2 and skip it.
+func TestSQLiteWriter_FurthestWins_UpdatesShadowPlayed(t *testing.T) {
 	path := setupSQLiteDB(t)
+	db := openTestDB(t, path)
 
 	// ep9: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1, ZLASTDATEPLAYED=692100000.0
-	// The reader reports this as PlayStatePlayed (shadow played).
-	// The writer must treat it the same way — skip rather than overwrite.
 	pubDate := coreDataTime(692000000.0)
 	lib := buildWriteLib("https://feeds.example.com/show-a", "Show A", []model.EpisodeState{
 		{
@@ -138,8 +143,16 @@ func TestSQLiteWriter_FurthestWins_SkipsShadowPlayed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if n != 0 {
-		t.Errorf("shadow-played episode should be skipped (FurthestWins, already played), got %d update(s)", n)
+	// Shadow-played (ZPLAYSTATE=0) must be updated to ZPLAYSTATE=2 so that
+	// a subsequent run can confirm it is satisfied via the strict rawZPlayState check.
+	if n != 1 {
+		t.Errorf("shadow-played episode should be updated (ZPLAYSTATE→2), got %d update(s)", n)
+	}
+
+	// Confirm ZPLAYSTATE was set to 2.
+	ps, _, _ := readPlayState(t, db, "rss-guid-9")
+	if ps != 2 {
+		t.Errorf("ZPLAYSTATE after update: got %d, want 2", ps)
 	}
 }
 
@@ -404,7 +417,9 @@ func TestSQLiteWriter_URLNormalization_HttpToHttps(t *testing.T) {
 	// The incoming library uses https:// — normalisation should bridge the gap.
 	// We need an episode on show-b. ep6/7 are PSUB/PLUS and excluded from the
 	// writer's query; let's insert an untouched episode on show-b.
-	_, err := db.Exec(`INSERT INTO ZMTEPISODE VALUES (100, 2, 'rss-guid-100', 'Show B Ep', 698500000.0, 1800.0, 0, 0, 0.0, NULL, 'STDQ')`)
+	_, err := db.Exec(`INSERT INTO ZMTEPISODE
+		(Z_PK, ZPODCAST, ZGUID, ZTITLE, ZPUBDATE, ZDURATION, ZPLAYSTATE, ZPLAYCOUNT, ZPLAYHEAD, ZLASTDATEPLAYED, ZPRICETYPE)
+		VALUES (100, 2, 'rss-guid-100', 'Show B Ep', 698500000.0, 1800.0, 0, 0, 0.0, NULL, 'STDQ')`)
 	if err != nil {
 		t.Fatalf("insert episode: %v", err)
 	}
@@ -495,5 +510,54 @@ func TestAppleProvider_SetLibrary_ReturnsError_WhenSQLiteMissing(t *testing.T) {
 	err := p.SetLibrary(context.Background(), &model.Library{}, provider.WriteOptions{})
 	if err == nil {
 		t.Error("expected error from SetLibrary when SQLite database does not exist")
+	}
+}
+
+// TestSQLiteWriter_LogWriter_DryRun checks that the CSV log captures
+// would_update, skipped, and not_found rows correctly in dry-run mode.
+func TestSQLiteWriter_LogWriter_DryRun(t *testing.T) {
+	path := setupSQLiteDB(t)
+
+	// ep4  (rss-guid-4) — currently unplayed; source says played  → would_update
+	// ep1  (rss-guid-1) — already ZPLAYSTATE=2 (played); pubDate=700000000 → skipped (already_played)
+	// fake episode with no Apple DB match                          → not_found
+	pubDate4 := coreDataTime(697000000.0)
+	pubDate1 := coreDataTime(700000000.0) // matches ep1 in test DB (see setupSQLiteDB)
+	pubFake := coreDataTime(600000000.0)
+
+	lib := buildWriteLib("https://feeds.example.com/show-a", "Show A", []model.EpisodeState{
+		{Title: "Untouched", PubDate: pubDate4, PlayState: model.PlayStatePlayed},
+		{Title: "Played Episode", PubDate: pubDate1, PlayState: model.PlayStatePlayed},
+		{Title: "No Such Episode", PubDate: pubFake, PlayState: model.PlayStatePlayed},
+	})
+
+	var buf strings.Builder
+	n, err := apple.NewSQLiteWriter(path).Write(context.Background(), lib, provider.WriteOptions{
+		DryRun:    true,
+		LogWriter: &buf,
+	})
+	if err != nil {
+		t.Fatalf("Write (dry-run): %v", err)
+	}
+	if n != 1 {
+		t.Errorf("would-update count: got %d, want 1", n)
+	}
+
+	log := buf.String()
+	// Header must be present.
+	if !strings.Contains(log, "status,podcast,episode,pub_date,source_state,target_state,note") {
+		t.Errorf("log missing CSV header:\n%s", log)
+	}
+	// The unplayed episode must appear as would_update.
+	if !strings.Contains(log, "would_update") {
+		t.Errorf("log missing would_update row:\n%s", log)
+	}
+	// The already-played episode must appear as skipped.
+	if !strings.Contains(log, "skipped") {
+		t.Errorf("log missing skipped row:\n%s", log)
+	}
+	// The unknown episode must appear as not_found.
+	if !strings.Contains(log, "not_found") {
+		t.Errorf("log missing not_found row:\n%s", log)
 	}
 }

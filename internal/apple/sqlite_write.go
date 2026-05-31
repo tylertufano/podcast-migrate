@@ -14,10 +14,18 @@ import (
 )
 
 // SQLiteWriter writes episode play state back to the Apple Podcasts SQLite
-// database (MTLibrary.sqlite). It matches incoming episodes by feed URL +
-// publication date (primary) or feed URL + normalised title (fallback),
-// then updates the four relevant columns: ZPLAYSTATE, ZPLAYHEAD, ZPLAYCOUNT,
-// and ZLASTDATEPLAYED.
+// database (MTLibrary.sqlite).
+//
+// Episode matching uses a two-tier approach to handle the common case where
+// Overcast and Apple Podcasts have subscribed to the same show via different
+// feed URLs (different CDNs, http vs https redirect, etc.):
+//
+//  1. Primary (same feed URL): feedURL+pubDate, then feedURL+episodeTitle
+//  2. Secondary (same podcast title, any feed URL): podcastTitle+pubDate,
+//     then podcastTitle+episodeTitle
+//
+// The secondary tier lets the writer match episodes even when the two apps
+// diverged on the canonical feed URL for the same show.
 //
 // Safety constraints:
 //   - Only existing ZMTEPISODE rows are updated; no new rows are inserted.
@@ -37,6 +45,7 @@ func NewSQLiteWriter(dbPath string) *SQLiteWriter {
 type appleEpisodeRecord struct {
 	pk           int64
 	feedURL      string
+	podcastTitle string // normalised podcast title from ZMTPODCAST.ZTITLE
 	guid         string
 	title        string
 	pubDate      time.Time
@@ -90,13 +99,13 @@ func (w *SQLiteWriter) Write(ctx context.Context, lib *model.Library, opts provi
 			continue
 		}
 
-		appleRec, ok := findInAppleIndex(index, ep)
+		appleRec, ok := findInAppleIndex(index, ep, feedToTitle)
 		if !ok {
 			notFound++
 			continue
 		}
 
-		if appleSatisfied(ep, appleRec, opts.ConflictStrategy) {
+		if applySatisfied(ep, appleRec, opts.ConflictStrategy) {
 			skipped++
 			continue
 		}
@@ -134,32 +143,59 @@ func (w *SQLiteWriter) dryRun(ctx context.Context, lib *model.Library, opts prov
 	feedToTitle := buildFeedToTitleFromLib(lib)
 	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
 
+	if len(opts.PodcastFilter) > 0 {
+		fmt.Printf("apple: podcast filter active — %q — %d/%d episode(s) in scope\n",
+			opts.PodcastFilter, len(episodes), len(lib.Episodes))
+	}
+
 	n := 0
+	notFound := 0
+	skipped := 0
 	for _, ep := range episodes {
 		if ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
 		}
-		appleRec, ok := findInAppleIndex(index, ep)
+		appleRec, ok := findInAppleIndex(index, ep, feedToTitle)
 		if !ok {
+			notFound++
 			continue
 		}
-		if !appleSatisfied(ep, appleRec, opts.ConflictStrategy) {
-			n++
+		if applySatisfied(ep, appleRec, opts.ConflictStrategy) {
+			skipped++
+			continue
 		}
+		n++
 	}
+
+	if notFound > 0 {
+		fmt.Printf("apple: %d episode(s) not found in Apple Podcasts database (not downloaded or streamed)\n", notFound)
+	}
+	if skipped > 0 {
+		fmt.Printf("apple: skipping %d episode(s) already at desired state\n", skipped)
+	}
+
 	return n, nil
 }
 
-// buildAppleIndex queries ZMTEPISODE (joined to ZMTPODCAST) and returns
-// a map keyed by both feeddate and feedtitle match keys.
-// Only episodes on subscribed, publicly-accessible feeds are included.
+// buildAppleIndex queries ZMTEPISODE (joined to ZMTPODCAST) and returns a map
+// keyed by multiple match strategies. Four key types are built for each episode:
+//
+//   feeddate:<normFeedURL>|<RFC3339>       — primary: same feed URL, same pubDate
+//   feedtitle:<normFeedURL>|<normTitle>    — fallback: same feed URL, same episode title
+//   poddate:<normPodTitle>|<RFC3339>       — secondary: same podcast title, same pubDate
+//   podtitle:<normPodTitle>|<normEpTitle>  — secondary fallback: same podcast + episode title
+//
+// The "pod" keys allow matching when Overcast and Apple Podcasts subscribed to
+// the same show via different feed URLs.
 func (w *SQLiteWriter) buildAppleIndex(ctx context.Context, db *sql.DB) (map[string]appleEpisodeRecord, error) {
+	// Note: both p.ZTITLE and e.ZTITLE exist; alias them to avoid ambiguity.
 	const q = `
 		SELECT
 			e.Z_PK,
 			e.ZGUID,
 			p.ZFEEDURL,
-			e.ZTITLE,
+			p.ZTITLE AS PODCAST_TITLE,
+			e.ZTITLE AS EPISODE_TITLE,
 			e.ZPUBDATE,
 			e.ZPLAYHEAD,
 			e.ZPLAYSTATE
@@ -179,22 +215,34 @@ func (w *SQLiteWriter) buildAppleIndex(ctx context.Context, db *sql.DB) (map[str
 
 	for rows.Next() {
 		var (
-			pk          int64
-			guid        sql.NullString
-			feedURL     string
-			title       string
-			pubDateRaw  sql.NullFloat64
-			playHeadSec sql.NullFloat64
-			playStateSq sql.NullInt64
+			pk             int64
+			guid           sql.NullString
+			feedURL        string
+			podcastTitle   sql.NullString
+			episodeTitle   sql.NullString
+			pubDateRaw     sql.NullFloat64
+			playHeadSec    sql.NullFloat64
+			playStateSq    sql.NullInt64
 		)
-		if err := rows.Scan(&pk, &guid, &feedURL, &title, &pubDateRaw, &playHeadSec, &playStateSq); err != nil {
+		if err := rows.Scan(&pk, &guid, &feedURL, &podcastTitle, &episodeTitle,
+			&pubDateRaw, &playHeadSec, &playStateSq); err != nil {
 			return nil, fmt.Errorf("apple/sqlite-write: scan: %w", err)
 		}
 
+		epTitle := ""
+		if episodeTitle.Valid {
+			epTitle = episodeTitle.String
+		}
+		podTitle := ""
+		if podcastTitle.Valid {
+			podTitle = podcastTitle.String
+		}
+
 		rec := appleEpisodeRecord{
-			pk:      pk,
-			feedURL: feedURL,
-			title:   title,
+			pk:           pk,
+			feedURL:      feedURL,
+			podcastTitle: strings.ToLower(strings.TrimSpace(podTitle)),
+			title:        epTitle,
 		}
 		if guid.Valid {
 			rec.guid = guid.String
@@ -205,31 +253,29 @@ func (w *SQLiteWriter) buildAppleIndex(ctx context.Context, db *sql.DB) (map[str
 		if playHeadSec.Valid && playHeadSec.Float64 > 0 {
 			rec.playPosition = time.Duration(playHeadSec.Float64 * float64(time.Second))
 			rec.playState = model.PlayStateInProgress
-		} else if (playStateSq.Valid && playStateSq.Int64 != 0) || (playHeadSec.Valid && playHeadSec.Float64 == 0) {
+		} else if playStateSq.Valid && playStateSq.Int64 != 0 {
 			// Non-zero ZPLAYSTATE with no playhead means explicitly played.
-			// We can't distinguish played from unplayed purely from ZPLAYSTATE without
-			// also checking ZPLAYCOUNT/ZLASTDATEPLAYED, but for conflict resolution
-			// we are conservative: if ZPLAYSTATE=0 and ZPLAYHEAD=0, treat as unplayed.
-			if playStateSq.Valid && playStateSq.Int64 != 0 {
-				rec.playState = model.PlayStatePlayed
-			}
+			rec.playState = model.PlayStatePlayed
 		}
 
 		normFeed := normalizeWriteFeedURL(feedURL)
+		normPodTitle := rec.podcastTitle
 
-		// Primary key: feedURL + pubDate (RFC3339 UTC, second precision).
+		// --- Feed URL-based keys (primary) ---
 		if !rec.pubDate.IsZero() {
-			key := feedDateKey(normFeed, rec.pubDate)
-			if _, exists := index[key]; !exists {
-				index[key] = rec
-			}
+			setIfAbsent(index, feedDateKey(normFeed, rec.pubDate), rec)
+		}
+		if epTitle != "" {
+			setIfAbsent(index, feedTitleKey(normFeed, epTitle), rec)
 		}
 
-		// Fallback key: feedURL + normalised title.
-		if title != "" {
-			key := feedTitleKey(normFeed, title)
-			if _, exists := index[key]; !exists {
-				index[key] = rec
+		// --- Podcast title-based keys (secondary, cross-feed-URL matching) ---
+		if normPodTitle != "" {
+			if !rec.pubDate.IsZero() {
+				setIfAbsent(index, podDateKey(normPodTitle, rec.pubDate), rec)
+			}
+			if epTitle != "" {
+				setIfAbsent(index, podTitleKey(normPodTitle, epTitle), rec)
 			}
 		}
 	}
@@ -287,26 +333,59 @@ const (
 	applePlayStatePlayed     = 2
 )
 
-// findInAppleIndex looks up an episode in the Apple index by feed+pubDate then
-// feed+title. Returns the record and whether a match was found.
-func findInAppleIndex(index map[string]appleEpisodeRecord, ep model.EpisodeState) (appleEpisodeRecord, bool) {
+// findInAppleIndex looks up an episode in the Apple index using a cascade of
+// four match strategies:
+//  1. feedURL + pubDate  (same feed, exact date)
+//  2. feedURL + title    (same feed, same episode title)
+//  3. podcastTitle + pubDate  (any feed for same podcast, exact date)
+//  4. podcastTitle + title    (any feed for same podcast, same episode title)
+//
+// feedToTitle maps the incoming episode's feed URL to its lowercased podcast
+// title (used for strategies 3 and 4 when the feed URL differs between apps).
+func findInAppleIndex(index map[string]appleEpisodeRecord, ep model.EpisodeState, feedToTitle map[string]string) (appleEpisodeRecord, bool) {
 	normFeed := normalizeWriteFeedURL(ep.FeedURL)
+
+	// Strategy 1: same feed URL, same pubDate
 	if !ep.PubDate.IsZero() {
 		if rec, ok := index[feedDateKey(normFeed, ep.PubDate)]; ok {
 			return rec, true
 		}
 	}
+	// Strategy 2: same feed URL, same episode title
 	if ep.Title != "" {
 		if rec, ok := index[feedTitleKey(normFeed, ep.Title)]; ok {
 			return rec, true
 		}
 	}
+
+	// Strategies 3 & 4: cross-feed-URL matching via podcast title.
+	// feedToTitle is keyed by the episode's feed URL and returns the lowercased
+	// podcast title. The Apple index has the same podcast title (from ZMTPODCAST)
+	// keyed as "poddate:" and "podtitle:" entries.
+	podTitle := feedToTitle[ep.FeedURL] // already lowercased
+	if podTitle == "" {
+		return appleEpisodeRecord{}, false
+	}
+
+	// Strategy 3: same podcast title, same pubDate
+	if !ep.PubDate.IsZero() {
+		if rec, ok := index[podDateKey(podTitle, ep.PubDate)]; ok {
+			return rec, true
+		}
+	}
+	// Strategy 4: same podcast title, same episode title
+	if ep.Title != "" {
+		if rec, ok := index[podTitleKey(podTitle, ep.Title)]; ok {
+			return rec, true
+		}
+	}
+
 	return appleEpisodeRecord{}, false
 }
 
-// appleSatisfied reports whether the Apple episode's current state already meets
+// applySatisfied reports whether the Apple episode's current state already meets
 // or exceeds the desired state, making an update unnecessary.
-func appleSatisfied(desired model.EpisodeState, current appleEpisodeRecord, strategy provider.ConflictStrategy) bool {
+func applySatisfied(desired model.EpisodeState, current appleEpisodeRecord, strategy provider.ConflictStrategy) bool {
 	switch strategy {
 	case provider.SourceWins:
 		return false // always overwrite
@@ -340,9 +419,9 @@ func buildFeedToTitleFromLib(lib *model.Library) map[string]string {
 	return m
 }
 
-// filterLibraryEpisodes is the Apple-side equivalent of filterEpisodesByPodcast.
-// Returns only episodes from podcasts matching at least one filter pattern.
-// If filters is empty, all episodes are returned.
+// filterLibraryEpisodes returns only episodes from podcasts whose title
+// contains at least one filter pattern (case-insensitive substring match).
+// If filters is empty, all episodes are returned unchanged.
 func filterLibraryEpisodes(episodes []model.EpisodeState, feedToTitle map[string]string, filters []string) []model.EpisodeState {
 	if len(filters) == 0 {
 		return episodes
@@ -370,8 +449,7 @@ func toCoreData(t time.Time) float64 {
 	return t.UTC().Sub(coreDataEpoch).Seconds()
 }
 
-// normalizeWriteFeedURL produces a canonical feed URL key for matching,
-// identical to the normalization applied on the Overcast side:
+// normalizeWriteFeedURL produces a canonical feed URL key for matching:
 //   - lowercase scheme and host
 //   - http → https
 //   - strip trailing slash
@@ -393,10 +471,27 @@ func normalizeWriteFeedURL(raw string) string {
 	return u.String()
 }
 
+// setIfAbsent inserts rec into m under key only if key is not already present.
+func setIfAbsent(m map[string]appleEpisodeRecord, key string, rec appleEpisodeRecord) {
+	if _, exists := m[key]; !exists {
+		m[key] = rec
+	}
+}
+
+// Index key constructors.
+
 func feedDateKey(normFeedURL string, pubDate time.Time) string {
 	return "feeddate:" + normFeedURL + "|" + pubDate.UTC().Format(time.RFC3339)
 }
 
 func feedTitleKey(normFeedURL, title string) string {
 	return "feedtitle:" + normFeedURL + "|" + strings.ToLower(strings.TrimSpace(title))
+}
+
+func podDateKey(normPodTitle string, pubDate time.Time) string {
+	return "poddate:" + normPodTitle + "|" + pubDate.UTC().Format(time.RFC3339)
+}
+
+func podTitleKey(normPodTitle, epTitle string) string {
+	return "podtitle:" + normPodTitle + "|" + strings.ToLower(strings.TrimSpace(epTitle))
 }

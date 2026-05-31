@@ -292,6 +292,81 @@ func TestSQLiteWriter_EpisodeNotInDB_IsSkipped(t *testing.T) {
 	}
 }
 
+// TestSQLiteWriter_CrossFeedURL_MatchByPodcastTitle verifies that episodes are
+// matched even when the Overcast and Apple Podcasts feed URLs differ for the
+// same show. The secondary "poddate" and "podtitle" index keys make this work.
+func TestSQLiteWriter_CrossFeedURL_MatchByPodcastTitle(t *testing.T) {
+	path := setupSQLiteDB(t)
+	db := openTestDB(t, path)
+
+	// ep4 is on show-a (ZFEEDURL = "https://feeds.example.com/show-a", ZTITLE = "Show A").
+	// The incoming library uses a completely different feed URL for the same podcast.
+	// Only the podcast title ("Show A") bridges the two.
+	pubDate := coreDataTime(697000000.0) // matches ep4
+
+	lib := &model.Library{
+		// The Overcast-side podcast has a different feed URL but the same title.
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://totally-different-cdn.example.com/show-a", Title: "Show A"},
+		},
+		Episodes: []model.EpisodeState{
+			{
+				FeedURL:   "https://totally-different-cdn.example.com/show-a",
+				Title:     "Untouched",
+				PubDate:   pubDate,
+				PlayState: model.PlayStatePlayed,
+			},
+		},
+	}
+
+	n, err := apple.NewSQLiteWriter(path).Write(context.Background(), lib, provider.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("cross-feed-URL match by podcast title: expected 1 update, got %d", n)
+	}
+
+	_, _, lp := readPlayState(t, db, "rss-guid-4")
+	if !lp.Valid {
+		t.Error("ZLASTDATEPLAYED should be set after cross-feed-URL podcast title match")
+	}
+}
+
+// TestSQLiteWriter_CrossFeedURL_MatchByPodcastTitleAndEpisodeTitle verifies
+// that episodes are matched by podcast title + episode title when pubDate is absent.
+func TestSQLiteWriter_CrossFeedURL_MatchByPodcastAndEpisodeTitle(t *testing.T) {
+	path := setupSQLiteDB(t)
+	db := openTestDB(t, path)
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://different-cdn.example.com/show-a", Title: "Show A"},
+		},
+		Episodes: []model.EpisodeState{
+			{
+				FeedURL:   "https://different-cdn.example.com/show-a",
+				Title:     "Untouched", // matches ep4 episode title
+				PlayState: model.PlayStatePlayed,
+				// No PubDate — must fall back to podcast+episode title
+			},
+		},
+	}
+
+	n, err := apple.NewSQLiteWriter(path).Write(context.Background(), lib, provider.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("cross-feed-URL match by podcast+episode title: expected 1 update, got %d", n)
+	}
+
+	_, _, lp := readPlayState(t, db, "rss-guid-4")
+	if !lp.Valid {
+		t.Error("ZLASTDATEPLAYED should be set after cross-feed podcast+episode title match")
+	}
+}
+
 func TestSQLiteWriter_URLNormalization_HttpToHttps(t *testing.T) {
 	path := setupSQLiteDB(t)
 	db := openTestDB(t, path)

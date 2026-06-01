@@ -47,18 +47,24 @@ func setupSQLiteDB(t *testing.T) string {
 	}
 
 	_, err = db.Exec(`CREATE TABLE ZMTEPISODE (
-		Z_PK            INTEGER PRIMARY KEY,
-		Z_OPT           INTEGER NOT NULL DEFAULT 1,
-		ZPODCAST        INTEGER,
-		ZGUID           TEXT,
-		ZTITLE          TEXT,
-		ZPUBDATE        REAL,
-		ZDURATION       REAL,
-		ZPLAYSTATE      INTEGER DEFAULT 0,
-		ZPLAYCOUNT      INTEGER DEFAULT 0,
-		ZPLAYHEAD       REAL    DEFAULT 0.0,
-		ZLASTDATEPLAYED REAL,
-		ZPRICETYPE      TEXT
+		Z_PK                        INTEGER PRIMARY KEY,
+		Z_OPT                       INTEGER NOT NULL DEFAULT 1,
+		ZPODCAST                    INTEGER,
+		ZGUID                       TEXT,
+		ZTITLE                      TEXT,
+		ZPUBDATE                    REAL,
+		ZDURATION                   REAL,
+		ZPLAYSTATE                  INTEGER DEFAULT 0,
+		ZPLAYCOUNT                  INTEGER DEFAULT 0,
+		ZPLAYHEAD                   REAL    DEFAULT 0.0,
+		ZLASTDATEPLAYED             REAL,
+		ZPRICETYPE                  TEXT,
+		ZUNPLAYEDTAB                INTEGER DEFAULT 0,
+		ZPLAYSTATESOURCE            INTEGER DEFAULT 0,
+		ZPLAYSTATEMANUALLYSET       INTEGER DEFAULT 0,
+		ZLASTUSERMARKEDASPLAYEDDATE REAL,
+		ZPLAYSTATELASTMODIFIEDDATE  REAL,
+		ZSTORETRACKID               INTEGER
 	)`)
 	if err != nil {
 		t.Fatalf("create ZMTEPISODE: %v", err)
@@ -103,7 +109,11 @@ func setupSQLiteDB(t *testing.T) string {
 
 	// --- Episodes ---
 	// ep1: fully played (ZPLAYSTATE=2, ZPLAYHEAD=0) → PlayStatePlayed, PlayPosition=0
+	// ZPLAYSTATESOURCE=3 (listened to completion) makes applySatisfied treat it as already satisfied.
 	insertEpisode(1, 1, "rss-guid-1", "Played Episode", 700000000.0, 3600.0, 2, 0, 0.0, 700100000.0, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 1`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep1: %v", err)
+	}
 	// ep2: in-progress (ZPLAYSTATE=1, ZPLAYHEAD=900) → PlayStateInProgress, PlayPosition=900s
 	insertEpisode(2, 1, "rss-guid-2", "In-Progress Episode", 699000000.0, 1800.0, 1, 0, 900.0, nil, "STDQ")
 	// ep3: ZPLAYSTATE=0 but ZPLAYHEAD=300 → PlayStateInProgress (ZPLAYHEAD>0 implies in-progress)

@@ -47,6 +47,20 @@ type WriteOptions struct {
 	// The writer emits a header row followed by one data row per episode.
 	// nil disables per-episode logging.
 	LogWriter io.Writer
+
+	// TitleMatchDateTolerance limits title-based episode matching (strategies 2
+	// and 4 in the cascade) to episodes whose pub dates are within this window of
+	// the source episode's pub date.  Exact pub-date matching (strategies 1 and 3)
+	// is not affected.
+	//
+	// A value of 0 disables the guard and accepts any date combination — this
+	// preserves backward-compatible behaviour for API callers that do not set
+	// the field.  The CLI sets a sensible default (≈3 days) to prevent false
+	// title matches between episodes published years apart.
+	//
+	// If either side has no pub date the check is skipped and the title match
+	// is accepted regardless of the tolerance value.
+	TitleMatchDateTolerance time.Duration
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

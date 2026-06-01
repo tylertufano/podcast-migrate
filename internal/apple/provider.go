@@ -15,12 +15,15 @@ import (
 // denied or the path does not exist) it falls back to an OPML file.
 //
 // Reading:  SQLite (play state + subscriptions) with OPML fallback (subscriptions only).
-// Writing:  SQLite play state writes are supported when the database is accessible.
+// Writing:  Play state is written via the amp-api.podcasts.apple.com web API, which
+//           syncs to all devices (iPhone, iPad, Mac). Web API credentials must be
+//           provided via SetWebAPICredentials before calling SetLibrary.
 //           Subscription writes are not supported (Apple Podcasts has no public write API
 //           for subscriptions; use the GUI to subscribe).
 type Provider struct {
 	sqlitePath string
 	opmlPath   string // optional fallback; empty disables it
+	webAPI     *WebAPIWriter
 }
 
 // NewProvider returns an Apple Podcasts provider.
@@ -33,23 +36,22 @@ func NewProvider(sqlitePath, opmlPath string) *Provider {
 	return &Provider{sqlitePath: sqlitePath, opmlPath: opmlPath}
 }
 
+// SetWebAPICredentials configures the provider to write play state via the
+// Apple Podcasts web API instead of directly to SQLite. bearerToken is the
+// Authorization: Bearer value and mediaUserToken is the media-user-token header
+// value, both obtained from a logged-in podcasts.apple.com browser session.
+func (p *Provider) SetWebAPICredentials(bearerToken, mediaUserToken string) {
+	p.webAPI = NewWebAPIWriter(p.sqlitePath, bearerToken, mediaUserToken)
+}
+
 func (p *Provider) Name() string { return "Apple Podcasts" }
 
 func (p *Provider) Capabilities() provider.Capabilities {
-	// SQLite supports play state reads and writes; we report true and fail
-	// gracefully at runtime if the DB is inaccessible.
-	// OPML fallback only supports subscription reads (no play state, no writes).
-	sqliteAccessible := false
-	if p.sqlitePath != "" {
-		if _, err := os.Stat(p.sqlitePath); err == nil {
-			sqliteAccessible = true
-		}
-	}
 	return provider.Capabilities{
 		ReadSubscriptions: true,
 		ReadPlayState:     true,
-		// Play state writes require the live SQLite database.
-		WritePlayState: sqliteAccessible,
+		// Play state writes require web API credentials.
+		WritePlayState: p.webAPI != nil,
 		// Apple Podcasts has no public subscription write API.
 		WriteSubscriptions: false,
 	}
@@ -71,10 +73,10 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 	return NewOPMLReader(p.opmlPath).Read(ctx)
 }
 
-// SetLibrary writes episode play state to the Apple Podcasts SQLite database.
+// SetLibrary writes episode play state to Apple Podcasts via the web API.
+// Web API credentials must be set via SetWebAPICredentials before calling.
 // Subscription writes are not supported.
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
-	// Subscription writes are not supported regardless of options.
 	if opts.OnlySubscriptions {
 		return &provider.ErrCapabilityUnsupported{
 			Provider:  p.Name(),
@@ -82,22 +84,23 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 		}
 	}
 
-	// Play state writes require the SQLite database.
-	if _, err := os.Stat(p.sqlitePath); err != nil {
-		return fmt.Errorf("apple: SQLite database not accessible at %s: %w\n"+
-			"  Play state writes require the live Apple Podcasts database.\n"+
-			"  Ensure Apple Podcasts has been opened at least once on this Mac.", p.sqlitePath, err)
+	if p.webAPI == nil {
+		return fmt.Errorf("apple: web API credentials required for play state writes\n" +
+			"  Set --apple-bearer-token and --apple-media-user-token (or APPLE_BEARER_TOKEN /\n" +
+			"  APPLE_MEDIA_USER_TOKEN env vars). Obtain them from podcasts.apple.com:\n" +
+			"  open DevTools, mark any episode as played, copy the Authorization and\n" +
+			"  media-user-token headers from the network request.")
 	}
 
-	n, err := NewSQLiteWriter(p.sqlitePath).Write(ctx, lib, opts)
+	fmt.Println("apple: writing play state via web API (syncs to all devices)")
+	n, err := p.webAPI.Write(ctx, lib, opts)
 	if err != nil {
 		return err
 	}
-
 	prefix := ""
 	if opts.DryRun {
 		prefix = "[dry-run] "
 	}
-	fmt.Printf("%supdated play state for %d episode(s) in Apple Podcasts\n", prefix, n)
+	fmt.Printf("%smarked %d episode(s) as played via Apple Podcasts web API\n", prefix, n)
 	return nil
 }

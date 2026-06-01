@@ -18,6 +18,7 @@ Run 'podcast-migrate help <command>' for details on a specific command.`,
 		markPlayedCmd(),
 		exportCmd(),
 		importCmd(),
+		observeCmd(),
 	)
 	return root
 }

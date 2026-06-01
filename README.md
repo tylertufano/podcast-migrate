@@ -1,28 +1,29 @@
 # podcast-migrate
 
-A command-line tool for migrating podcast subscriptions and episode play state between podcast applications. Currently supports Apple Podcasts → Overcast, with the architecture designed for bidirectional sync and additional services.
+A command-line tool for migrating podcast subscriptions and episode play state between podcast applications. Supports Apple Podcasts ↔ Overcast in both directions.
 
 ## How it works
 
-podcast-migrate reads your library directly from the source app's local data, merges it with whatever the destination already knows, and writes the result in a format the destination app can import. Each podcast service is an interchangeable adapter behind a common `Provider` interface, so adding new services doesn't require changes to the core migration logic.
+podcast-migrate reads your library directly from the source app's local data, merges it with whatever the destination already knows, and writes the result. Each podcast service is an interchangeable adapter behind a common `Provider` interface, so adding new services doesn't require changes to the core migration logic.
 
 ## Current status
 
 ### What's working
 
-**Apple Podcasts (source)**
+**Apple Podcasts (source and destination)**
 
 - Reads subscriptions and episode play state directly from `MTLibrary.sqlite` — no export step needed
 - Falls back to a manually exported OPML file if the database isn't accessible
+- **Play state write** via the Apple Podcasts web API (`amp-api.podcasts.apple.com`) — marks episodes as played on Apple's backend, which syncs automatically to iPhone, iPad, Mac, and the web player. See [Overcast → Apple Podcasts](#overcast--apple-podcasts-sync-play-state-to-iphone) for setup.
 - Detects and reports two categories of content that can't be migrated:
-  - **`internal://` feeds** — Apple-exclusive shows with no public RSS feed. Excluded from the subscription list entirely and reported by name so you know what was skipped.
-  - **PSUB / PLUS episodes** — paywalled episodes from Apple Podcasts Subscriptions. These use Apple-internal GUIDs and DRM-only audio streams that no other app can match or play. The parent podcast subscription is still migrated; only the per-episode play state is dropped.
+  - **`internal://` feeds** — Apple-exclusive shows with no public RSS feed
+  - **PSUB / PLUS episodes** — paywalled Apple Podcasts Subscriptions episodes; the parent podcast subscription is still migrated
 
-**Overcast (destination)**
+**Overcast (source and destination)**
 
 - Generates an OPML file ready to import via Overcast › Settings › Import OPML
-- Can also read an Overcast OPML export for inspection or two-way merging
-- **Play state write is implemented** via the unofficial Overcast web API (the same endpoint the Overcast web player uses internally). Pass `--play-state` with your credentials to enable it. See [Play state write](#overcast-play-state-write-unofficial) for details and caveats.
+- Reads an Overcast OPML export for inspection or two-way merging
+- **Play state write** via the unofficial Overcast web API. See [Apple Podcasts → Overcast](#apple-podcasts--overcast-sync-play-state) for details.
 
 **Sync engine**
 
@@ -30,14 +31,14 @@ podcast-migrate reads your library directly from the source app's local data, me
   - `furthest` *(default)* — whichever side is further along wins; fully-played always beats in-progress
   - `source` — source data always wins
   - `target` — existing destination data is never overwritten
-- Episode matching across providers uses a priority chain: RSS `<guid>` → feed URL + pub date → feed URL + normalized title
+- Episode matching across providers uses a four-strategy cascade: feed URL + pub date → feed URL + title → podcast title + pub date → podcast title + title (the last two handle feeds that differ between apps)
 - `--dry-run` previews what would change without writing anything
 
 ### Supported providers
 
 | Provider | Read subscriptions | Read play state | Write subscriptions | Write play state |
 |---|:---:|:---:|:---:|:---:|
-| Apple Podcasts | ✅ | ✅ | — | — |
+| Apple Podcasts | ✅ | ✅ | — | ✅ (web API → syncs to all devices) |
 | Overcast | ✅ | ✅ | ✅ (OPML) | ✅ (unofficial web API) |
 
 ## Installation
@@ -64,7 +65,7 @@ If you'd rather not grant Full Disk Access, export your subscriptions manually v
 
 ## Usage
 
-### Migrate Apple Podcasts → Overcast
+### Apple Podcasts → Overcast (subscriptions)
 
 ```sh
 # Preview what will be migrated (no files written)
@@ -79,11 +80,10 @@ podcast-migrate migrate --from podcasts --to overcast \
 
 Then in Overcast: **Settings › Import OPML** and select the generated file.
 
-### Overcast play state write (unofficial)
+### Apple Podcasts → Overcast (sync play state)
 
 ```sh
-# Export your extended OPML from overcast.fm/account/export_opml/extended first,
-# then run with --play-state. Credentials via env vars (recommended):
+# Export your extended OPML from overcast.fm/account/export_opml/extended first, then:
 export OVERCAST_EMAIL="you@example.com"
 export OVERCAST_PASSWORD="yourpassword"
 
@@ -91,19 +91,80 @@ podcast-migrate migrate --from podcasts --to overcast \
   --overcast-out ~/Desktop/overcast-import.opml \
   --overcast-export ~/Downloads/overcast.opml \
   --play-state
-
-# Or pass credentials as flags:
-podcast-migrate migrate --from podcasts --to overcast \
-  --overcast-out ~/Desktop/overcast-import.opml \
-  --overcast-export ~/Downloads/overcast.opml \
-  --play-state \
-  --overcast-email you@example.com \
-  --overcast-password yourpassword
 ```
 
-**How it works:** The tool authenticates with your Overcast account and calls the same internal API endpoint the Overcast web player uses to save episode positions. For each episode with play state, it fetches the episode's Overcast page to resolve the internal numeric ID, then POSTs the position.
+**How it works:** Authenticates with your Overcast account and calls the same internal API endpoint the Overcast web player uses to save episode positions. For each played episode, it fetches the episode's Overcast page to resolve its internal numeric ID, then POSTs the played position.
 
-> **Disclaimer:** This uses an undocumented Overcast endpoint that Overcast has not publicly supported. It works as of the implementation date but may break without notice if Marco Arment changes the backend. Use `--dry-run` to preview what would be written before committing.
+> **Disclaimer:** Uses an undocumented Overcast endpoint that Marco Arment has not publicly supported. It works as of the implementation date but may break without notice. Use `--dry-run` to preview before committing.
+
+### Overcast → Apple Podcasts (sync play state to iPhone)
+
+This direction writes play state via the Apple Podcasts web API, which syncs to **all your Apple devices** (iPhone, iPad, Mac, and the web at podcasts.apple.com) automatically — no need to open the app, no iCloud delay.
+
+#### Step 1 — Get your tokens (one-time setup)
+
+1. Open [podcasts.apple.com](https://podcasts.apple.com) in your browser and sign in
+2. Open DevTools (⌥⌘I in Safari, F12 in Chrome) → Network tab
+3. Mark any episode as played in the web UI
+4. Find the `PUT` request to `amp-api.podcasts.apple.com/v1/me/playback/positions/...`
+5. Copy two header values from that request:
+   - `Authorization` — everything after `Bearer ` (a long JWT string)
+   - `media-user-token` — the full value of this header
+
+#### Step 2 — Run the migration
+
+```sh
+# Set tokens as env vars (avoids them appearing in shell history)
+export APPLE_BEARER_TOKEN="eyJhbGci..."
+export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
+
+# Export your Overcast library from overcast.fm/account/export_opml/extended first, then:
+
+# Dry-run first to preview what will be marked
+podcast-migrate migrate --from overcast --to podcasts \
+  --overcast-export ~/Downloads/overcast.opml \
+  --play-state --dry-run
+
+# Live run
+podcast-migrate migrate --from overcast --to podcasts \
+  --overcast-export ~/Downloads/overcast.opml \
+  --play-state
+```
+
+Or pass the tokens directly as flags:
+
+```sh
+podcast-migrate migrate --from overcast --to podcasts \
+  --overcast-export ~/Downloads/overcast.opml \
+  --play-state \
+  --apple-bearer-token "eyJhbGci..." \
+  --apple-media-user-token "0.Apgf..."
+```
+
+**Scope:** Only episodes in the Apple Podcasts catalog (public RSS feeds indexed by Apple) can be marked via this API. Private or unlisted feeds without an Apple catalog entry are skipped and reported.
+
+**Token lifetimes:** The Bearer token is a short-lived JWT signed by Apple — capture a fresh one if you get `401` errors. The `media-user-token` is your account session and lasts longer but will eventually expire. Both are re-captured the same way (one network request in DevTools).
+
+**Rate limiting:** The tool sends one API request per episode with a 500 ms delay between calls by default. Override with `--request-delay` (e.g. `--request-delay 1s`) if you hit rate limits.
+
+#### Limit to specific podcasts
+
+```sh
+# Single podcast (case-insensitive substring match)
+podcast-migrate migrate --from overcast --to podcasts \
+  --overcast-export ~/Downloads/overcast.opml \
+  --play-state --podcast "rogan"
+
+# Multiple podcasts
+podcast-migrate migrate --from overcast --to podcasts \
+  --overcast-export ~/Downloads/overcast.opml \
+  --play-state --podcast "rogan" --podcast "sistersinlaw"
+
+# From a file (one podcast title/word per line)
+podcast-migrate migrate --from overcast --to podcasts \
+  --overcast-export ~/Downloads/overcast.opml \
+  --play-state --podcast-list ~/my-podcasts.txt
+```
 
 ### Export your library to JSON
 
@@ -139,9 +200,15 @@ podcast-migrate import --to overcast \
 | `--conflict` | Conflict resolution: `furthest` (default), `source`, `target` |
 | `--sqlite` | Custom path to `MTLibrary.sqlite` (auto-detected by default) |
 | `--opml-fallback` | Apple Podcasts OPML export to use if SQLite is inaccessible |
-| `--play-state` | Write episode play state via the unofficial Overcast web API |
+| `--play-state` | Write episode play state |
+| `--podcast` | Limit play-state sync to podcasts matching this word/phrase (repeatable) |
+| `--podcast-list` | Path to a file with one podcast title/word per line |
+| `--request-delay` | Delay between API requests (default 500ms; increase if you hit rate limits) |
+| `--log-file` | Write per-episode CSV detail log (columns: status, podcast, episode, pub_date, source_state, target_state, note) |
 | `--overcast-email` | Overcast account email (or `OVERCAST_EMAIL` env var) |
 | `--overcast-password` | Overcast account password (or `OVERCAST_PASSWORD` env var) |
+| `--apple-bearer-token` | Apple web API Bearer token (or `APPLE_BEARER_TOKEN` env var) |
+| `--apple-media-user-token` | Apple media-user-token (or `APPLE_MEDIA_USER_TOKEN` env var) |
 
 ## Future work
 
@@ -149,17 +216,16 @@ podcast-migrate import --to overcast \
 The `Provider` interface makes adding new services straightforward. Planned:
 - **Pocket Casts** — has a documented sync API
 - **Castro**
-- **Pocketcasts** (Android)
 - **RSS readers / generic OPML** — subscription-only, no play state
-
-### Overcast → Apple Podcasts direction
-Apple Podcasts has no import API. The only viable path is scripting the app via AppleScript or, on iOS, a Shortcut. This needs investigation.
 
 ### Automated / scheduled sync
 A `sync` subcommand that runs on a schedule (cron or a background agent) and incrementally syncs only changes since the last run, using a state file to track what was last seen.
 
 ### Richer episode matching
-The current GUID → pub date → title chain can fail when the same episode has different GUIDs across providers (common with older feeds that changed hosting). A fuzzy-match fallback using pub date proximity and edit distance on titles would reduce unmatched episodes.
+The current cascade can fail when the same episode has different titles or pub dates across providers (common with older feeds that changed hosting). A fuzzy-match fallback using edit distance on titles would reduce unmatched episodes.
+
+### Token management
+Automatic extraction of the Apple Bearer token from the macOS Keychain (where the native Podcasts app caches it), and automatic renewal when it expires, to avoid the manual DevTools capture step.
 
 ### Packaged release
 Signed macOS binary via GitHub Actions, distributed through Homebrew.
@@ -167,12 +233,12 @@ Signed macOS binary via GitHub Actions, distributed through Homebrew.
 ## Project structure
 
 ```
-cmd/                  CLI entry points (migrate, export, import)
+cmd/                  CLI entry points (migrate, export, import, mark-played, observe)
 internal/
   model/              Shared types: Library, Podcast, EpisodeState
   provider/           Provider interface and WriteOptions
-  apple/              Apple Podcasts adapter (SQLite + OPML)
-  overcast/           Overcast adapter (OPML read/write)
+  apple/              Apple Podcasts adapter (SQLite read + web API write)
+  overcast/           Overcast adapter (OPML read/write + web API)
   sync/               Merge engine and conflict resolution
 main.go
 ```
@@ -183,4 +249,4 @@ main.go
 go test ./...
 ```
 
-111 tests; coverage: `apple` 90%, `overcast` 95%, `sync` 99%.
+131 tests; coverage: `apple` ~85%, `overcast` 95%, `sync` 99%.

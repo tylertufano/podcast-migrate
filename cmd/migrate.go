@@ -28,11 +28,14 @@ func migrateCmd() *cobra.Command {
 		overcastOut      string
 		overcastEmail    string
 		overcastPassword string
-		conflictStrategy string
-		requestDelay     time.Duration
-		podcastFilter    []string // --podcast (repeatable)
-		podcastListFile  string   // --podcast-list (file path)
-		logFile          string   // --log-file (per-episode CSV log)
+		conflictStrategy        string
+		requestDelay            time.Duration
+		titleMatchTolerance     time.Duration
+		podcastFilter           []string // --podcast (repeatable)
+		podcastListFile         string   // --podcast-list (file path)
+		logFile                 string   // --log-file (per-episode CSV log)
+		appleBearerToken    string       // --apple-bearer-token / APPLE_BEARER_TOKEN
+		appleMediaUserToken string       // --apple-media-user-token / APPLE_MEDIA_USER_TOKEN
 	)
 
 	cmd := &cobra.Command{
@@ -60,8 +63,10 @@ func migrateCmd() *cobra.Command {
     --overcast-export ~/Downloads/overcast.opml --play-state \
     --podcast-list ~/my-podcasts.txt
 
-  # Overcast → Podcasts (reverse sync: write Overcast play state back to Apple Podcasts)
-  # Quit Apple Podcasts first, then run:
+  # Overcast → Podcasts (reverse sync via Apple web API — syncs to iPhone automatically)
+  # Get tokens from podcasts.apple.com DevTools (mark any episode played → network tab)
+  export APPLE_BEARER_TOKEN="eyJ..."
+  export APPLE_MEDIA_USER_TOKEN="0.Apg..."
   podcast-migrate migrate --from overcast --to podcasts \
     --overcast-export ~/Downloads/overcast.opml --play-state
 
@@ -76,6 +81,14 @@ func migrateCmd() *cobra.Command {
 			}
 			if overcastPassword == "" {
 				overcastPassword = os.Getenv("OVERCAST_PASSWORD")
+			}
+
+			// Resolve Apple web API tokens from flags → env vars.
+			if appleBearerToken == "" {
+				appleBearerToken = os.Getenv("APPLE_BEARER_TOKEN")
+			}
+			if appleMediaUserToken == "" {
+				appleMediaUserToken = os.Getenv("APPLE_MEDIA_USER_TOKEN")
 			}
 
 			// Direction-aware validation for --play-state:
@@ -114,6 +127,15 @@ func migrateCmd() *cobra.Command {
 				return fmt.Errorf("destination: %w", err)
 			}
 
+			// If Apple web API credentials are provided, configure the destination
+			// provider (or source, in case someone pipes apple→apple) to use the
+			// web API for play state writes instead of direct SQLite manipulation.
+			if appleBearerToken != "" && appleMediaUserToken != "" {
+				if ap, ok := dst.(*apple.Provider); ok {
+					ap.SetWebAPICredentials(appleBearerToken, appleMediaUserToken)
+				}
+			}
+
 			opts := provider.WriteOptions{
 				DryRun:            dryRun,
 				OnlySubscriptions: onlySubs,
@@ -122,9 +144,10 @@ func migrateCmd() *cobra.Command {
 				// and breaks feedToTitle (the episode→podcast title lookup used by
 				// --podcast filters and cross-feed-URL episode matching).
 				// The Apple Podcasts writer ignores subscriptions internally regardless.
-				ConflictStrategy: parseConflictStrategy(conflictStrategy),
-				RequestDelay:     requestDelay,
-				PodcastFilter:    allFilters,
+				ConflictStrategy:        parseConflictStrategy(conflictStrategy),
+				RequestDelay:            requestDelay,
+				PodcastFilter:           allFilters,
+				TitleMatchDateTolerance: titleMatchTolerance,
 			}
 
 			if logFile != "" {
@@ -151,8 +174,8 @@ func migrateCmd() *cobra.Command {
 				}
 			}
 			if !dryRun && (to == "podcasts" || to == "apple") && playState {
-				fmt.Println("\nPlay state has been written to Apple Podcasts' local database.")
-				fmt.Println("Open Apple Podcasts to see the updated episode states.")
+				fmt.Println("\nPlay state has been written via the Apple Podcasts web API.")
+				fmt.Println("Episodes will sync to iPhone and all Apple devices automatically.")
 			}
 			return nil
 		},
@@ -162,7 +185,7 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&to, "to", "", "destination app: overcast (required)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without writing anything")
 	cmd.Flags().BoolVar(&onlySubs, "only-subscriptions", false, "migrate subscriptions only, skip play state")
-	cmd.Flags().BoolVar(&playState, "play-state", false, "also write episode play state (Podcasts→Overcast: uses unofficial web API, requires credentials; Overcast→Podcasts: writes to local SQLite database)")
+	cmd.Flags().BoolVar(&playState, "play-state", false, "also write episode play state (Podcasts→Overcast: uses unofficial web API, requires Overcast credentials; Overcast→Podcasts: uses Apple Podcasts web API when --apple-bearer-token/--apple-media-user-token are set, otherwise writes to local SQLite)")
 	cmd.Flags().StringVar(&sqlitePath, "sqlite", "", "path to MTLibrary.sqlite (default: auto-detect)")
 	cmd.Flags().StringVar(&opmlFallback, "opml-fallback", "", "path to Apple Podcasts OPML export (fallback if SQLite unavailable)")
 	cmd.Flags().StringVar(&overcastExport, "overcast-export", "", "path to Overcast OPML export (for reading Overcast data or play state matching)")
@@ -170,10 +193,16 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&overcastEmail, "overcast-email", "", "Overcast account email (or set OVERCAST_EMAIL env var)")
 	cmd.Flags().StringVar(&overcastPassword, "overcast-password", "", "Overcast account password (or set OVERCAST_PASSWORD env var)")
 	cmd.Flags().StringVar(&conflictStrategy, "conflict", "furthest", "conflict resolution: furthest | source | target")
-	cmd.Flags().DurationVar(&requestDelay, "request-delay", overcast.DefaultRequestDelay, "delay between consecutive Overcast API requests (increase if you hit 429 rate limits)")
+	cmd.Flags().DurationVar(&requestDelay, "request-delay", 0, "delay between consecutive API requests to Overcast or Apple (default 500ms for both; increase if you hit 429 rate limits)")
+	cmd.Flags().DurationVar(&titleMatchTolerance, "title-match-tolerance", 72*time.Hour,
+		"max pub-date gap allowed when matching episodes by title (strategies 2 & 4 fallback);\n"+
+			"prevents false matches between same-named episodes published years apart;\n"+
+			"set to 0 to disable the guard and accept any date (legacy behaviour)")
 	cmd.Flags().StringArrayVar(&podcastFilter, "podcast", nil, "limit play-state sync to podcasts whose title contains this word/phrase (case-insensitive, repeatable)")
 	cmd.Flags().StringVar(&podcastListFile, "podcast-list", "", "path to a file with one podcast title/word per line; combined with --podcast")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "write per-episode detail to this CSV file (columns: status, podcast, episode, pub_date, source_state, target_state, note)")
+	cmd.Flags().StringVar(&appleBearerToken, "apple-bearer-token", "", "Apple Podcasts web API Bearer token (or set APPLE_BEARER_TOKEN); obtain from podcasts.apple.com DevTools → mark episode played → Authorization header")
+	cmd.Flags().StringVar(&appleMediaUserToken, "apple-media-user-token", "", "Apple Podcasts media-user-token (or set APPLE_MEDIA_USER_TOKEN); obtain from podcasts.apple.com DevTools → mark episode played → media-user-token header")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")

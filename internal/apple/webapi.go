@@ -3,7 +3,6 @@ package apple
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,11 +18,15 @@ import (
 // Overcast default and keeps the client well within observed rate limits.
 const DefaultRequestDelay = 500 * time.Millisecond
 
-// WebAPIWriter marks episodes as played via the Apple Podcasts web API
-// (amp-api.podcasts.apple.com). This approach writes play state directly to
-// Apple's backend, which then syncs to all devices (iPhone, iPad, Mac) via the
-// PodcastContentService — unlike SQLite writes, which cannot cross the CoreData
-// object graph boundary to trigger a sync push.
+// WebAPIWriter marks episodes as played (or in-progress) via the Apple Podcasts
+// web API (amp-api.podcasts.apple.com). This approach writes play state directly
+// to Apple's backend, which then syncs to all devices (iPhone, iPad, Mac) via
+// the PodcastContentService — unlike SQLite writes, which cannot cross the
+// CoreData object graph boundary to trigger a sync push.
+//
+// Episode ID resolution uses the Apple catalog API (no local SQLite required):
+//   - iTunes Search API (itunes.apple.com) to map podcast feed URL → collectionId
+//   - amp-api catalog with full pagination to index all episodes for a podcast
 //
 // Two tokens are required, both obtainable by opening podcasts.apple.com in a
 // browser, marking any episode as played, and inspecting the network request in
@@ -34,38 +37,28 @@ const DefaultRequestDelay = 500 * time.Millisecond
 //   - MediaUserToken: the media-user-token header value (user-specific,
 //     identifies the Apple Account)
 type WebAPIWriter struct {
-	dbPath         string
 	bearerToken    string
 	mediaUserToken string
 	httpClient     *http.Client
 }
 
 // NewWebAPIWriter returns a writer that uses the Apple Podcasts web API.
-// dbPath is the path to MTLibrary.sqlite, opened read-only for episode lookup.
-func NewWebAPIWriter(dbPath, bearerToken, mediaUserToken string) *WebAPIWriter {
+// bearerToken and mediaUserToken are obtained from a logged-in podcasts.apple.com
+// browser session (DevTools → mark any episode played → network request headers).
+func NewWebAPIWriter(bearerToken, mediaUserToken string) *WebAPIWriter {
 	return &WebAPIWriter{
-		dbPath:         dbPath,
 		bearerToken:    bearerToken,
 		mediaUserToken: mediaUserToken,
 		httpClient:     &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-// Write iterates over lib's played episodes, resolves each to an Apple catalog
-// episode ID via SQLite, and calls the playback-positions API to mark it played.
-// Returns the number of episodes successfully marked.
+// Write iterates over lib's played and in-progress episodes, resolves each to
+// an Apple catalog episode ID via the catalog API, checks current server state,
+// and calls the playback-positions endpoint when an update is needed.
+// Returns the number of episodes successfully written.
 func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provider.WriteOptions) (int, error) {
-	// Open SQLite read-only — we only need it for ZSTORETRACKID lookups.
-	db, err := sql.Open("sqlite", "file:"+w.dbPath+"?mode=ro&_journal=off")
-	if err != nil {
-		return 0, fmt.Errorf("apple/webapi: open SQLite %s: %w", w.dbPath, err)
-	}
-	defer db.Close()
-
-	index, err := buildAppleIndex(ctx, db)
-	if err != nil {
-		return 0, fmt.Errorf("apple/webapi: build index: %w", err)
-	}
+	catalog := NewCatalogClient(w.bearerToken)
 
 	// Resolve request delay: honour the caller's preference, or fall back to
 	// the Apple default. Mirrors the same pattern used by the Overcast writer.
@@ -84,14 +77,16 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 	writeLogHeader(opts.LogWriter)
 
 	marked := 0
-	notFound := 0
-	noID := 0
+	skippedPlayed := 0 // server already has completed=true
+	skippedAhead := 0  // server in-progress position >= source position
+	notInCatalog := 0  // podcast not found in Apple catalog
+	notMatched := 0    // podcast found but episode not matched
 
 	for _, ep := range episodes {
 		if ep.FromDestination {
 			continue
 		}
-		if ep.PlayState != model.PlayStatePlayed {
+		if ep.PlayState != model.PlayStatePlayed && ep.PlayState != model.PlayStateInProgress {
 			continue
 		}
 		if ep.FeedURL == "" {
@@ -100,52 +95,89 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 
 		podTitle := feedToTitle[ep.FeedURL]
 
-		appleRec, ok := findInAppleIndex(index, ep, feedToTitle, opts.TitleMatchDateTolerance)
-		if !ok {
-			notFound++
-			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-				"no match in Apple Podcasts database")
+		appleID, status, err := catalog.FindEpisode(ctx, ep, feedToTitle, opts.TitleMatchDateTolerance, opts.StrictFeedMatch)
+		if err != nil {
+			fmt.Printf("  warning: catalog lookup failed for %q — %q: %v\n", podTitle, ep.Title, err)
+			writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
 			continue
 		}
 
-		if appleRec.storeTrackID == 0 {
-			noID++
+		switch status {
+		case CatalogPodcastNotInCatalog:
+			notInCatalog++
 			writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
 				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-				"episode has no Apple catalog ID (private or unindexed feed)")
+				"podcast not found in Apple catalog (private or unindexed feed)")
+			continue
+
+		case CatalogEpisodeNotMatched:
+			notMatched++
+			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+				"episode not matched in Apple catalog")
 			continue
 		}
 
-		// Note: we intentionally do NOT call applySatisfied here. The local
-		// SQLite state is not authoritative for the web API path — Apple's
-		// server is. Previous SQLite-write attempts may have left behind
-		// stale local state (e.g. ZPLAYSTATE=2/source=3) that looks
-		// satisfied locally but was never pushed to the server. The PUT is
-		// idempotent, so re-marking an already-played episode is harmless.
+		// CatalogFound — appleID is valid.
+
+		// Determine what we want to write.
+		wantCompleted := ep.PlayState == model.PlayStatePlayed
+		wantPositionMs := ep.PlayPosition.Milliseconds() // 0 when fully played
 
 		if opts.DryRun {
-			fmt.Printf("  [dry-run] would mark via web API: %q — %q (id=%d)\n",
-				podTitle, ep.Title, appleRec.storeTrackID)
+			fmt.Printf("  [dry-run] would set position via web API: %q — %q (id=%d, completed=%v, pos=%dms)\n",
+				podTitle, ep.Title, appleID, wantCompleted, wantPositionMs)
 			writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition),
-				playStateLabel(appleRec.playState, appleRec.playPosition), "")
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—", "")
 			marked++
 			continue
 		}
 
-		if err := w.markPlayed(ctx, appleRec.storeTrackID); err != nil {
+		// Check current server state and skip if Apple is already at or beyond
+		// the position we want to write. Skipped when ForceUpdate is set.
+		if !opts.ForceUpdate {
+			srvPos, err := w.getServerPosition(ctx, appleID)
+			if err != nil {
+				// Treat check failure as unknown — proceed with the write.
+				fmt.Printf("  warning: could not check play status for %q (id=%d): %v — will update anyway\n",
+					ep.Title, appleID, err)
+			} else {
+				if srvPos.completed {
+					// Server already has the episode marked as played — nothing to do
+					// regardless of whether we wanted to mark it played or in-progress.
+					skippedPlayed++
+					writeLogLine(opts.LogWriter, "already_played", podTitle, ep.Title, ep.PubDate,
+						playStateLabel(ep.PlayState, ep.PlayPosition), "played", "")
+					continue
+				}
+				if !wantCompleted && srvPos.recorded && srvPos.positionMs >= wantPositionMs {
+					// We want to set an in-progress position but the server is already
+					// at least as far along — skip to avoid rewinding.
+					skippedAhead++
+					writeLogLine(opts.LogWriter, "already_ahead", podTitle, ep.Title, ep.PubDate,
+						playStateLabel(ep.PlayState, ep.PlayPosition),
+						fmt.Sprintf("in_progress(%s)", (time.Duration(srvPos.positionMs)*time.Millisecond).Round(time.Second)),
+						"server position is at or ahead of source")
+					continue
+				}
+			}
+		}
+
+		if err := w.markPosition(ctx, appleID, wantPositionMs, wantCompleted); err != nil {
 			fmt.Printf("  warning: web API call failed for %q (id=%d): %v\n",
-				ep.Title, appleRec.storeTrackID, err)
+				ep.Title, appleID, err)
 			writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition),
-				playStateLabel(appleRec.playState, appleRec.playPosition), err.Error())
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
 			continue
 		}
 
+		targetLabel := "played"
+		if !wantCompleted {
+			targetLabel = fmt.Sprintf("in_progress(%s)", ep.PlayPosition.Round(time.Second))
+		}
 		writeLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
-			playStateLabel(ep.PlayState, ep.PlayPosition),
-			playStateLabel(appleRec.playState, appleRec.playPosition), "")
+			playStateLabel(ep.PlayState, ep.PlayPosition), targetLabel, "")
 		marked++
 
 		select {
@@ -155,22 +187,110 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 		}
 	}
 
-	if notFound > 0 {
-		fmt.Printf("apple/webapi: %d episode(s) not found in local Apple Podcasts database\n", notFound)
+	if skippedPlayed > 0 {
+		fmt.Printf("apple/webapi: %d episode(s) skipped — already marked as played on server\n", skippedPlayed)
 	}
-	if noID > 0 {
-		fmt.Printf("apple/webapi: %d episode(s) skipped — no Apple catalog ID (private/unindexed feed)\n", noID)
+	if skippedAhead > 0 {
+		fmt.Printf("apple/webapi: %d episode(s) skipped — server position already at or ahead of source\n", skippedAhead)
+	}
+	if notInCatalog > 0 {
+		fmt.Printf("apple/webapi: %d episode(s) skipped — podcast not found in Apple catalog (private/unindexed feed)\n", notInCatalog)
+	}
+	if notMatched > 0 {
+		fmt.Printf("apple/webapi: %d episode(s) not matched in Apple catalog\n", notMatched)
 	}
 
 	return marked, nil
 }
 
-// markPlayed calls PUT /v1/me/playback/positions/podcast-episodes/{id} with
-// completed=true, which Apple's backend uses to sync the played state to all
-// devices associated with the account.
-func (w *WebAPIWriter) markPlayed(ctx context.Context, appleEpisodeID int64) error {
+// serverPosition holds the play state returned by the GET playback-positions
+// endpoint for a single episode.
+type serverPosition struct {
+	recorded   bool  // false when the server has no record (404)
+	completed  bool
+	positionMs int64 // 0 when not started or fully played
+}
+
+// getServerPosition calls GET /v1/me/playback/positions/podcast-episodes/{id}
+// and returns the server's current play state for that episode.
+//
+// A 404 means no position has been recorded (never started); the returned
+// serverPosition has recorded=false. Any other HTTP error is returned as an
+// error; the caller should proceed with the write rather than silently skipping.
+func (w *WebAPIWriter) getServerPosition(ctx context.Context, appleEpisodeID int64) (serverPosition, error) {
+	url := fmt.Sprintf(
+		"https://amp-api.podcasts.apple.com/v1/me/playback/positions/podcast-episodes/%d?with=entitlements%%2ChlsVideo&l=en-US",
+		appleEpisodeID,
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return serverPosition{}, fmt.Errorf("get position: build request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+w.bearerToken)
+	req.Header.Set("media-user-token", w.mediaUserToken)
+	req.Header.Set("Origin", "https://podcasts.apple.com")
+	req.Header.Set("Referer", "https://podcasts.apple.com/")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15")
+
+	resp, err := w.httpClient.Do(req)
+	if err != nil {
+		return serverPosition{}, fmt.Errorf("get position: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 404 means no position recorded at all.
+	if resp.StatusCode == http.StatusNotFound {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
+		return serverPosition{recorded: false}, nil
+	}
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return serverPosition{}, fmt.Errorf("get position: HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			Attributes struct {
+				Completed              bool  `json:"completed"`
+				PositionInMilliseconds int64 `json:"positionInMilliseconds"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		// Treat a parse error as unknown — proceed with the write.
+		return serverPosition{recorded: false}, nil
+	}
+
+	if len(result.Data) == 0 {
+		return serverPosition{recorded: false}, nil
+	}
+
+	a := result.Data[0].Attributes
+	return serverPosition{
+		recorded:   true,
+		completed:  a.Completed,
+		positionMs: a.PositionInMilliseconds,
+	}, nil
+}
+
+// markPosition calls PUT /v1/me/playback/positions/podcast-episodes/{id} to
+// set the episode's play state on Apple's backend, which syncs to all devices.
+//
+// Use completed=true with positionMs=0 to mark as played.
+// Use completed=false with positionMs>0 to set an in-progress position.
+//
+// 5xx responses are retried up to maxMarkRetries times with exponential backoff
+// since Apple's Podcast Cloud Library service occasionally returns transient
+// upstream errors (code 50001).
+func (w *WebAPIWriter) markPosition(ctx context.Context, appleEpisodeID, positionMs int64, completed bool) error {
+	const maxRetries = 3
+	const retryBaseDelay = 2 * time.Second
+
 	type attributes struct {
-		PositionInMilliseconds int    `json:"positionInMilliseconds"`
+		PositionInMilliseconds int64  `json:"positionInMilliseconds"`
 		RecordedAtTimestamp    string `json:"recordedAtTimestamp"`
 		Completed              bool   `json:"completed"`
 	}
@@ -179,46 +299,67 @@ func (w *WebAPIWriter) markPlayed(ctx context.Context, appleEpisodeID int64) err
 		Attributes attributes `json:"attributes"`
 	}
 
-	body, err := json.Marshal(payload{
-		Type: "playback-positions",
-		Attributes: attributes{
-			PositionInMilliseconds: 0,
-			RecordedAtTimestamp:    time.Now().UTC().Format(time.RFC3339Nano),
-			Completed:              true,
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
-	}
-
 	url := fmt.Sprintf(
 		"https://amp-api.podcasts.apple.com/v1/me/playback/positions/podcast-episodes/%d?with=entitlements%%2ChlsVideo&l=en-US",
 		appleEpisodeID,
 	)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := retryBaseDelay * (1 << (attempt - 1)) // 2s, 4s, 8s
+			fmt.Printf("    retrying in %v (attempt %d/%d)...\n", delay, attempt, maxRetries)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
 
-	req.Header.Set("Authorization", "Bearer "+w.bearerToken)
-	req.Header.Set("media-user-token", w.mediaUserToken)
-	req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
-	req.Header.Set("Origin", "https://podcasts.apple.com")
-	req.Header.Set("Referer", "https://podcasts.apple.com/")
-	req.Header.Set("x-apple-client-version", "2622.3.0-external")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15")
+		body, err := json.Marshal(payload{
+			Type: "playback-positions",
+			Attributes: attributes{
+				PositionInMilliseconds: positionMs,
+				RecordedAtTimestamp:    time.Now().UTC().Format(time.RFC3339Nano),
+				Completed:              completed,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("marshal payload: %w", err)
+		}
 
-	resp, err := w.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("HTTP PUT: %w", err)
-	}
-	defer resp.Body.Close()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("build request: %w", err)
+		}
 
-	if resp.StatusCode >= 400 {
+		req.Header.Set("Authorization", "Bearer "+w.bearerToken)
+		req.Header.Set("media-user-token", w.mediaUserToken)
+		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+		req.Header.Set("Origin", "https://podcasts.apple.com")
+		req.Header.Set("Referer", "https://podcasts.apple.com/")
+		req.Header.Set("x-apple-client-version", "2622.3.0-external")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15")
+
+		resp, err := w.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("HTTP PUT: %w", err)
+			continue // network error — retry
+		}
+
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))
+		resp.Body.Close()
+
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))
+			continue // transient server error — retry
+		}
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody)) // client error — don't retry
+		}
+
+		return nil // success
 	}
 
-	return nil
+	return fmt.Errorf("after %d attempts: %w", maxRetries+1, lastErr)
 }

@@ -41,7 +41,7 @@ func NewProvider(sqlitePath, opmlPath string) *Provider {
 // Authorization: Bearer value and mediaUserToken is the media-user-token header
 // value, both obtained from a logged-in podcasts.apple.com browser session.
 func (p *Provider) SetWebAPICredentials(bearerToken, mediaUserToken string) {
-	p.webAPI = NewWebAPIWriter(p.sqlitePath, bearerToken, mediaUserToken)
+	p.webAPI = NewWebAPIWriter(bearerToken, mediaUserToken)
 }
 
 func (p *Provider) Name() string { return "Apple Podcasts" }

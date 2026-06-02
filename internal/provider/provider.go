@@ -61,6 +61,22 @@ type WriteOptions struct {
 	// If either side has no pub date the check is skipped and the title match
 	// is accepted regardless of the tolerance value.
 	TitleMatchDateTolerance time.Duration
+
+	// StrictFeedMatch, when true, restricts episode matching to strategies that
+	// require the feed URL to agree (strategies 1 and 2: feeddate and feedtitle).
+	// The cross-feed fallbacks (strategies 3 and 4: poddate and podtitle, which
+	// match by podcast title regardless of feed URL) are skipped.
+	//
+	// Use this when you want to be certain an episode is only marked if its feed
+	// URL is unambiguous. Off by default.
+	StrictFeedMatch bool
+
+	// ForceUpdate, when true, writes the source play state to the destination
+	// even when the destination already shows the episode as played or further
+	// along. By default the writer skips episodes where the server is already
+	// at or beyond the target state (to avoid redundant writes and rewinding
+	// in-progress positions). Enable this to force a full re-sync.
+	ForceUpdate bool
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

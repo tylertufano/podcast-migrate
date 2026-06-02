@@ -14,7 +14,7 @@ podcast-migrate reads your library directly from the source app's local data, me
 
 - Reads subscriptions and episode play state directly from `MTLibrary.sqlite` — no export step needed
 - Falls back to a manually exported OPML file if the database isn't accessible
-- **Play state write** via the Apple Podcasts web API (`amp-api.podcasts.apple.com`) — marks episodes as played on Apple's backend, which syncs automatically to iPhone, iPad, Mac, and the web player. See [Overcast → Apple Podcasts](#overcast--apple-podcasts-sync-play-state-to-iphone) for setup.
+- **Play state write** via the Apple Podcasts web API (`amp-api.podcasts.apple.com`) — syncs both fully played and in-progress episodes to Apple's backend, which propagates automatically to iPhone, iPad, Mac, and the web player. Episode IDs are resolved through the Apple catalog API (iTunes Search + amp-api catalog with full pagination), so no local database or Full Disk Access is required for the write path. Before each write the server's current position is checked and the episode is skipped if Apple is already at or ahead of the source. See [Overcast → Apple Podcasts](#overcast--apple-podcasts-sync-play-state-to-iphone) for setup.
 - Detects and reports two categories of content that can't be migrated:
   - **`internal://` feeds** — Apple-exclusive shows with no public RSS feed
   - **PSUB / PLUS episodes** — paywalled Apple Podcasts Subscriptions episodes; the parent podcast subscription is still migrated
@@ -101,6 +101,8 @@ podcast-migrate migrate --from podcasts --to overcast \
 
 This direction writes play state via the Apple Podcasts web API, which syncs to **all your Apple devices** (iPhone, iPad, Mac, and the web at podcasts.apple.com) automatically — no need to open the app, no iCloud delay.
 
+Episode IDs are resolved through the Apple catalog API (iTunes Search API to find the podcast, then amp-api catalog with full pagination to index all episodes). **No local Apple Podcasts database is needed** — this works without Full Disk Access and on machines where Apple Podcasts has never been opened.
+
 #### Step 1 — Get your tokens (one-time setup)
 
 1. Open [podcasts.apple.com](https://podcasts.apple.com) in your browser and sign in
@@ -142,6 +144,8 @@ podcast-migrate migrate --from overcast --to podcasts \
 ```
 
 **Scope:** Only episodes in the Apple Podcasts catalog (public RSS feeds indexed by Apple) can be marked via this API. Private or unlisted feeds without an Apple catalog entry are skipped and reported.
+
+**Episode coverage:** The Apple catalog API is paginated — all episodes for a podcast are indexed (not just the most recent), so old played episodes are handled correctly regardless of how far back your history goes.
 
 **Token lifetimes:** The Bearer token is a short-lived JWT signed by Apple — capture a fresh one if you get `401` errors. The `media-user-token` is your account session and lasts longer but will eventually expire. Both are re-captured the same way (one network request in DevTools).
 
@@ -209,6 +213,8 @@ podcast-migrate import --to overcast \
 | `--overcast-password` | Overcast account password (or `OVERCAST_PASSWORD` env var) |
 | `--apple-bearer-token` | Apple web API Bearer token (or `APPLE_BEARER_TOKEN` env var) |
 | `--apple-media-user-token` | Apple media-user-token (or `APPLE_MEDIA_USER_TOKEN` env var) |
+| `--strict-feed-match` | Only match episodes using feed-URL-anchored strategies; skips cross-feed title fallbacks |
+| `--force-update` | Write source play state even if the destination already shows the episode as played or further along |
 
 ## Future work
 
@@ -225,7 +231,7 @@ A `sync` subcommand that runs on a schedule (cron or a background agent) and inc
 The current cascade can fail when the same episode has different titles or pub dates across providers (common with older feeds that changed hosting). A fuzzy-match fallback using edit distance on titles would reduce unmatched episodes.
 
 ### Token management
-Automatic extraction of the Apple Bearer token from the macOS Keychain (where the native Podcasts app caches it), and automatic renewal when it expires, to avoid the manual DevTools capture step.
+Automatic extraction of the Apple Bearer token from the macOS Keychain (where the native Podcasts app caches it), and automatic renewal when it expires, to avoid the manual DevTools capture step. The `media-user-token` is harder to extract automatically since it lives in a browser cookie rather than the system Keychain.
 
 ### Packaged release
 Signed macOS binary via GitHub Actions, distributed through Homebrew.
@@ -237,7 +243,7 @@ cmd/                  CLI entry points (migrate, export, import, mark-played, ob
 internal/
   model/              Shared types: Library, Podcast, EpisodeState
   provider/           Provider interface and WriteOptions
-  apple/              Apple Podcasts adapter (SQLite read + web API write)
+  apple/              Apple Podcasts adapter (SQLite read; catalog API + web API write)
   overcast/           Overcast adapter (OPML read/write + web API)
   sync/               Merge engine and conflict resolution
 main.go
@@ -249,4 +255,4 @@ main.go
 go test ./...
 ```
 
-131 tests; coverage: `apple` ~85%, `overcast` 95%, `sync` 99%.
+131 tests; coverage: `apple` ~80%, `overcast` 95%, `sync` 99%.

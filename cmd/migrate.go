@@ -177,8 +177,10 @@ func migrateCmd() *cobra.Command {
 
 			fmt.Println(result)
 
-			if !dryRun && to == "overcast" && overcastOut != "" {
-				fmt.Printf("\nNext step: open Overcast > Settings > Import OPML and select:\n  %s\n", overcastOut)
+			if !dryRun && to == "overcast" {
+				if overcastOut != "" {
+					fmt.Printf("\nNext step: open Overcast > Settings > Import OPML and select:\n  %s\n", overcastOut)
+				}
 				if playState {
 					fmt.Println("Play state has been written directly via the Overcast web API.")
 				}
@@ -264,8 +266,8 @@ func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, 
 	case "podcasts", "apple":
 		return apple.NewProvider(sqlitePath, opmlFallback), nil
 	case "overcast":
-		if overcastImport == "" && overcastOut == "" {
-			return nil, fmt.Errorf("overcast requires --overcast-source-opml (read) or --overcast-out (write)")
+		if overcastImport == "" && overcastOut == "" && overcastEmail == "" {
+			return nil, fmt.Errorf("overcast requires at least one of: --overcast-source-opml (read), --overcast-out (write), or credentials (--overcast-email/--overcast-password for play-state write)")
 		}
 		if overcastEmail != "" {
 			return overcast.NewProviderWithCredentials(overcastImport, overcastOut, overcastEmail, overcastPassword), nil

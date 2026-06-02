@@ -155,60 +155,79 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			opts.PodcastFilter, len(episodes), len(lib.Episodes))
 	}
 
-	// 2. Authenticate.
+	writeLogHeader(opts.LogWriter)
+
+	// 2. In dry-run mode, report what would be written without making any web requests.
+	//    Extended matching (which requires authentication) is not run, so episodes
+	//    absent from the OPML appear as not_found even if they would resolve at write time.
 	if opts.DryRun {
-		// In dry-run mode, report what would be written without making any web requests.
 		n := 0
 		for _, ep := range episodes {
-			if ep.PlayState == model.PlayStateUnplayed {
+			if ep.FromDestination || ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 				continue
 			}
-			entry, ok := findInOvercastIndex(index, ep)
-			if ok && !overcastAlreadySatisfied(ep, entry) {
-				n++
+			podTitle := feedToTitle[ep.FeedURL]
+			entry, ok := findInOvercastIndex(index, ep, opts.StrictFeedMatch)
+			if !ok {
+				writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
+					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+					"not in Overcast OPML (extended matching skipped in dry-run)")
+				continue
 			}
+			if !opts.ForceUpdate {
+				if reason := overcastSkipReason(ep, entry); reason != "" {
+					writeLogLine(opts.LogWriter, reason, podTitle, ep.Title, ep.PubDate,
+						playStateLabel(ep.PlayState, ep.PlayPosition),
+						playStateLabel(entry.currentState, entry.currentPos), "")
+					continue
+				}
+			}
+			fmt.Printf("  [dry-run] would set progress: %q — %q → %s\n",
+				podTitle, ep.Title, playStateLabel(ep.PlayState, ep.PlayPosition))
+			writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—", "")
+			n++
 		}
 		return n, nil
 	}
 
+	// 3. Authenticate.
 	fmt.Printf("overcast: authenticating as %s...\n", p.email)
 	httpClient, err := Login(ctx, p.email, p.password)
 	if err != nil {
 		return 0, fmt.Errorf("overcast: authentication failed: %w", err)
 	}
 
-	// 3. Resolve the request delay: honour the caller's preference, or fall
+	// 4. Resolve the request delay: honour the caller's preference, or fall
 	//    back to the conservative default.
 	requestDelay := opts.RequestDelay
 	if requestDelay <= 0 {
 		requestDelay = DefaultRequestDelay
 	}
 
-	// 4. Augment the index with episode IDs from Overcast podcast pages.
+	// 5. Augment the index with episode IDs from Overcast podcast pages.
 	//    This handles episodes in shared feeds that weren't in the OPML export
 	//    (i.e. episodes the user listened to in Apple but never touched in Overcast).
 	//    Pass the filtered episode list so we only fetch pages for in-scope podcasts.
-	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, episodes, index, requestDelay, feedToTitle)
+	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
 
-	// 5. For each episode with play state, look up its Overcast numeric ID and post
-	//    set_progress. Failures on individual episodes are logged and skipped.
+	// 6. Pre-count: how many episodes need an API call vs. are already satisfied.
 	fmt.Printf("overcast: request delay: %v between calls\n", requestDelay)
 
-	// Pre-count: how many episodes need an API call vs. are already satisfied.
 	toUpdate := 0
 	alreadyDone := 0
 	for _, ep := range episodes {
-		if ep.PlayState == model.PlayStateUnplayed {
+		if ep.FromDestination || ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
 		}
-		entry, ok := findInOvercastIndex(index, ep)
+		entry, ok := findInOvercastIndex(index, ep, opts.StrictFeedMatch)
 		if !ok {
 			continue // unmatched — not in Overcast's history
 		}
-		if overcastAlreadySatisfied(ep, entry) {
+		if !opts.ForceUpdate && overcastSkipReason(ep, entry) != "" {
 			alreadyDone++
 		} else {
 			toUpdate++
@@ -219,24 +238,44 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	}
 	fmt.Printf("overcast: writing play state for %d episode(s)...\n", toUpdate)
 
+	// 7. For each episode with play state, look up its Overcast numeric ID and post
+	//    set_progress. Failures on individual episodes are logged and skipped.
 	updated := 0
 	apiSkipped := 0
+	skippedPlayed := 0
+	skippedAhead := 0
+	notFound := 0
 
 	for _, ep := range episodes {
-		if ep.PlayState == model.PlayStateUnplayed {
+		if ep.FromDestination || ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
 		}
+		podTitle := feedToTitle[ep.FeedURL]
 
-		entry, ok := findInOvercastIndex(index, ep)
+		entry, ok := findInOvercastIndex(index, ep, opts.StrictFeedMatch)
 		if !ok {
-			continue // unmatched — not in Overcast's history
+			notFound++
+			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+				"episode not matched in Overcast (not subscribed or not found via extended matching)")
+			continue
 		}
 
-		// Skip episodes that Overcast already has in the desired state.
-		// This dramatically reduces API calls on re-runs when most episodes
-		// are already marked as played in Overcast.
-		if overcastAlreadySatisfied(ep, entry) {
-			continue
+		// Skip episodes that Overcast already has in the desired state, unless
+		// ForceUpdate is set (caller wants to force a full re-sync).
+		if !opts.ForceUpdate {
+			if reason := overcastSkipReason(ep, entry); reason != "" {
+				switch reason {
+				case "already_played":
+					skippedPlayed++
+				case "already_ahead":
+					skippedAhead++
+				}
+				writeLogLine(opts.LogWriter, reason, podTitle, ep.Title, ep.PubDate,
+					playStateLabel(ep.PlayState, ep.PlayPosition),
+					playStateLabel(entry.currentState, entry.currentPos), "")
+				continue
+			}
 		}
 
 		numericID := entry.numericID
@@ -245,14 +284,29 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			pos = PlayedSentinel
 		}
 
+		// Retry loop: 429 (rate limit) and 5xx/network (transient) errors are
+		// handled independently with separate attempt counters so neither can
+		// exhaust the other's budget. Permanent 4xx errors (other than 429)
+		// break immediately.
+		const maxRateLimitRetries = 3
+		const maxTransientRetries = 3
+		const retryBaseDelay = 2 * time.Second
+
 		var setErr error
-		for attempt := 0; attempt < 4; attempt++ {
+		rateLimitRetries := 0
+		transientRetries := 0
+		for {
 			setErr = SetProgress(ctx, httpClient, numericID, pos)
 			if setErr == nil {
 				break
 			}
+
 			var rl *RateLimitError
 			if errors.As(setErr, &rl) {
+				if rateLimitRetries >= maxRateLimitRetries {
+					break
+				}
+				rateLimitRetries++
 				fmt.Printf("\n  rate limited (429) — pausing %v before retry...\n", rl.Wait)
 				select {
 				case <-ctx.Done():
@@ -261,11 +315,31 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				}
 				continue
 			}
-			break // non-rate-limit error — don't retry
+
+			var te *TransientError
+			if errors.As(setErr, &te) {
+				if transientRetries >= maxTransientRetries {
+					break
+				}
+				transientRetries++
+				delay := retryBaseDelay * (1 << uint(transientRetries-1)) // 2s, 4s, 8s
+				fmt.Printf("    transient error — retrying in %v (attempt %d/%d)...\n",
+					delay, transientRetries, maxTransientRetries)
+				select {
+				case <-ctx.Done():
+					return updated, ctx.Err()
+				case <-time.After(delay):
+				}
+				continue
+			}
+
+			break // permanent error (4xx other than 429) — don't retry
 		}
 		if setErr != nil {
 			fmt.Printf("  [%d/%d] FAILED %q (id=%s): %v\n",
 				updated+apiSkipped+1, toUpdate, ep.Title, numericID, setErr)
+			writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—", setErr.Error())
 			apiSkipped++
 
 			// If the first call already indicates an auth failure, abort immediately.
@@ -276,6 +350,10 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			}
 			continue
 		}
+
+		targetLabel := playStateLabel(ep.PlayState, ep.PlayPosition)
+		writeLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
+			playStateLabel(ep.PlayState, ep.PlayPosition), targetLabel, "")
 		updated++
 
 		// Log the first 5 successes and then every 50th so the user can verify
@@ -295,6 +373,15 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		time.Sleep(requestDelay)
 	}
 
+	if skippedPlayed > 0 {
+		fmt.Printf("overcast: %d episode(s) skipped — already marked as played in Overcast\n", skippedPlayed)
+	}
+	if skippedAhead > 0 {
+		fmt.Printf("overcast: %d episode(s) skipped — Overcast position already at or ahead of source\n", skippedAhead)
+	}
+	if notFound > 0 {
+		fmt.Printf("overcast: %d episode(s) not matched in Overcast (not subscribed or not found via extended matching)\n", notFound)
+	}
 	if apiSkipped > 0 {
 		fmt.Printf("overcast: %d episode(s) failed during write (see warnings above)\n", apiSkipped)
 	}
@@ -327,6 +414,7 @@ func augmentIndexFromPodcastPages(
 	index map[string]overcastIndexEntry,
 	requestDelay time.Duration,
 	feedToTitle map[string]string, // Apple feedURL → lowercased podcast title (for title-based fallback)
+	strictFeedMatch bool,
 ) int {
 	// Build per-feed Apple episode set (only episodes with play state, by feed).
 	appleByFeed := make(map[string][]model.EpisodeState)
@@ -403,17 +491,21 @@ func augmentIndexFromPodcastPages(
 
 		// Look up Overcast podcast info by normalised feed URL first.
 		info, ok := opmlByNormFeed[normFeed]
-		if !ok {
+		if !ok && !strictFeedMatch {
 			// Feed URL mismatch — try matching by podcast title.
 			// feedToTitle values are already lowercased by buildFeedToTitle.
+			// Skipped when strictFeedMatch is true: only feed-URL-anchored results allowed.
 			if appleTitle := feedToTitle[feedURL]; appleTitle != "" {
-				info, ok = opmlByTitle[appleTitle]
+				if titleInfo, found := opmlByTitle[appleTitle]; found {
+					info = titleInfo
+					ok = true
+					fmt.Printf("  note: feed URL mismatch for %q — matched by podcast title\n", info.title)
+				}
 			}
-			if !ok {
-				skippedFeeds++
-				continue // not subscribed in Overcast and title not found
-			}
-			fmt.Printf("  note: feed URL mismatch for %q — matched by podcast title\n", info.title)
+		}
+		if !ok {
+			skippedFeeds++
+			continue // not subscribed in Overcast and title not found
 		}
 
 		iTunesID, err := searchPodcastITunesIDWithRetry(ctx, client, info.title, info.overcastID, requestDelay)
@@ -509,7 +601,8 @@ func augmentIndexFromPodcastPages(
 			// This handles episodes where the pubDate stored in Apple Podcasts doesn't
 			// align with the date Overcast shows on the podcast page (e.g. timezone
 			// differences in the RSS feed's pubDate field).
-			if epURL == "" && ap.Title != "" {
+			// Skipped when strictFeedMatch is true: only date-anchored results allowed.
+			if epURL == "" && !strictFeedMatch && ap.Title != "" {
 				normAppleTitle := strings.ToLower(strings.TrimSpace(ap.Title))
 				// Exact match first (cell text == episode title).
 				for _, te := range titleEntries {
@@ -744,9 +837,10 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client, pag
 	return nil, lastErr
 }
 
-// findInOvercastIndex looks up an episode by pubDate+feedURL then title+feedURL.
+// findInOvercastIndex looks up an episode by pubDate+feedURL, then title+feedURL
+// (unless strictFeedMatch is true, in which case only the exact-date strategy is tried).
 // Returns the index entry and whether a match was found.
-func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState) (overcastIndexEntry, bool) {
+func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState, strictFeedMatch bool) (overcastIndexEntry, bool) {
 	// Normalise the Apple feed URL so it matches the normalised Overcast feed URL
 	// stored in the index, bridging minor differences (http vs https, trailing slash).
 	normFeed := normalizeFeedURL(ep.FeedURL)
@@ -756,7 +850,9 @@ func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeSt
 			return entry, true
 		}
 	}
-	if ep.FeedURL != "" && ep.Title != "" {
+	// Title-based fallback: same feed URL, different pub date.  Skipped when
+	// strictFeedMatch is true (caller wants only exact date+URL matches).
+	if !strictFeedMatch && ep.FeedURL != "" && ep.Title != "" {
 		key := "feedtitle:" + normFeed + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
 		if entry, ok := index[key]; ok {
 			return entry, true
@@ -836,22 +932,35 @@ func normalizeFeedURL(raw string) string {
 	return u.String()
 }
 
+// overcastSkipReason returns the log status string when Overcast's current state
+// for an episode already matches or exceeds what we want to write — either
+// "already_played" (Overcast has it as completed) or "already_ahead" (in-progress
+// position is at or beyond the desired position). Returns "" when we should write.
+//
+// These map directly to the statuses used by the Apple target writer so that
+// --log-file produces consistent output regardless of direction.
+func overcastSkipReason(desired model.EpisodeState, current overcastIndexEntry) string {
+	switch desired.PlayState {
+	case model.PlayStatePlayed:
+		if current.currentState == model.PlayStatePlayed {
+			return "already_played"
+		}
+	case model.PlayStateInProgress:
+		if current.currentState == model.PlayStatePlayed {
+			return "already_played" // Overcast is ahead
+		}
+		if current.currentState == model.PlayStateInProgress && current.currentPos >= desired.PlayPosition {
+			return "already_ahead"
+		}
+	}
+	return ""
+}
+
 // overcastAlreadySatisfied reports whether Overcast's current state for an episode
 // already matches or exceeds what we want to write, making the set_progress call a no-op.
 //
 // Played beats everything. For in-progress, we skip if Overcast is already at
 // or ahead of the desired position.
 func overcastAlreadySatisfied(desired model.EpisodeState, current overcastIndexEntry) bool {
-	switch desired.PlayState {
-	case model.PlayStatePlayed:
-		return current.currentState == model.PlayStatePlayed
-	case model.PlayStateInProgress:
-		if current.currentState == model.PlayStatePlayed {
-			return true // already further
-		}
-		if current.currentState == model.PlayStateInProgress {
-			return current.currentPos >= desired.PlayPosition
-		}
-	}
-	return false
+	return overcastSkipReason(desired, current) != ""
 }

@@ -255,4 +255,4 @@ main.go
 go test ./...
 ```
 
-131 tests; coverage: `apple` ~80%, `overcast` 95%, `sync` 99%.
+Tests: `apple` ~85%, `overcast` 95%, `sync` 99%.

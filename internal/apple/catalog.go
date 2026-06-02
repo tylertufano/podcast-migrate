@@ -220,18 +220,35 @@ func (c *CatalogClient) searchITunes(ctx context.Context, feedURL, podcastTitle 
 
 	var result struct {
 		Results []struct {
-			CollectionId int64  `json:"collectionId"`
-			FeedUrl      string `json:"feedUrl"`
+			CollectionId   int64  `json:"collectionId"`
+			FeedUrl        string `json:"feedUrl"`
+			CollectionName string `json:"collectionName"`
 		} `json:"results"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return 0, false, fmt.Errorf("catalog: iTunes search: decode: %w", err)
 	}
 
-	// Match by normalized feed URL.
+	// Primary: match by normalized feed URL.
 	for _, r := range result.Results {
 		if normalizeWriteFeedURL(r.FeedUrl) == normFeed {
 			return r.CollectionId, true, nil
+		}
+	}
+
+	// Fallback: exact podcast title match when no feed URL matched.
+	// The source app may store a redirected or alternate feed URL that differs
+	// from what the iTunes catalog has. Searching by title already scoped results,
+	// so an exact case-insensitive name match is reliable.
+	// Mirrors the title-fallback in overcast.SearchPodcastITunesID.
+	titleNorm := strings.ToLower(strings.TrimSpace(podcastTitle))
+	if titleNorm != "" {
+		for _, r := range result.Results {
+			if strings.ToLower(strings.TrimSpace(r.CollectionName)) == titleNorm {
+				fmt.Printf("  note: iTunes feed URL mismatch for %q — matched by podcast title (catalog feedUrl: %s)\n",
+					podcastTitle, r.FeedUrl)
+				return r.CollectionId, true, nil
+			}
 		}
 	}
 

@@ -115,6 +115,17 @@ func (e *RateLimitError) Error() string {
 	return fmt.Sprintf("overcast/web: rate limited (HTTP 429) — retry after %v", e.Wait)
 }
 
+// TransientError is returned when SetProgress receives a 5xx response or a
+// network-level failure — both of which may succeed on a subsequent attempt.
+// Callers that implement retry logic should detect this type and back off before
+// retrying. Permanent client errors (4xx other than 429) are not wrapped.
+type TransientError struct {
+	cause error
+}
+
+func (e *TransientError) Error() string { return e.cause.Error() }
+func (e *TransientError) Unwrap() error { return e.cause }
+
 // rateLimitWait extracts the Retry-After delay from a 429 response, falling back
 // to defaultWait if the header is absent or unparseable.
 func rateLimitWait(resp *http.Response, defaultWait time.Duration) time.Duration {
@@ -198,7 +209,8 @@ func SetProgress(ctx context.Context, client *http.Client, numericID string, pos
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("overcast/web: set_progress %s: %w", numericID, err)
+		// Network-level failure (DNS, TCP, timeout) — transient, caller may retry.
+		return &TransientError{cause: fmt.Errorf("overcast/web: set_progress %s: %w", numericID, err)}
 	}
 
 	// Read up to 4 KB of the body for error diagnostics.
@@ -207,6 +219,11 @@ func SetProgress(ctx context.Context, client *http.Client, numericID string, pos
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
+	if resp.StatusCode >= 500 {
+		// Server-side error — transient, caller may retry with backoff.
+		excerpt := bodyExcerpt(body)
+		return &TransientError{cause: fmt.Errorf("overcast/web: set_progress %s returned HTTP %d: %s", numericID, resp.StatusCode, excerpt)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		excerpt := bodyExcerpt(body)

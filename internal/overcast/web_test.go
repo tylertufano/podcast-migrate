@@ -2,6 +2,7 @@ package overcast_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -190,17 +191,44 @@ func TestSetProgress_Unplayed(t *testing.T) {
 	}
 }
 
-func TestSetProgress_HTTPError(t *testing.T) {
-	// Use a server that always returns 503; rewrite all requests to it.
-	srv503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv503.Close()
+func TestSetProgress_5xxReturnsTransientError(t *testing.T) {
+	// 5xx responses should be wrapped in *TransientError so callers can retry.
+	for _, code := range []int{500, 502, 503, 504} {
+		code := code
+		t.Run(fmt.Sprintf("HTTP%d", code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
 
-	client := &http.Client{Transport: rewriteHostTransport{target: srv503.URL}}
+			client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+			err := overcast.SetProgress(context.Background(), client, "9876543210", overcast.PlayedSentinel)
+			if err == nil {
+				t.Fatalf("HTTP %d: expected error, got nil", code)
+			}
+			var te *overcast.TransientError
+			if !errors.As(err, &te) {
+				t.Errorf("HTTP %d: expected *TransientError, got %T: %v", code, err, err)
+			}
+		})
+	}
+}
+
+func TestSetProgress_4xxReturnsPlainError(t *testing.T) {
+	// 4xx responses (other than 429) should NOT be wrapped in *TransientError.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden) // 403
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
 	err := overcast.SetProgress(context.Background(), client, "9876543210", overcast.PlayedSentinel)
 	if err == nil {
-		t.Error("expected error for 503 response")
+		t.Fatal("expected error for 403, got nil")
+	}
+	var te *overcast.TransientError
+	if errors.As(err, &te) {
+		t.Errorf("403 should not be a *TransientError (permanent client error)")
 	}
 }
 

@@ -91,7 +91,7 @@ func TestBuildOvercastIndex_NormalisesURLs(t *testing.T) {
 		Title:   "URL Mismatch Episode",
 		PubDate: pubDate,
 	}
-	entry, ok := findInOvercastIndex(index, appleEp)
+	entry, ok := findInOvercastIndex(index, appleEp, false)
 	if !ok {
 		t.Fatal("findInOvercastIndex: episode not found — URL normalisation failed")
 	}
@@ -123,7 +123,7 @@ func TestFindInOvercastIndex_TrailingSlashMismatch(t *testing.T) {
 		Title:   "Trailing Slash Test",
 		PubDate: pubDate,
 	}
-	if _, ok := findInOvercastIndex(index, appleEp); !ok {
+	if _, ok := findInOvercastIndex(index, appleEp, false); !ok {
 		t.Error("trailing-slash mismatch prevented match — normalisation should handle this")
 	}
 }

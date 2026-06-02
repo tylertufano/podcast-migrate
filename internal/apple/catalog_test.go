@@ -221,6 +221,102 @@ func TestFindEpisode_TitleFallbackEndToEnd(t *testing.T) {
 	}
 }
 
+// TestSearchITunes_PlusTitleFallback verifies that when the source app has a paid
+// feed (e.g. "Fresh Air Plus" from NPR Plus) the Apple catalog is still found by
+// stripping the " Plus" suffix and matching the public podcast title.
+func TestSearchITunes_PlusTitleFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// iTunes catalog only knows the public show title "Fresh Air".
+		w.Write(itunesSearchResponse([]map[string]any{
+			{
+				"collectionId":   int64(381444908),
+				"feedUrl":        "https://feeds.npr.org/381444908/podcast.xml",
+				"collectionName": "Fresh Air",
+			},
+		}))
+	}))
+	defer srv.Close()
+
+	c := NewCatalogClient("token")
+	c.httpClient = &http.Client{Transport: rewriteHostTransport(srv.URL)}
+
+	// Source (Overcast) stored the NPR Plus feed URL and podcast title "Fresh Air Plus".
+	id, found, err := c.searchITunes(context.Background(),
+		"https://feeds.npr.org/plus/fresh-air", "Fresh Air Plus")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true via Plus-normalised title fallback")
+	}
+	if id != 381444908 {
+		t.Errorf("collectionId: got %d, want 381444908", id)
+	}
+}
+
+// TestSearchITunes_PlusTitleFallback_PlusSymbol verifies the "+" suffix variant
+// (e.g. "Planet Money+") is also stripped when searching the iTunes catalog.
+func TestSearchITunes_PlusTitleFallback_PlusSymbol(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(itunesSearchResponse([]map[string]any{
+			{
+				"collectionId":   int64(290783428),
+				"feedUrl":        "https://feeds.npr.org/510289/podcast.xml",
+				"collectionName": "Planet Money",
+			},
+		}))
+	}))
+	defer srv.Close()
+
+	c := NewCatalogClient("token")
+	c.httpClient = &http.Client{Transport: rewriteHostTransport(srv.URL)}
+
+	id, found, err := c.searchITunes(context.Background(),
+		"https://feeds.npr.org/plus/planet-money", "Planet Money+")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true via Plus-symbol title fallback")
+	}
+	if id != 290783428 {
+		t.Errorf("collectionId: got %d, want 290783428", id)
+	}
+}
+
+// TestSearchITunes_PlusTitleFallback_NotUsedForExactMatch verifies that the
+// Plus fallback is not attempted when the feed URL already matched directly.
+func TestSearchITunes_PlusTitleFallback_NotUsedForExactMatch(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(itunesSearchResponse([]map[string]any{
+			{
+				"collectionId":   int64(12345),
+				"feedUrl":        "https://feeds.example.com/show",
+				"collectionName": "Example Show",
+			},
+		}))
+	}))
+	defer srv.Close()
+
+	c := NewCatalogClient("token")
+	c.httpClient = &http.Client{Transport: rewriteHostTransport(srv.URL)}
+
+	id, found, err := c.searchITunes(context.Background(),
+		"https://feeds.example.com/show", "Example Show")
+	if err != nil || !found || id != 12345 {
+		t.Fatalf("basic match failed: err=%v found=%v id=%d", err, found, id)
+	}
+	// Only one HTTP call (no retry from fallback paths).
+	if calls != 1 {
+		t.Errorf("expected 1 HTTP call (feed URL matched directly), got %d", calls)
+	}
+}
+
 // rewriteHostTransport returns an http.RoundTripper that redirects all requests
 // to baseURL, preserving the path and query. Used to point clients at httptest servers.
 type rewriteHost struct {

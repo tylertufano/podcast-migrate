@@ -38,16 +38,17 @@ func TestOvercastProvider_Capabilities_BothPaths(t *testing.T) {
 	p := overcast.NewProvider("import.opml", "export.opml")
 	caps := p.Capabilities()
 	if !caps.ReadSubscriptions {
-		t.Error("ReadSubscriptions should be true when importOPMLPath is set")
+		t.Error("ReadSubscriptions should be true when sourceOPMLPath is set")
 	}
 	if !caps.ReadPlayState {
-		t.Error("ReadPlayState should be true when importOPMLPath is set")
+		t.Error("ReadPlayState should be true when sourceOPMLPath is set")
 	}
 	if !caps.WriteSubscriptions {
 		t.Error("WriteSubscriptions should be true when exportOPMLPath is set")
 	}
+	// WritePlayState requires credentials, not an OPML path.
 	if caps.WritePlayState {
-		t.Error("WritePlayState should always be false — Overcast has no public API for this")
+		t.Error("WritePlayState should be false without credentials")
 	}
 }
 
@@ -137,30 +138,41 @@ func TestOvercastProvider_WithCredentials_Capabilities(t *testing.T) {
 	caps := p.Capabilities()
 
 	if !caps.WritePlayState {
-		t.Error("WritePlayState should be true when credentials and importOPMLPath are set")
+		t.Error("WritePlayState should be true when credentials are set")
 	}
 	if !caps.ReadSubscriptions {
-		t.Error("ReadSubscriptions should be true when importOPMLPath is set")
+		t.Error("ReadSubscriptions should be true when sourceOPMLPath is set")
 	}
 	if !caps.WriteSubscriptions {
 		t.Error("WriteSubscriptions should be true when exportOPMLPath is set")
 	}
 }
 
-func TestOvercastProvider_WithCredentials_NoOPML_WritePlayStateFalse(t *testing.T) {
-	// Credentials alone are not enough — an OPML is needed for episode matching.
+func TestOvercastProvider_WithCredentials_NoSourceOPML_WritePlayStateTrue(t *testing.T) {
+	// Credentials alone are sufficient for WritePlayState — the destination matching
+	// OPML is auto-fetched from the live account after login (no sourceOPMLPath needed).
 	p := overcast.NewProviderWithCredentials("", "/tmp/out.opml", "user@example.com", "secret")
 	caps := p.Capabilities()
-	if caps.WritePlayState {
-		t.Error("WritePlayState should be false when importOPMLPath is empty (no episode matching possible)")
+	if !caps.WritePlayState {
+		t.Error("WritePlayState should be true when credentials are set (match OPML auto-fetched at write time)")
+	}
+	// ReadSubscriptions and ReadPlayState still require a source OPML.
+	if caps.ReadSubscriptions {
+		t.Error("ReadSubscriptions should be false when sourceOPMLPath is empty")
+	}
+	if caps.ReadPlayState {
+		t.Error("ReadPlayState should be false when sourceOPMLPath is empty")
 	}
 }
 
 func TestOvercastProvider_SetLibrary_PlayStateDryRun(t *testing.T) {
 	// Dry-run play state write: should count matched episodes without making any HTTP calls.
+	// SetMatchOPMLPath is required here so the dry-run reads from a file instead of
+	// trying to authenticate and auto-fetch the live account library.
 	importPath := writeMinimalOvercastOPML(t)
 	outPath := filepath.Join(t.TempDir(), "out.opml")
 	p := overcast.NewProviderWithCredentials(importPath, outPath, "user@example.com", "secret")
+	p.SetMatchOPMLPath(importPath) // use the source OPML for matching — avoids live login in tests
 
 	lib := &model.Library{
 		Podcasts: []model.Podcast{{FeedURL: "https://feeds.example.com/show-a", Title: "Show A"}},

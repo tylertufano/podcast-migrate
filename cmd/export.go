@@ -15,7 +15,7 @@ func exportCmd() *cobra.Command {
 		out            string
 		sqlitePath     string
 		opmlFallback   string
-		overcastExport string
+		overcastSourceOPML string
 	)
 
 	cmd := &cobra.Command{
@@ -23,7 +23,7 @@ func exportCmd() *cobra.Command {
 		Short: "Export a provider's library to a portable JSON file",
 		Example: `  podcast-migrate export --from podcasts --out ~/Desktop/my-podcasts.json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := buildProvider(from, sqlitePath, opmlFallback, overcastExport, "", "", "")
+			p, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", "", "")
 			if err != nil {
 				return err
 			}
@@ -65,7 +65,7 @@ func exportCmd() *cobra.Command {
 	cmd.Flags().StringVar(&out, "out", "-", "output path (default: stdout)")
 	cmd.Flags().StringVar(&sqlitePath, "sqlite", "", "path to MTLibrary.sqlite")
 	cmd.Flags().StringVar(&opmlFallback, "opml-fallback", "", "path to Apple Podcasts OPML export")
-	cmd.Flags().StringVar(&overcastExport, "overcast-export", "", "path to Overcast OPML export")
+	cmd.Flags().StringVar(&overcastSourceOPML, "overcast-source-opml", "", "path to Overcast OPML export")
 	_ = cmd.MarkFlagRequired("from")
 
 	return cmd

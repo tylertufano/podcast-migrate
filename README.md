@@ -83,17 +83,26 @@ Then in Overcast: **Settings › Import OPML** and select the generated file.
 ### Apple Podcasts → Overcast (sync play state)
 
 ```sh
-# Export your extended OPML from overcast.fm/account/export_opml/extended first, then:
 export OVERCAST_EMAIL="you@example.com"
 export OVERCAST_PASSWORD="yourpassword"
 
 podcast-migrate migrate --from podcasts --to overcast \
   --overcast-out ~/Desktop/overcast-import.opml \
-  --overcast-export ~/Downloads/overcast.opml \
   --play-state
 ```
 
-**How it works:** Authenticates with your Overcast account and calls the same internal API endpoint the Overcast web player uses to save episode positions. For each played episode, it fetches the episode's Overcast page to resolve its internal numeric ID, then POSTs the played position.
+**How it works:** Authenticates with your Overcast account, automatically fetches your current library from `overcast.fm/account/export_opml/extended`, and calls the same internal API endpoint the Overcast web player uses to save episode positions. For each played episode, it fetches the episode's Overcast page to resolve its internal numeric ID, then POSTs the played position.
+
+No manual OPML export required — the tool fetches your live account state after login.
+
+If you prefer to match against a specific snapshot instead of auto-fetching the live account (e.g. for reproducible dry-run previews), provide one explicitly:
+
+```sh
+podcast-migrate migrate --from podcasts --to overcast \
+  --overcast-out ~/Desktop/overcast-import.opml \
+  --overcast-match-opml ~/Downloads/overcast.opml \
+  --play-state
+```
 
 > **Disclaimer:** Uses an undocumented Overcast endpoint that Marco Arment has not publicly supported. It works as of the implementation date but may break without notice. Use `--dry-run` to preview before committing.
 
@@ -121,15 +130,14 @@ export APPLE_BEARER_TOKEN="eyJhbGci..."
 export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
 
 # Export your Overcast library from overcast.fm/account/export_opml/extended first, then:
-
 # Dry-run first to preview what will be marked
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-export ~/Downloads/overcast.opml \
+  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --dry-run
 
 # Live run
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-export ~/Downloads/overcast.opml \
+  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state
 ```
 
@@ -137,7 +145,7 @@ Or pass the tokens directly as flags:
 
 ```sh
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-export ~/Downloads/overcast.opml \
+  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state \
   --apple-bearer-token "eyJhbGci..." \
   --apple-media-user-token "0.Apgf..."
@@ -156,17 +164,17 @@ podcast-migrate migrate --from overcast --to podcasts \
 ```sh
 # Single podcast (case-insensitive substring match)
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-export ~/Downloads/overcast.opml \
+  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --podcast "rogan"
 
 # Multiple podcasts
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-export ~/Downloads/overcast.opml \
+  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --podcast "rogan" --podcast "sistersinlaw"
 
 # From a file (one podcast title/word per line)
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-export ~/Downloads/overcast.opml \
+  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --podcast-list ~/my-podcasts.txt
 ```
 
@@ -181,9 +189,9 @@ podcast-migrate export --from podcasts
 # Save to file
 podcast-migrate export --from podcasts --out ~/Desktop/my-library.json
 
-# Export from Overcast (requires a manual OPML export from overcast.fm/account/export_opml)
+# Export from Overcast
 podcast-migrate export --from overcast \
-  --overcast-export ~/Downloads/overcast.opml \
+  --overcast-source-opml ~/Downloads/overcast.opml \
   --out ~/Desktop/overcast-library.json
 ```
 
@@ -209,6 +217,8 @@ podcast-migrate import --to overcast \
 | `--podcast-list` | Path to a file with one podcast title/word per line |
 | `--request-delay` | Delay between API requests (default 500ms; increase if you hit rate limits) |
 | `--log-file` | Write per-episode CSV detail log (columns: status, podcast, episode, pub_date, source_state, target_state, note) |
+| `--overcast-source-opml` | Path to Overcast extended OPML export used as the migration source (`--from overcast`) |
+| `--overcast-match-opml` | Path to Overcast OPML used for destination episode matching when writing play state (optional; if omitted and credentials are set, the live account library is fetched automatically) |
 | `--overcast-email` | Overcast account email (or `OVERCAST_EMAIL` env var) |
 | `--overcast-password` | Overcast account password (or `OVERCAST_PASSWORD` env var) |
 | `--apple-bearer-token` | Apple web API Bearer token (or `APPLE_BEARER_TOKEN` env var) |
@@ -255,4 +265,4 @@ main.go
 go test ./...
 ```
 
-Tests: `apple` ~85%, `overcast` 95%, `sync` 99%.
+Tests: `apple` ~90%, `overcast` 95%, `sync` 99%, `model` 100%.

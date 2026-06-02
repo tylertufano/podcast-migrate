@@ -128,16 +128,45 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 	// --- Episode states: merge by conflict strategy ---
 	if !opts.OnlySubscriptions {
 		dstIndex := buildEpisodeIndex(dst)
+
+		// First pass: primary matching — GUID, feed URL + pub date, feed URL + title.
+		var unmatched []model.EpisodeState
 		for _, ep := range src.Episodes {
 			key := episodeKey(ep)
 			if existing, ok := dstIndex[key]; ok {
-				resolved := resolveConflict(ep, existing, opts.ConflictStrategy)
-				out.Episodes = append(out.Episodes, resolved)
+				out.Episodes = append(out.Episodes, resolveConflict(ep, existing, opts.ConflictStrategy))
 				delete(dstIndex, key)
 			} else {
-				out.Episodes = append(out.Episodes, ep)
+				unmatched = append(unmatched, ep)
 			}
 		}
+
+		// Second pass: cross-feed matching for episodes not resolved above.
+		// Handles paid-tier feed variants (e.g. "Fresh Air Plus" ↔ "Fresh Air") where
+		// the feed URL differs between apps but the podcast title normalises to the same
+		// base. Both sides are normalised via NormalizePlusTitle before comparison.
+		dstCrossIndex := buildCrossFeedIndex(dst)
+		srcFeedToTitle := buildFeedToTitle(src)
+		for _, ep := range unmatched {
+			if !ep.PubDate.IsZero() && ep.FeedURL != "" && len(dstCrossIndex) > 0 {
+				if podTitle := srcFeedToTitle[ep.FeedURL]; podTitle != "" {
+					xKey := "xfeed:" + model.NormalizePlusTitle(podTitle) + "|" + ep.PubDate.UTC().Format("2006-01-02T15:04:05")
+					if existing, ok := dstCrossIndex[xKey]; ok {
+						// Guard: only match if the dst episode wasn't already claimed in
+						// the first pass (possible when primary and cross-feed keys collide).
+						existingKey := episodeKey(existing)
+						if _, stillAvail := dstIndex[existingKey]; stillAvail {
+							out.Episodes = append(out.Episodes, resolveConflict(ep, existing, opts.ConflictStrategy))
+							delete(dstIndex, existingKey)
+							delete(dstCrossIndex, xKey)
+							continue
+						}
+					}
+				}
+			}
+			out.Episodes = append(out.Episodes, ep)
+		}
+
 		// Destination-only episodes (no match in src) are included so the writer
 		// can perform conflict resolution, but they are flagged so writers can
 		// distinguish them from source-originated episodes and skip re-processing
@@ -149,6 +178,48 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 	}
 
 	return out
+}
+
+// buildFeedToTitle returns a map from each podcast's feed URL to its lowercased
+// podcast title, built from lib.Podcasts. Used for cross-feed episode matching.
+func buildFeedToTitle(lib *model.Library) map[string]string {
+	if lib == nil {
+		return nil
+	}
+	m := make(map[string]string, len(lib.Podcasts))
+	for _, pod := range lib.Podcasts {
+		if pod.FeedURL != "" {
+			m[pod.FeedURL] = strings.ToLower(strings.TrimSpace(pod.Title))
+		}
+	}
+	return m
+}
+
+// buildCrossFeedIndex indexes lib's episodes by Plus-normalised podcast title +
+// pub date (format "xfeed:<normTitle>|<UTC date>"). Intended as a secondary index
+// used only when primary feed-URL-based matching fails, so that episodes from
+// paid-tier variants (e.g. "Fresh Air Plus") can match their public counterparts
+// ("Fresh Air") across providers.
+func buildCrossFeedIndex(lib *model.Library) map[string]model.EpisodeState {
+	if lib == nil {
+		return nil
+	}
+	feedToTitle := buildFeedToTitle(lib)
+	idx := make(map[string]model.EpisodeState)
+	for _, ep := range lib.Episodes {
+		if ep.PubDate.IsZero() || ep.FeedURL == "" {
+			continue
+		}
+		podTitle := feedToTitle[ep.FeedURL]
+		if podTitle == "" {
+			continue
+		}
+		key := "xfeed:" + model.NormalizePlusTitle(podTitle) + "|" + ep.PubDate.UTC().Format("2006-01-02T15:04:05")
+		if _, exists := idx[key]; !exists {
+			idx[key] = ep
+		}
+	}
+	return idx
 }
 
 func buildEpisodeIndex(lib *model.Library) map[string]model.EpisodeState {

@@ -588,3 +588,118 @@ func TestFetchPodcastEpisodes_HTTPError(t *testing.T) {
 		t.Error("expected error for 404 response")
 	}
 }
+
+// ---- FetchExtendedOPML ----
+
+const minimalExtendedOPML = `<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head><title>Overcast Subscriptions</title></head>
+  <body>
+    <outline text="feeds">
+      <outline text="Fresh Air" type="rss" xmlUrl="https://feeds.npr.org/381444908/podcast.xml" overcastId="42">
+        <outline type="podcast-episode" title="A Great Episode" overcastId="9001"
+          pubDate="2024-06-01T12:00:00Z" played="1"/>
+      </outline>
+    </outline>
+  </body>
+</opml>`
+
+func TestFetchExtendedOPML_ParsesOPML(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/account/export_opml/extended" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		fmt.Fprint(w, minimalExtendedOPML)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	lib, err := overcast.FetchExtendedOPML(context.Background(), client)
+	if err != nil {
+		t.Fatalf("FetchExtendedOPML: %v", err)
+	}
+	if len(lib.Podcasts) != 1 {
+		t.Fatalf("got %d podcasts, want 1", len(lib.Podcasts))
+	}
+	if lib.Podcasts[0].Title != "Fresh Air" {
+		t.Errorf("podcast title: got %q, want 'Fresh Air'", lib.Podcasts[0].Title)
+	}
+	if len(lib.Episodes) != 1 {
+		t.Fatalf("got %d episodes, want 1", len(lib.Episodes))
+	}
+	if lib.Episodes[0].Title != "A Great Episode" {
+		t.Errorf("episode title: got %q, want 'A Great Episode'", lib.Episodes[0].Title)
+	}
+}
+
+func TestFetchExtendedOPML_Non200ReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	_, err := overcast.FetchExtendedOPML(context.Background(), client)
+	if err == nil {
+		t.Error("expected error for non-200 response")
+	}
+}
+
+// ---- SearchPodcastITunesID Plus fallback ----
+
+func TestSearchPodcastITunesID_PlusTitleFallback(t *testing.T) {
+	// Overcast search returns "Fresh Air" but the query is "Fresh Air Plus".
+	// The Plus-normalized fallback should find it by stripping " Plus".
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"results":[{"id":"oc123","iTunesID":"381444908","title":"Fresh Air"}]}`)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	id, err := overcast.SearchPodcastITunesID(context.Background(), client, "Fresh Air Plus", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "381444908" {
+		t.Errorf("iTunesID: got %q, want '381444908'", id)
+	}
+}
+
+func TestSearchPodcastITunesID_PlusTitleFallback_PlusSymbol(t *testing.T) {
+	// "Planet Money+" → normalize to "planet money" → matches "Planet Money"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"results":[{"id":"oc456","iTunesID":"290783428","title":"Planet Money"}]}`)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	id, err := overcast.SearchPodcastITunesID(context.Background(), client, "Planet Money+", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "290783428" {
+		t.Errorf("iTunesID: got %q, want '290783428'", id)
+	}
+}
+
+func TestSearchPodcastITunesID_ExactMatchNotAffectedByPlusFallback(t *testing.T) {
+	// Exact match should still work and not accidentally trigger Plus fallback.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"results":[{"id":"oc789","iTunesID":"999","title":"Fresh Air"}]}`)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	id, err := overcast.SearchPodcastITunesID(context.Background(), client, "Fresh Air", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "999" {
+		t.Errorf("iTunesID: got %q, want '999'", id)
+	}
+}

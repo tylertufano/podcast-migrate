@@ -236,7 +236,7 @@ func (c *CatalogClient) searchITunes(ctx context.Context, feedURL, podcastTitle 
 		}
 	}
 
-	// Fallback: exact podcast title match when no feed URL matched.
+	// Fallback 1: exact podcast title match when no feed URL matched.
 	// The source app may store a redirected or alternate feed URL that differs
 	// from what the iTunes catalog has. Searching by title already scoped results,
 	// so an exact case-insensitive name match is reliable.
@@ -248,6 +248,21 @@ func (c *CatalogClient) searchITunes(ctx context.Context, feedURL, podcastTitle 
 				fmt.Printf("  note: iTunes feed URL mismatch for %q — matched by podcast title (catalog feedUrl: %s)\n",
 					podcastTitle, r.FeedUrl)
 				return r.CollectionId, true, nil
+			}
+		}
+
+		// Fallback 2: Plus-normalised title match.
+		// When the source has a paid feed (e.g. "Fresh Air Plus" from NPR Plus) but
+		// the Apple catalog only knows the public title ("Fresh Air"), strip the paid
+		// suffix and try again. NormalizePlusTitle lowercases, so we compare directly.
+		baseTitleNorm := model.NormalizePlusTitle(podcastTitle)
+		if baseTitleNorm != titleNorm {
+			for _, r := range result.Results {
+				if strings.ToLower(strings.TrimSpace(r.CollectionName)) == baseTitleNorm {
+					fmt.Printf("  note: iTunes feed URL mismatch for %q — matched via Plus-normalized title %q (catalog feedUrl: %s)\n",
+						podcastTitle, baseTitleNorm, r.FeedUrl)
+					return r.CollectionId, true, nil
+				}
 			}
 		}
 	}

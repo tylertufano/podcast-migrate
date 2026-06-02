@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // PlayState represents the listening status of an episode.
 type PlayState int
@@ -41,6 +44,27 @@ type EpisodeState struct {
 	// library). Writers use this to skip episodes that came from themselves —
 	// there is no source state to apply and re-processing them produces noise.
 	FromDestination bool
+}
+
+// NormalizePlusTitle strips paid-tier suffixes from a podcast title and lowercases
+// the result. This enables cross-feed matching when one app has a public feed
+// (e.g. "Fresh Air") and another has the paid equivalent (e.g. "Fresh Air Plus").
+//
+// Stripped suffixes (case-insensitive):
+//   - " Plus"  — NPR Plus and similar (e.g. "Fresh Air Plus" → "fresh air")
+//   - " +"     — space + plus symbol (e.g. "Planet Money +" → "planet money")
+//   - "+"      — trailing plus symbol (e.g. "Planet Money+" → "planet money")
+//
+// If the title has no known suffix it is still lowercased and trimmed, so the
+// return value is always safe to use as a normalised matching key.
+func NormalizePlusTitle(title string) string {
+	t := strings.ToLower(strings.TrimSpace(title))
+	for _, suffix := range []string{" plus", " +", "+"} {
+		if strings.HasSuffix(t, suffix) {
+			return strings.TrimSpace(strings.TrimSuffix(t, suffix))
+		}
+	}
+	return t
 }
 
 // Library is the canonical intermediate representation shared by all providers.

@@ -100,7 +100,12 @@ func (r *OPMLReader) Read(_ context.Context) (*model.Library, error) {
 	if err != nil {
 		return nil, fmt.Errorf("overcast/opml: read %s: %w", r.path, err)
 	}
+	return parseOPMLBytes(data)
+}
 
+// parseOPMLBytes parses raw OPML XML bytes and returns a Library. It is used
+// by OPMLReader.Read (file-based) and FetchExtendedOPML (in-memory, from web).
+func parseOPMLBytes(data []byte) (*model.Library, error) {
 	var doc opmlReadDoc
 	if err := xml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("overcast/opml: parse: %w", err)

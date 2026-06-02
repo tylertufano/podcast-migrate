@@ -6,6 +6,7 @@ package overcast
 // notice if Overcast changes its backend.
 //
 // Endpoints used:
+//   GET  https://overcast.fm/account/export_opml/extended — live library as extended OPML
 //   GET  https://overcast.fm/podcasts              — list subscribed podcasts (page paths)
 //   GET  https://overcast.fm/itunes{id}/{slug}     — podcast episode listing
 //   POST https://overcast.fm/login                 — authenticate, get session cookie
@@ -27,6 +28,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tyler/podcast-migrate/internal/model"
 )
 
 const (
@@ -243,6 +246,44 @@ func SetProgress(ctx context.Context, client *http.Client, numericID string, pos
 	return nil
 }
 
+// FetchExtendedOPML fetches the authenticated user's current Overcast library as an
+// extended OPML and returns it parsed as a *model.Library. The client must be
+// authenticated (obtained from Login).
+//
+// This is equivalent to the user manually downloading
+// overcast.fm/account/export_opml/extended and passing it via --overcast-match-opml,
+// but happens automatically at write time so the destination index always reflects
+// the account's current subscriptions and play state.
+func FetchExtendedOPML(ctx context.Context, client *http.Client) (*model.Library, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		overcastBaseURL+"/account/export_opml/extended", nil)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: build OPML fetch request: %w", err)
+	}
+	req.Header.Set("User-Agent", overcastUA)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: fetch extended OPML: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("overcast/web: fetch extended OPML: HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(body))
+	}
+
+	lib, err := parseOPMLBytes(body)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: parse fetched OPML: %w", err)
+	}
+	return lib, nil
+}
+
 // bodyExcerpt returns a short printable excerpt of a response body for use in error messages.
 func bodyExcerpt(b []byte) string {
 	s := strings.TrimSpace(string(b))
@@ -309,11 +350,24 @@ func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, over
 		}
 	}
 
-	// Fallback: case-insensitive exact title match.
+	// Fallback 1: case-insensitive exact title match.
 	titleNorm := strings.ToLower(strings.TrimSpace(title))
 	for _, r := range payload.Results {
 		if strings.ToLower(strings.TrimSpace(r.Title)) == titleNorm {
 			return r.ITunesID, nil
+		}
+	}
+
+	// Fallback 2: Plus-normalised title match.
+	// Handles the case where the Overcast OPML has "Fresh Air Plus" but the
+	// Overcast search catalog knows it as "Fresh Air" (or vice-versa). Both
+	// sides are normalised so that "fresh air plus" == "fresh air" after stripping.
+	baseTitleNorm := model.NormalizePlusTitle(title)
+	if baseTitleNorm != titleNorm {
+		for _, r := range payload.Results {
+			if model.NormalizePlusTitle(r.Title) == baseTitleNorm {
+				return r.ITunesID, nil
+			}
 		}
 	}
 

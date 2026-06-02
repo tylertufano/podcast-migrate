@@ -30,56 +30,71 @@ const DefaultRequestDelay = 500 * time.Millisecond
 // Writing play state: uses the unofficial Overcast web API (requires credentials).
 // When email and password are set, the provider POSTs to the same set_progress
 // endpoint used by the Overcast web player. This is unofficial and may break.
+//
+// The matching OPML (used to build the episode-ID index for play state writes) is
+// resolved in this priority order:
+//  1. matchOPMLPath (set via SetMatchOPMLPath / --overcast-match-opml) — explicit snapshot
+//  2. Auto-fetched from overcast.fm/account/export_opml/extended after login — live state
 type Provider struct {
-	importOPMLPath string // path to existing Overcast OPML export (for reads + play state matching)
+	sourceOPMLPath string // path to Overcast OPML export used by GetLibrary (--overcast-source-opml)
+	matchOPMLPath  string // path to OPML used for write-side episode matching (--overcast-match-opml, optional)
 	exportOPMLPath string // destination path for generated import file (for subscription writes)
 	email          string // Overcast account email (enables play state writes)
 	password       string // Overcast account password
 }
 
 // NewProvider returns an Overcast provider without web API credentials.
-// importOPMLPath is the path to an Overcast export file (for GetLibrary).
+// sourceOPMLPath is the path to an Overcast export file (for GetLibrary).
 // exportOPMLPath is where the generated subscription import file will be written (for SetLibrary).
-func NewProvider(importOPMLPath, exportOPMLPath string) *Provider {
+func NewProvider(sourceOPMLPath, exportOPMLPath string) *Provider {
 	return &Provider{
-		importOPMLPath: importOPMLPath,
+		sourceOPMLPath: sourceOPMLPath,
 		exportOPMLPath: exportOPMLPath,
 	}
 }
 
 // NewProviderWithCredentials returns an Overcast provider that can also write episode
-// play state using the unofficial Overcast web API. importOPMLPath must point to an
-// Overcast extended OPML export (from overcast.fm/account/export_opml/extended) so the
-// provider can map RSS episodes to their Overcast-specific URLs.
-func NewProviderWithCredentials(importOPMLPath, exportOPMLPath, email, password string) *Provider {
+// play state using the unofficial Overcast web API.
+//
+// sourceOPMLPath is used by GetLibrary to read the source library; it does not need to
+// point to the destination account's current state. The matching OPML for write-side
+// episode resolution is either provided via SetMatchOPMLPath or auto-fetched from
+// the live account after login.
+func NewProviderWithCredentials(sourceOPMLPath, exportOPMLPath, email, password string) *Provider {
 	return &Provider{
-		importOPMLPath: importOPMLPath,
+		sourceOPMLPath: sourceOPMLPath,
 		exportOPMLPath: exportOPMLPath,
 		email:          email,
 		password:       password,
 	}
 }
 
+// SetMatchOPMLPath sets an explicit OPML file to use as the destination matching index
+// for play state writes. When set, this file is used instead of auto-fetching the live
+// Overcast library. Equivalent to passing --overcast-match-opml on the command line.
+func (p *Provider) SetMatchOPMLPath(path string) { p.matchOPMLPath = path }
+
 func (p *Provider) Name() string { return "Overcast" }
 
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		ReadSubscriptions:  p.importOPMLPath != "",
-		ReadPlayState:      p.importOPMLPath != "",
+		ReadSubscriptions:  p.sourceOPMLPath != "",
+		ReadPlayState:      p.sourceOPMLPath != "",
 		WriteSubscriptions: p.exportOPMLPath != "",
-		// Play state writes require credentials and an extended OPML for episode matching.
-		WritePlayState: p.email != "" && p.importOPMLPath != "",
+		// Play state writes require credentials; the matching OPML is either provided
+		// explicitly via SetMatchOPMLPath or auto-fetched from the live account after login.
+		WritePlayState: p.email != "",
 	}
 }
 
 func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
-	if p.importOPMLPath == "" {
+	if p.sourceOPMLPath == "" {
 		return nil, &provider.ErrCapabilityUnsupported{
 			Provider:  p.Name(),
-			Operation: "read (no import OPML path configured)",
+			Operation: "read (no source OPML path configured — use --overcast-source-opml)",
 		}
 	}
-	return NewOPMLReader(p.importOPMLPath).Read(ctx)
+	return NewOPMLReader(p.sourceOPMLPath).Read(ctx)
 }
 
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
@@ -113,9 +128,6 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 	}
 
 	if writePlayState {
-		if p.importOPMLPath == "" {
-			return fmt.Errorf("overcast: writing play state requires an Overcast extended OPML export (use --overcast-export with a file from overcast.fm/account/export_opml/extended)")
-		}
 		n, err := p.doWritePlayState(ctx, lib, opts)
 		if err != nil {
 			return err
@@ -130,36 +142,62 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 	return nil
 }
 
-// doWritePlayState matches lib's episodes against the Overcast OPML, authenticates,
+// doWritePlayState matches lib's episodes against the Overcast matching library,
 // then posts set_progress for each matched episode that has play state.
+//
+// The matching library (overcastLib) is resolved in this order:
+//  1. matchOPMLPath (explicit file) — if set, read from disk; no login required for this step
+//  2. Auto-fetch from overcast.fm/account/export_opml/extended — live account state
+//
 // Returns the number of episodes successfully updated.
 func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opts provider.WriteOptions) (int, error) {
-	// 1. Read the Overcast extended OPML to build a (pubDate+feedURL → numericID) index.
-	//    We match by pub date and feed URL rather than GUID because the overcastId in
-	//    the OPML is Overcast's internal numeric ID, not the RSS <guid> value.
-	overcastLib, err := NewOPMLReader(p.importOPMLPath).Read(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("overcast: read OPML for play state matching: %w", err)
-	}
-
-	index := buildOvercastIndex(overcastLib)
-
-	// Build a feedURL → podcast title lookup used for podcast filtering.
+	// 1. Build feedURL → title and filter episode list (no I/O needed).
 	feedToTitle := buildFeedToTitle(lib)
-
-	// Apply the podcast filter: if any patterns were specified, keep only
-	// episodes from podcasts whose title matches at least one pattern.
 	episodes := filterEpisodesByPodcast(lib.Episodes, feedToTitle, opts.PodcastFilter)
 	if len(opts.PodcastFilter) > 0 {
 		fmt.Printf("overcast: podcast filter active — %q — %d/%d episode(s) in scope\n",
 			opts.PodcastFilter, len(episodes), len(lib.Episodes))
 	}
-
 	writeLogHeader(opts.LogWriter)
 
-	// 2. In dry-run mode, report what would be written without making any web requests.
-	//    Extended matching (which requires authentication) is not run, so episodes
-	//    absent from the OPML appear as not_found even if they would resolve at write time.
+	// 2. Resolve the matching library:
+	//    - Explicit matchOPMLPath: read from file (no login needed yet).
+	//    - No matchOPMLPath: login and auto-fetch the live account library.
+	var (
+		matchLib  *model.Library
+		httpClient *http.Client
+		loginDone  bool
+	)
+	if p.matchOPMLPath != "" {
+		var err error
+		matchLib, err = NewOPMLReader(p.matchOPMLPath).Read(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("overcast: read match OPML: %w", err)
+		}
+	} else {
+		fmt.Printf("overcast: authenticating as %s...\n", p.email)
+		var err error
+		httpClient, err = Login(ctx, p.email, p.password)
+		if err != nil {
+			return 0, fmt.Errorf("overcast: authentication failed: %w", err)
+		}
+		loginDone = true
+		fmt.Printf("overcast: fetching current library from account for episode matching...\n")
+		matchLib, err = FetchExtendedOPML(ctx, httpClient)
+		if err != nil {
+			return 0, fmt.Errorf("overcast: fetch live OPML for matching: %w", err)
+		}
+		fmt.Printf("overcast: fetched %d podcast(s), %d episode(s) from live account\n",
+			len(matchLib.Podcasts), len(matchLib.Episodes))
+	}
+
+	// 3. Build the episode-ID index from the resolved matching library.
+	index := buildOvercastIndex(matchLib)
+
+	// 4. In dry-run mode, report what would be written without making any further
+	//    web requests. Extended matching (which fetches podcast and episode pages)
+	//    is not run in dry-run, so episodes absent from the matching OPML appear
+	//    as not_found even if they would resolve at write time.
 	if opts.DryRun {
 		n := 0
 		for _, ep := range episodes {
@@ -171,7 +209,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			if !ok {
 				writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
 					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-					"not in Overcast OPML (extended matching skipped in dry-run)")
+					"not in matching OPML (extended matching skipped in dry-run)")
 				continue
 			}
 			if !opts.ForceUpdate {
@@ -191,30 +229,33 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		return n, nil
 	}
 
-	// 3. Authenticate.
-	fmt.Printf("overcast: authenticating as %s...\n", p.email)
-	httpClient, err := Login(ctx, p.email, p.password)
-	if err != nil {
-		return 0, fmt.Errorf("overcast: authentication failed: %w", err)
+	// 5. Authenticate (if not already done during OPML auto-fetch above).
+	if !loginDone {
+		fmt.Printf("overcast: authenticating as %s...\n", p.email)
+		var err error
+		httpClient, err = Login(ctx, p.email, p.password)
+		if err != nil {
+			return 0, fmt.Errorf("overcast: authentication failed: %w", err)
+		}
 	}
 
-	// 4. Resolve the request delay: honour the caller's preference, or fall
+	// 6. Resolve the request delay: honour the caller's preference, or fall
 	//    back to the conservative default.
 	requestDelay := opts.RequestDelay
 	if requestDelay <= 0 {
 		requestDelay = DefaultRequestDelay
 	}
 
-	// 5. Augment the index with episode IDs from Overcast podcast pages.
-	//    This handles episodes in shared feeds that weren't in the OPML export
-	//    (i.e. episodes the user listened to in Apple but never touched in Overcast).
-	//    Pass the filtered episode list so we only fetch pages for in-scope podcasts.
-	added := augmentIndexFromPodcastPages(ctx, httpClient, overcastLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch)
+	// 7. Augment the index with episode IDs from Overcast podcast pages.
+	//    This handles episodes in shared feeds that weren't in the matching OPML
+	//    (e.g. episodes the user listened to in Apple but never opened in Overcast,
+	//    or episodes from a different feed URL resolved via Plus-title normalization).
+	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
 
-	// 6. Pre-count: how many episodes need an API call vs. are already satisfied.
+	// 8. Pre-count: how many episodes need an API call vs. are already satisfied.
 	fmt.Printf("overcast: request delay: %v between calls\n", requestDelay)
 
 	toUpdate := 0
@@ -238,7 +279,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	}
 	fmt.Printf("overcast: writing play state for %d episode(s)...\n", toUpdate)
 
-	// 7. For each episode with play state, look up its Overcast numeric ID and post
+	// 9. For each episode with play state, look up its Overcast numeric ID and post
 	//    set_progress. Failures on individual episodes are logged and skipped.
 	updated := 0
 	apiSkipped := 0
@@ -388,6 +429,44 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	return updated, nil
 }
 
+// opmlPodInfo holds the Overcast podcast metadata used when matching Apple podcast
+// feed URLs to their Overcast equivalents during extended episode matching.
+type opmlPodInfo struct {
+	title      string
+	overcastID string
+}
+
+// buildOpmlTitleIndex builds a normalised-title → podcast-info lookup from the
+// Overcast library. Two keys are added per podcast:
+//
+//  1. The exact lowercased title (e.g. "fresh air plus").
+//  2. The Plus-normalised title (e.g. "fresh air"), so Apple episodes on the
+//     public feed can match the paid Overcast subscription — and vice-versa.
+//
+// Earlier entries (index order) win on key collision.
+func buildOpmlTitleIndex(lib *model.Library) map[string]opmlPodInfo {
+	idx := make(map[string]opmlPodInfo, len(lib.Podcasts))
+	for _, pod := range lib.Podcasts {
+		if pod.Title == "" {
+			continue
+		}
+		normTitle := strings.ToLower(strings.TrimSpace(pod.Title))
+		info := opmlPodInfo{title: pod.Title, overcastID: pod.OvercastID}
+		if _, exists := idx[normTitle]; !exists {
+			idx[normTitle] = info
+		}
+		// Also index under the Plus-normalised base title so "Fresh Air" finds
+		// "Fresh Air Plus" and "Fresh Air Plus" finds "Fresh Air".
+		baseTitle := model.NormalizePlusTitle(pod.Title)
+		if baseTitle != normTitle {
+			if _, exists := idx[baseTitle]; !exists {
+				idx[baseTitle] = info
+			}
+		}
+	}
+	return idx
+}
+
 // augmentIndexFromPodcastPages extends index with entries for Apple episodes whose
 // Overcast numeric ID was not in the OPML export. It does this by:
 //
@@ -429,29 +508,19 @@ func augmentIndexFromPodcastPages(
 
 	// Step 1: build feedURL → OPML podcast info.
 	// OvercastID (from the OPML overcastId attribute) is used to verify search results.
-	type opmlPodInfo struct {
-		title      string
-		overcastID string
-	}
+
 	// Primary lookup: normalised Overcast feed URL → podcast info.
 	// Normalisation bridges minor differences (http vs https, trailing slash, host case)
 	// between the URL Apple Podcasts has stored and the URL Overcast uses.
 	opmlByNormFeed := make(map[string]opmlPodInfo, len(overcastLib.Podcasts))
-	// Fallback lookup: normalised podcast title → podcast info.
-	// Used when no feed URL (even normalised) matches — e.g. the feed moved entirely
-	// or the two apps resolved a redirect to different endpoints.
-	opmlByTitle := make(map[string]opmlPodInfo, len(overcastLib.Podcasts))
 	for _, pod := range overcastLib.Podcasts {
 		if pod.FeedURL != "" {
 			opmlByNormFeed[normalizeFeedURL(pod.FeedURL)] = opmlPodInfo{title: pod.Title, overcastID: pod.OvercastID}
 		}
-		if pod.Title != "" {
-			normTitle := strings.ToLower(strings.TrimSpace(pod.Title))
-			if _, exists := opmlByTitle[normTitle]; !exists {
-				opmlByTitle[normTitle] = opmlPodInfo{title: pod.Title, overcastID: pod.OvercastID}
-			}
-		}
 	}
+	// Fallback lookup: normalised podcast title → podcast info.
+	// Indexed with both exact and Plus-normalised keys (see buildOpmlTitleIndex).
+	opmlByTitle := buildOpmlTitleIndex(overcastLib)
 
 	// Count feeds that have episodes not yet in the index, for the progress log.
 	unmatched := 0
@@ -500,6 +569,21 @@ func augmentIndexFromPodcastPages(
 					info = titleInfo
 					ok = true
 					fmt.Printf("  note: feed URL mismatch for %q — matched by podcast title\n", info.title)
+				}
+				// Also try the Plus-normalised Apple title ("Fresh Air Plus" → "Fresh Air").
+				// opmlByTitle already contains Plus-normalised keys for Overcast podcasts,
+				// so this covers the case where Apple has the paid feed and Overcast has
+				// the public feed (or vice-versa at the index level).
+				if !ok {
+					baseTitle := model.NormalizePlusTitle(appleTitle)
+					if baseTitle != appleTitle {
+						if titleInfo, found := opmlByTitle[baseTitle]; found {
+							info = titleInfo
+							ok = true
+							fmt.Printf("  note: feed URL mismatch for %q — matched via Plus-normalized title %q\n",
+								info.title, baseTitle)
+						}
+					}
 				}
 			}
 		}

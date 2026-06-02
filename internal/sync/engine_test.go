@@ -572,3 +572,183 @@ func TestResult_String_NoWarningsWhenClear(t *testing.T) {
 		}
 	}
 }
+
+// ---- cross-feed (Plus-title) matching ----
+
+// pubAt is a helper that returns a test pub date at the given hour.
+func pubAt(hour int) time.Time {
+	return time.Date(2024, 6, 15, hour, 0, 0, 0, time.UTC)
+}
+
+// TestMerge_CrossFeed_PlusVsPublic verifies that when one side has a podcast
+// subscribed via the paid feed ("Fresh Air Plus") and the other has the public
+// feed ("Fresh Air"), episodes are matched and conflict-resolved rather than
+// appearing twice.
+func TestMerge_CrossFeed_PlusVsPublic(t *testing.T) {
+	plusFeed := "https://feeds.npr.org/plus/fresh-air"
+	publicFeed := "https://feeds.npr.org/381444908/podcast.xml"
+	pubDate := pubAt(12)
+
+	// Source: Overcast with Plus feed, episode InProgress at 30 min.
+	src := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: plusFeed, Title: "Fresh Air Plus"},
+		},
+		Episodes: []model.EpisodeState{
+			{
+				FeedURL:      plusFeed,
+				PubDate:      pubDate,
+				Title:        "Great Interview",
+				PlayState:    model.PlayStateInProgress,
+				PlayPosition: 30 * time.Minute,
+			},
+		},
+	}
+
+	// Destination: Apple with public feed, same episode already Played.
+	dst := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: publicFeed, Title: "Fresh Air"},
+		},
+		Episodes: []model.EpisodeState{
+			{
+				FeedURL:   publicFeed,
+				PubDate:   pubDate,
+				Title:     "Great Interview",
+				PlayState: model.PlayStatePlayed,
+			},
+		},
+	}
+
+	result := merge(src, dst, provider.WriteOptions{ConflictStrategy: provider.FurthestWins})
+
+	// FurthestWins: Played (dst) beats InProgress (src) → one episode, Played.
+	if len(result.Episodes) != 1 {
+		t.Fatalf("expected 1 merged episode, got %d (cross-feed match failed — duplicate entries)", len(result.Episodes))
+	}
+	if result.Episodes[0].PlayState != model.PlayStatePlayed {
+		t.Errorf("FurthestWins: got PlayState=%v, want PlayStatePlayed", result.Episodes[0].PlayState)
+	}
+}
+
+// TestMerge_CrossFeed_SourceWins verifies SourceWins strategy with cross-feed match.
+func TestMerge_CrossFeed_SourceWins(t *testing.T) {
+	plusFeed := "https://feeds.npr.org/plus/fresh-air"
+	publicFeed := "https://feeds.npr.org/381444908/podcast.xml"
+	pubDate := pubAt(12)
+
+	src := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: plusFeed, Title: "Fresh Air Plus"},
+		},
+		Episodes: []model.EpisodeState{
+			{FeedURL: plusFeed, PubDate: pubDate, PlayState: model.PlayStateInProgress, PlayPosition: 10 * time.Minute},
+		},
+	}
+	dst := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: publicFeed, Title: "Fresh Air"},
+		},
+		Episodes: []model.EpisodeState{
+			{FeedURL: publicFeed, PubDate: pubDate, PlayState: model.PlayStatePlayed},
+		},
+	}
+
+	result := merge(src, dst, provider.WriteOptions{ConflictStrategy: provider.SourceWins})
+
+	if len(result.Episodes) != 1 {
+		t.Fatalf("SourceWins cross-feed: expected 1 episode, got %d", len(result.Episodes))
+	}
+	if result.Episodes[0].PlayState != model.PlayStateInProgress {
+		t.Errorf("SourceWins: got PlayState=%v, want InProgress (src wins)", result.Episodes[0].PlayState)
+	}
+}
+
+// TestMerge_CrossFeed_PlusPlusMatch verifies that two Plus feeds normalise to
+// the same base title and are treated as the same podcast.
+func TestMerge_CrossFeed_PlusPlusMatch(t *testing.T) {
+	plusFeedA := "https://feeds.example.com/plus/show"
+	plusFeedB := "https://feeds.example.com/plus2/show"
+	pubDate := pubAt(9)
+
+	src := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: plusFeedA, Title: "Great Show Plus"}},
+		Episodes: []model.EpisodeState{
+			{FeedURL: plusFeedA, PubDate: pubDate, PlayState: model.PlayStatePlayed},
+		},
+	}
+	dst := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: plusFeedB, Title: "Great Show Plus"}},
+		Episodes: []model.EpisodeState{
+			{FeedURL: plusFeedB, PubDate: pubDate, PlayState: model.PlayStateInProgress, PlayPosition: 5 * time.Minute},
+		},
+	}
+
+	result := merge(src, dst, provider.WriteOptions{ConflictStrategy: provider.FurthestWins})
+
+	if len(result.Episodes) != 1 {
+		t.Fatalf("Plus+Plus cross-feed: expected 1 merged episode, got %d", len(result.Episodes))
+	}
+	if result.Episodes[0].PlayState != model.PlayStatePlayed {
+		t.Errorf("FurthestWins: got PlayState=%v, want Played", result.Episodes[0].PlayState)
+	}
+}
+
+// TestMerge_CrossFeed_NoPrimaryMissUnrelated verifies that episodes from unrelated
+// podcasts with different titles are not cross-matched just because their pub dates
+// happen to coincide.
+func TestMerge_CrossFeed_NoPrimaryMissUnrelated(t *testing.T) {
+	feedA := "https://feeds.example.com/show-a"
+	feedB := "https://feeds.example.com/show-b"
+	pubDate := pubAt(12)
+
+	src := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: feedA, Title: "Show A"}},
+		Episodes: []model.EpisodeState{
+			{FeedURL: feedA, PubDate: pubDate, PlayState: model.PlayStatePlayed},
+		},
+	}
+	dst := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: feedB, Title: "Show B"}},
+		Episodes: []model.EpisodeState{
+			{FeedURL: feedB, PubDate: pubDate, PlayState: model.PlayStateInProgress, PlayPosition: 15 * time.Minute},
+		},
+	}
+
+	result := merge(src, dst, provider.WriteOptions{ConflictStrategy: provider.FurthestWins})
+
+	// No cross-feed match (different titles): both episodes survive.
+	if len(result.Episodes) != 2 {
+		t.Errorf("unrelated podcasts at same pub date: expected 2 episodes (no cross-match), got %d", len(result.Episodes))
+	}
+}
+
+// TestBuildCrossFeedIndex verifies the index structure produced for Plus and public feeds.
+func TestBuildCrossFeedIndex(t *testing.T) {
+	plusFeed := "https://feeds.npr.org/plus"
+	pubDate := time.Date(2024, 3, 10, 14, 0, 0, 0, time.UTC)
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: plusFeed, Title: "Fresh Air Plus"},
+		},
+		Episodes: []model.EpisodeState{
+			{FeedURL: plusFeed, PubDate: pubDate, PlayState: model.PlayStatePlayed},
+		},
+	}
+
+	idx := buildCrossFeedIndex(lib)
+
+	wantKey := "xfeed:fresh air|2024-03-10T14:00:00"
+	if _, ok := idx[wantKey]; !ok {
+		t.Errorf("buildCrossFeedIndex: key %q not found in index; keys = %v", wantKey, keys(idx))
+	}
+}
+
+func keys[K comparable, V any](m map[K]V) []K {
+	ks := make([]K, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
+}

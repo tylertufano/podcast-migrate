@@ -86,6 +86,11 @@ Then in Overcast: **Settings › Import OPML** and select the generated file.
 export OVERCAST_EMAIL="you@example.com"
 export OVERCAST_PASSWORD="yourpassword"
 
+# Play state only — no OPML file needed
+podcast-migrate migrate --from podcasts --to overcast \
+  --play-state
+
+# Play state + generate a subscription import file at the same time
 podcast-migrate migrate --from podcasts --to overcast \
   --overcast-out ~/Desktop/overcast-import.opml \
   --play-state
@@ -93,13 +98,12 @@ podcast-migrate migrate --from podcasts --to overcast \
 
 **How it works:** Authenticates with your Overcast account, automatically fetches your current library from `overcast.fm/account/export_opml/extended`, and calls the same internal API endpoint the Overcast web player uses to save episode positions. For each played episode, it fetches the episode's Overcast page to resolve its internal numeric ID, then POSTs the played position.
 
-No manual OPML export required — the tool fetches your live account state after login.
+`--overcast-out` is optional — omit it to sync play state without generating an OPML file.
 
 If you prefer to match against a specific snapshot instead of auto-fetching the live account (e.g. for reproducible dry-run previews), provide one explicitly:
 
 ```sh
 podcast-migrate migrate --from podcasts --to overcast \
-  --overcast-out ~/Desktop/overcast-import.opml \
   --overcast-match-opml ~/Downloads/overcast.opml \
   --play-state
 ```

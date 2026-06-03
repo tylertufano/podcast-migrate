@@ -458,11 +458,11 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]Subscr
 		})
 	}
 
-	// When parsing yields nothing, save the raw HTML for inspection so the
-	// regex can be refined against the actual page structure.
-	if len(podcasts) == 0 && len(body) > 0 {
-		debugPath := filepath.Join(os.TempDir(), "overcast-podcasts-page-debug.html")
-		_ = os.WriteFile(debugPath, body, 0644)
+	// Always save the raw HTML so structural issues can be diagnosed by
+	// inspecting which cells were missed (not just when 0 results).
+	debugPath := filepath.Join(os.TempDir(), "overcast-podcasts-page-debug.html")
+	_ = os.WriteFile(debugPath, body, 0644)
+	if len(podcasts) == 0 {
 		fmt.Printf("overcast: /podcasts page parsed 0 podcasts — raw HTML saved to %s for inspection\n", debugPath)
 	}
 

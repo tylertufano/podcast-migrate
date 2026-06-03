@@ -173,11 +173,18 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		return 0, nil
 	}
 
-	// 2. Resolve the matching library:
+	// 2. Resolve the request delay up front so it is available for post-login
+	//    pauses and is consistent across all steps.
+	requestDelay := opts.RequestDelay
+	if requestDelay <= 0 {
+		requestDelay = DefaultRequestDelay
+	}
+
+	// 3. Resolve the matching library:
 	//    - Explicit matchOPMLPath: read from file (no login needed yet).
 	//    - No matchOPMLPath: login and auto-fetch the live account library.
 	var (
-		matchLib  *model.Library
+		matchLib   *model.Library
 		httpClient *http.Client
 		loginDone  bool
 	)
@@ -195,6 +202,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			return 0, fmt.Errorf("overcast: authentication failed: %w", err)
 		}
 		loginDone = true
+		// Pause after login before the first content request.
+		time.Sleep(requestDelay)
 		fmt.Printf("overcast: fetching current library from account for episode matching...\n")
 		matchLib, err = FetchExtendedOPML(ctx, httpClient)
 		if err != nil {
@@ -204,11 +213,11 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			len(matchLib.Podcasts), len(matchLib.Episodes))
 	}
 
-	// 3. Build the episode-ID index from the resolved matching library.
+	// 4. Build the episode-ID index from the resolved matching library.
 	index := buildOvercastIndex(matchLib)
 
-	// 4. Authenticate (if not already done during OPML auto-fetch above).
-	//    This runs for both dry-run and live — augmentIndexFromPodcastPages (step 5)
+	// 5. Authenticate (if not already done during OPML auto-fetch above).
+	//    This runs for both dry-run and live — augmentIndexFromPodcastPages (step 6)
 	//    is read-only and must run in both modes to give an accurate dry-run preview.
 	if !loginDone {
 		fmt.Printf("overcast: authenticating as %s...\n", p.email)
@@ -217,16 +226,14 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		if err != nil {
 			return 0, fmt.Errorf("overcast: authentication failed: %w", err)
 		}
-	}
-
-	// 5. Resolve the request delay: honour the caller's preference, or fall
-	//    back to the conservative default.
-	requestDelay := opts.RequestDelay
-	if requestDelay <= 0 {
-		requestDelay = DefaultRequestDelay
+		// Pause after login before the first content request.
+		time.Sleep(requestDelay)
 	}
 
 	// 6. Augment the index with episode IDs from Overcast podcast pages.
+	//    augmentIndexFromPodcastPages fetches /podcasts, then up to one listing
+	//    page per subscribed feed. The requestDelay is threaded through so it
+	//    can pace all requests consistently.
 	//    This handles episodes absent from the matching OPML (e.g. episodes the
 	//    user listened to in Apple but never opened in Overcast). Runs in both
 	//    dry-run and live mode: the page fetches are read-only GETs, so running
@@ -584,6 +591,11 @@ func augmentIndexFromPodcastPages(
 			}
 		}
 		fmt.Printf("overcast: /podcasts page listed %d subscribed podcast(s)\n", len(subs))
+		// Pause after fetching /podcasts before the first podcast listing-page
+		// request. Without this pause the listing-page loop starts immediately
+		// after two back-to-back requests (login + /podcasts), making it easy
+		// to trigger Overcast's rate limiter on the very first listing page.
+		time.Sleep(requestDelay)
 	}
 
 	feedToPageURL := make(map[string]string)

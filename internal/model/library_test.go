@@ -32,6 +32,20 @@ func TestNormalizePlusTitle(t *testing.T) {
 		{"Surplus", "surplus"},
 		// Multiple suffix occurrences — only the outermost is stripped
 		{"Fresh Air Plus Plus", "fresh air plus"},
+		// NYT subscriber feed pattern
+		{"The Daily - Subscriber Feed (🔓)", "the daily"},
+		{"The Daily - Subscriber Feed", "the daily"},
+		// Member / private / premium variants
+		{"Some Show - Member Feed (🔓)", "some show"},
+		{"Some Show - Member Feed", "some show"},
+		{"Some Show - Private Feed", "some show"},
+		{"Some Show - Premium Feed", "some show"},
+		// Standalone lock emoji
+		{"Some Show (🔓)", "some show"},
+		// Subscriber suffix + Plus suffix (combined)
+		{"Show - Subscriber Feed Plus", "show - subscriber feed"},
+		// Public title unchanged
+		{"The Daily", "the daily"},
 	}
 	for _, tc := range cases {
 		got := NormalizePlusTitle(tc.input)

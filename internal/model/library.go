@@ -46,19 +46,48 @@ type EpisodeState struct {
 	FromDestination bool
 }
 
-// NormalizePlusTitle strips paid-tier suffixes from a podcast title and lowercases
-// the result. This enables cross-feed matching when one app has a public feed
-// (e.g. "Fresh Air") and another has the paid equivalent (e.g. "Fresh Air Plus").
+// NormalizePlusTitle strips paid-tier and subscriber-feed suffixes from a podcast
+// title and lowercases the result. This enables cross-feed matching when one app
+// has a public feed and another has a paid or private equivalent.
 //
-// Stripped suffixes (case-insensitive):
+// Stripped suffixes (case-insensitive, applied in order from most to least specific):
+//
+// Subscriber/private feed indicators (publishers append these to private RSS titles):
+//   - " - Subscriber Feed (🔓)"  — NYT pattern (e.g. "The Daily - Subscriber Feed (🔓)")
+//   - " - Subscriber Feed"
+//   - " - Member Feed (🔓)"
+//   - " - Member Feed"
+//   - " - Private Feed"
+//   - " - Premium Feed"
+//   - " (🔓)"                    — standalone lock emoji
+//
+// Plus-tier indicators (podcast networks append these to paid feed titles):
 //   - " Plus"  — NPR Plus and similar (e.g. "Fresh Air Plus" → "fresh air")
-//   - " +"     — space + plus symbol (e.g. "Planet Money +" → "planet money")
+//   - " +"     — space + plus symbol  (e.g. "Planet Money +" → "planet money")
 //   - "+"      — trailing plus symbol (e.g. "Planet Money+" → "planet money")
 //
 // If the title has no known suffix it is still lowercased and trimmed, so the
 // return value is always safe to use as a normalised matching key.
 func NormalizePlusTitle(title string) string {
 	t := strings.ToLower(strings.TrimSpace(title))
+
+	// Strip subscriber/private feed suffixes first (most specific → least specific).
+	for _, suffix := range []string{
+		" - subscriber feed (🔓)",
+		" - subscriber feed",
+		" - member feed (🔓)",
+		" - member feed",
+		" - private feed",
+		" - premium feed",
+		" (🔓)",
+	} {
+		if strings.HasSuffix(t, suffix) {
+			t = strings.TrimSpace(strings.TrimSuffix(t, suffix))
+			break
+		}
+	}
+
+	// Strip Plus-tier suffixes.
 	for _, suffix := range []string{" plus", " +", "+"} {
 		if strings.HasSuffix(t, suffix) {
 			return strings.TrimSpace(strings.TrimSuffix(t, suffix))

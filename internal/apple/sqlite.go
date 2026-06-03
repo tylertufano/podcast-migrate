@@ -57,7 +57,7 @@ func (r *SQLiteReader) Read(ctx context.Context) (*model.Library, error) {
 		Episodes:                episodes,
 		ExportedAt:              time.Now(),
 		SourceProvider:          "Apple Podcasts (SQLite)",
-		SkippedPaywalledEpisodes: skippedEpisodes,
+		PaywalledEpisodesIncluded: skippedEpisodes,
 		SkippedInternalPodcasts: skippedPodcasts,
 	}, nil
 }
@@ -184,7 +184,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		  AND e.ZGUID IS NOT NULL
 		  AND p.ZFEEDURL IS NOT NULL
 		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
-		  AND e.ZPRICETYPE NOT IN ('PSUB', 'PLUS')
+		  AND p.ZFEEDURL NOT LIKE 'internal://%'
 		ORDER BY e.ZPUBDATE DESC`
 
 	rows, err := db.QueryContext(ctx, q)
@@ -244,17 +244,21 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		return nil, 0, err
 	}
 
-	// Count paywalled episodes separately so callers can report them.
+	// Count PSUB/PLUS episodes that are included in the main query (i.e. on
+	// non-internal, non-JWT feeds). These have Apple-proprietary GUIDs and DRM
+	// enclosure URLs but are included for fuzzy matching by podcast title + pub date.
 	const countPaywalled = `
 		SELECT COUNT(*) FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
 		  AND e.ZGUID IS NOT NULL
 		  AND p.ZFEEDURL IS NOT NULL
+		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
+		  AND p.ZFEEDURL NOT LIKE 'internal://%'
 		  AND e.ZPRICETYPE IN ('PSUB', 'PLUS')`
 
-	var skipped int
-	_ = db.QueryRowContext(ctx, countPaywalled).Scan(&skipped)
+	var included int
+	_ = db.QueryRowContext(ctx, countPaywalled).Scan(&included)
 
-	return out, skipped, nil
+	return out, included, nil
 }

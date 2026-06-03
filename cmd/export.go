@@ -52,10 +52,10 @@ func exportCmd() *cobra.Command {
 				fmt.Printf("note: skipped %d podcast(s) with Apple-internal feed URLs — no public RSS feed exists for these.\n",
 					lib.SkippedInternalPodcasts)
 			}
-			if lib.SkippedPaywalledEpisodes > 0 {
-				fmt.Printf("note: skipped %d Apple Podcasts Subscription (PSUB/PLUS) episode states —\n"+
-					"      these use Apple-proprietary GUIDs and DRM streams that no other app can match or play.\n",
-					lib.SkippedPaywalledEpisodes)
+			if lib.PaywalledEpisodesIncluded > 0 {
+				fmt.Printf("note: %d Apple Podcasts Subscription (PSUB/PLUS) episode states included —\n"+
+					"      these use Apple-proprietary GUIDs; matching will fall back to podcast title + pub date.\n",
+					lib.PaywalledEpisodesIncluded)
 			}
 			return nil
 		},

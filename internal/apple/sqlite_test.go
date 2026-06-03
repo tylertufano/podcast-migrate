@@ -122,11 +122,11 @@ func setupSQLiteDB(t *testing.T) string {
 	insertEpisode(4, 1, "rss-guid-4", "Untouched", 697000000.0, 1200.0, 0, 0, 0.0, nil, "STDQ")
 	// ep5: null GUID → excluded
 	insertEpisode(5, 1, nil, "No GUID Episode", 696000000.0, 0, 1, 0, 0.0, nil, "STDQ")
-	// ep6: PSUB on public feed → excluded from episodes, counted in SkippedPaywalledEpisodes
+	// ep6: PSUB on public feed → INCLUDED for fuzzy matching, counted in PaywalledEpisodesIncluded
 	insertEpisode(6, 2, "psub-guid-1", "PSUB Episode", 695000000.0, 2000.0, 1, 0, 0.0, nil, "PSUB")
-	// ep7: PLUS on public feed → excluded from episodes, counted in SkippedPaywalledEpisodes
+	// ep7: PLUS on public feed → INCLUDED for fuzzy matching, counted in PaywalledEpisodesIncluded
 	insertEpisode(7, 2, "plus-guid-1", "PLUS Episode", 694000000.0, 1500.0, 2, 0, 500.0, nil, "PLUS")
-	// ep8: PSUB on internal:// podcast → excluded (paywalled), counted in SkippedPaywalledEpisodes
+	// ep8: PSUB on internal:// podcast → excluded via internal:// feed guard (not in PaywalledEpisodesIncluded)
 	insertEpisode(8, 3, "internal-psub-1", "Internal PSUB", 693000000.0, 3000.0, 1, 0, 0.0, nil, "PSUB")
 	// ep9: "shadow played" — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1, ZLASTDATEPLAYED set.
 	//      Mirrors the real-world case where an episode was played on another device but
@@ -295,33 +295,44 @@ func TestSQLiteReader_ExcludesNullGUIDEpisodes(t *testing.T) {
 	}
 }
 
-func TestSQLiteReader_ExcludesPSUBEpisodes(t *testing.T) {
+func TestSQLiteReader_IncludesPSUBEpisodes(t *testing.T) {
+	// PSUB episodes on public feeds are now included for fuzzy title+date matching.
 	lib := readLibrary(t, setupSQLiteDB(t))
-	if hasEpisodeGUID(lib, "psub-guid-1") {
-		t.Error("PSUB episode should be excluded from episode states")
+	if !hasEpisodeGUID(lib, "psub-guid-1") {
+		t.Error("PSUB episode on public feed should be included for fuzzy matching")
 	}
 }
 
-func TestSQLiteReader_ExcludesPLUSEpisodes(t *testing.T) {
+func TestSQLiteReader_IncludesPLUSEpisodes(t *testing.T) {
+	// PLUS episodes on public feeds are now included for fuzzy title+date matching.
 	lib := readLibrary(t, setupSQLiteDB(t))
-	if hasEpisodeGUID(lib, "plus-guid-1") {
-		t.Error("PLUS episode should be excluded from episode states")
+	if !hasEpisodeGUID(lib, "plus-guid-1") {
+		t.Error("PLUS episode on public feed should be included for fuzzy matching")
 	}
 }
 
-func TestSQLiteReader_CountsPaywalledEpisodes(t *testing.T) {
+func TestSQLiteReader_ExcludesPSUBOnInternalFeed(t *testing.T) {
+	// PSUB on an internal:// podcast is still excluded via the feed URL guard.
 	lib := readLibrary(t, setupSQLiteDB(t))
-	// ep6 (PSUB on public feed) + ep7 (PLUS on public feed) + ep8 (PSUB on internal feed) = 3
-	if lib.SkippedPaywalledEpisodes != 3 {
-		t.Errorf("SkippedPaywalledEpisodes: got %d, want 3", lib.SkippedPaywalledEpisodes)
+	if hasEpisodeGUID(lib, "internal-psub-1") {
+		t.Error("PSUB episode on internal:// podcast should be excluded")
+	}
+}
+
+func TestSQLiteReader_CountsIncludedPaywalledEpisodes(t *testing.T) {
+	lib := readLibrary(t, setupSQLiteDB(t))
+	// ep6 (PSUB on public feed) + ep7 (PLUS on public feed) = 2 included
+	// ep8 (PSUB on internal:// feed) is excluded by the feed URL guard and not counted.
+	if lib.PaywalledEpisodesIncluded != 2 {
+		t.Errorf("PaywalledEpisodesIncluded: got %d, want 2", lib.PaywalledEpisodesIncluded)
 	}
 }
 
 func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
-	// ep1 (played) + ep2 (in-progress) + ep3 (has position) + ep9 (shadow played) = 4 included
-	if len(lib.Episodes) != 4 {
-		t.Errorf("got %d episodes, want 4 (played + in-progress + has-position + shadow-played)", len(lib.Episodes))
+	// ep1 (played) + ep2 (in-progress) + ep3 (has position) + ep6 (PSUB) + ep7 (PLUS) + ep9 (shadow played) = 6
+	if len(lib.Episodes) != 6 {
+		t.Errorf("got %d episodes, want 6 (played + in-progress + has-position + PSUB + PLUS + shadow-played)", len(lib.Episodes))
 	}
 }
 

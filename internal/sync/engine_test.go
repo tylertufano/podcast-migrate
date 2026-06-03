@@ -491,8 +491,8 @@ func TestEngine_Run_SkippedCountsPropagated(t *testing.T) {
 	src := &mockProvider{
 		name: "src", caps: fullCaps,
 		lib: &model.Library{
-			SkippedPaywalledEpisodes: 42,
-			SkippedInternalPodcasts:  3,
+			PaywalledEpisodesIncluded: 42,
+			SkippedInternalPodcasts:   3,
 		},
 	}
 	dst := &mockProvider{name: "dst", caps: fullCaps, lib: &model.Library{}}
@@ -501,8 +501,8 @@ func TestEngine_Run_SkippedCountsPropagated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if result.SkippedPaywalledEpisodes != 42 {
-		t.Errorf("SkippedPaywalledEpisodes: got %d, want 42", result.SkippedPaywalledEpisodes)
+	if result.PaywalledEpisodesIncluded != 42 {
+		t.Errorf("PaywalledEpisodesIncluded: got %d, want 42", result.PaywalledEpisodesIncluded)
 	}
 	if result.SkippedInternalPodcasts != 3 {
 		t.Errorf("SkippedInternalPodcasts: got %d, want 3", result.SkippedInternalPodcasts)
@@ -538,8 +538,8 @@ func TestResult_String_DryRunPrefix(t *testing.T) {
 
 func TestResult_String_IncludesSkippedWarnings(t *testing.T) {
 	r := Result{
-		SkippedPaywalledEpisodes: 10,
-		SkippedInternalPodcasts:  2,
+		PaywalledEpisodesIncluded: 10,
+		SkippedInternalPodcasts:   2,
 	}
 	s := r.String()
 	if len(s) == 0 {
@@ -632,6 +632,8 @@ func TestMerge_CrossFeed_PlusVsPublic(t *testing.T) {
 }
 
 // TestMerge_CrossFeed_SourceWins verifies SourceWins strategy with cross-feed match.
+// The merged episode must use the destination's FeedURL (so downstream writers that
+// index by FeedURL can locate it), while play state comes from the source.
 func TestMerge_CrossFeed_SourceWins(t *testing.T) {
 	plusFeed := "https://feeds.npr.org/plus/fresh-air"
 	publicFeed := "https://feeds.npr.org/381444908/podcast.xml"
@@ -659,8 +661,95 @@ func TestMerge_CrossFeed_SourceWins(t *testing.T) {
 	if len(result.Episodes) != 1 {
 		t.Fatalf("SourceWins cross-feed: expected 1 episode, got %d", len(result.Episodes))
 	}
-	if result.Episodes[0].PlayState != model.PlayStateInProgress {
-		t.Errorf("SourceWins: got PlayState=%v, want InProgress (src wins)", result.Episodes[0].PlayState)
+	ep := result.Episodes[0]
+	if ep.PlayState != model.PlayStateInProgress {
+		t.Errorf("SourceWins: got PlayState=%v, want InProgress (src wins)", ep.PlayState)
+	}
+	// Destination feed URL must be preserved so Overcast/Apple writers can locate the episode.
+	if ep.FeedURL != publicFeed {
+		t.Errorf("SourceWins cross-feed: FeedURL should be destination's (%q), got %q", publicFeed, ep.FeedURL)
+	}
+}
+
+// TestMerge_CrossFeed_DestIdentifiersPreservedFurthestWins verifies that when
+// FurthestWins selects the source (e.g. source is further along), the merged
+// episode still carries the destination's FeedURL and GUID so downstream
+// writers keyed on destination identifiers can locate it.
+func TestMerge_CrossFeed_DestIdentifiersPreservedFurthestWins(t *testing.T) {
+	srcFeed := "https://feeds.example.com/public/show"
+	dstFeed := "https://feeds.example.com/plus/show"
+	pubDate := pubAt(10)
+
+	src := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: srcFeed, Title: "My Show"}},
+		Episodes: []model.EpisodeState{
+			{GUID: "apple-internal-guid", FeedURL: srcFeed, PubDate: pubDate, PlayState: model.PlayStatePlayed},
+		},
+	}
+	dst := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: dstFeed, Title: "My Show Plus"}},
+		Episodes: []model.EpisodeState{
+			{GUID: "rss-native-guid", FeedURL: dstFeed, PubDate: pubDate, PlayState: model.PlayStateUnplayed},
+		},
+	}
+
+	result := merge(src, dst, provider.WriteOptions{ConflictStrategy: provider.FurthestWins})
+
+	if len(result.Episodes) != 1 {
+		t.Fatalf("expected 1 merged episode, got %d", len(result.Episodes))
+	}
+	ep := result.Episodes[0]
+	// Source wins on play state (Played > Unplayed).
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("FurthestWins: PlayState got %v, want Played", ep.PlayState)
+	}
+	// Destination identifiers must be preserved.
+	if ep.GUID != "rss-native-guid" {
+		t.Errorf("FurthestWins cross-feed: GUID should be destination's %q, got %q", "rss-native-guid", ep.GUID)
+	}
+	if ep.FeedURL != dstFeed {
+		t.Errorf("FurthestWins cross-feed: FeedURL should be destination's %q, got %q", dstFeed, ep.FeedURL)
+	}
+}
+
+// TestMerge_PSUBEpisode_MatchesCrossFeed simulates the PSUB scenario: a source
+// episode has an Apple-proprietary GUID and a public feed URL, but the destination
+// has the same episode under a different (private/Plus) feed URL. The engine should
+// match them via podcast title + pub date and preserve destination identifiers.
+func TestMerge_PSUBEpisode_MatchesCrossFeed(t *testing.T) {
+	publicFeed := "https://feeds.npr.org/381444908/podcast.xml"
+	plusFeed := "https://feeds.npr.org/plus/381444908/podcast.xml"
+	pubDate := pubAt(8)
+
+	src := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: publicFeed, Title: "Fresh Air"}},
+		Episodes: []model.EpisodeState{
+			// PSUB episode: Apple-internal GUID, public feed URL, played state.
+			{GUID: "apple-psub-hex-id", FeedURL: publicFeed, Title: "Episode Title", PubDate: pubDate, PlayState: model.PlayStatePlayed},
+		},
+	}
+	dst := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: plusFeed, Title: "Fresh Air Plus"}},
+		Episodes: []model.EpisodeState{
+			// Same episode in destination under Plus feed, unplayed.
+			{GUID: "rss-guid-123", FeedURL: plusFeed, Title: "Episode Title", PubDate: pubDate, PlayState: model.PlayStateUnplayed},
+		},
+	}
+
+	result := merge(src, dst, provider.WriteOptions{ConflictStrategy: provider.FurthestWins})
+
+	if len(result.Episodes) != 1 {
+		t.Fatalf("PSUB cross-feed: expected 1 merged episode, got %d (match failed — duplicate entries)", len(result.Episodes))
+	}
+	ep := result.Episodes[0]
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("PSUB cross-feed: PlayState got %v, want Played (Apple played > Overcast unplayed)", ep.PlayState)
+	}
+	if ep.GUID != "rss-guid-123" {
+		t.Errorf("PSUB cross-feed: GUID should be destination's RSS GUID %q, got %q", "rss-guid-123", ep.GUID)
+	}
+	if ep.FeedURL != plusFeed {
+		t.Errorf("PSUB cross-feed: FeedURL should be destination's Plus feed %q, got %q", plusFeed, ep.FeedURL)
 	}
 }
 

@@ -14,8 +14,8 @@ type Result struct {
 	SubscriptionsAdded      int
 	EpisodesUpdated         int
 	EpisodesSkipped         int
-	SkippedPaywalledEpisodes int // Apple PSUB/PLUS episodes: wrong GUIDs, DRM streams
-	SkippedInternalPodcasts  int // Apple "internal://" feeds: no public RSS exists
+	PaywalledEpisodesIncluded int // Apple PSUB/PLUS episodes included for fuzzy title+date matching
+	SkippedInternalPodcasts   int // Apple "internal://" feeds: no public RSS exists
 	DryRun                  bool
 }
 
@@ -32,10 +32,11 @@ func (r Result) String() string {
 			"      Search for these shows by name in Overcast to find their public feeds.",
 			r.SkippedInternalPodcasts)
 	}
-	if r.SkippedPaywalledEpisodes > 0 {
-		s += fmt.Sprintf("\nnote: %d Apple Podcasts Subscription (PSUB/PLUS) episode states were excluded —\n"+
-			"      these use Apple-proprietary GUIDs and DRM streams no other app can match or play.",
-			r.SkippedPaywalledEpisodes)
+	if r.PaywalledEpisodesIncluded > 0 {
+		s += fmt.Sprintf("\nnote: %d Apple Podcasts Subscription (PSUB/PLUS) episode(s) included —\n"+
+			"      these use Apple-proprietary GUIDs and DRM enclosure URLs, so feed-URL matching\n"+
+			"      is skipped; they are matched by podcast title + pub date against the destination.",
+			r.PaywalledEpisodesIncluded)
 	}
 	return s
 }
@@ -74,7 +75,7 @@ func (e *Engine) Run(ctx context.Context, opts provider.WriteOptions) (*Result, 
 
 	res := &Result{
 		DryRun:                   opts.DryRun,
-		SkippedPaywalledEpisodes: srcLib.SkippedPaywalledEpisodes,
+		PaywalledEpisodesIncluded: srcLib.PaywalledEpisodesIncluded,
 		SkippedInternalPodcasts:  srcLib.SkippedInternalPodcasts,
 	}
 	// Only count subscriptions added when the destination can actually receive them.
@@ -156,7 +157,7 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 						// the first pass (possible when primary and cross-feed keys collide).
 						existingKey := episodeKey(existing)
 						if _, stillAvail := dstIndex[existingKey]; stillAvail {
-							out.Episodes = append(out.Episodes, resolveConflict(ep, existing, opts.ConflictStrategy))
+							out.Episodes = append(out.Episodes, resolveConflictCrossFeed(ep, existing, opts.ConflictStrategy))
 							delete(dstIndex, existingKey)
 							delete(dstCrossIndex, xKey)
 							continue
@@ -247,6 +248,28 @@ func episodeKey(ep model.EpisodeState) string {
 
 func normalizeTitle(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// resolveConflictCrossFeed is like resolveConflict but always emits the
+// destination episode's identity fields (GUID, FeedURL, Title, PodcastTitle,
+// PubDate, Duration) with only the winning play state applied. Used for
+// cross-feed matches where source and destination identify the same episode
+// under different feed URLs or GUIDs — for example:
+//
+//   - Public feed ("Fresh Air") vs paid-tier feed ("Fresh Air Plus")
+//   - Apple-proprietary GUID/DRM enclosure (PSUB/PLUS) vs the destination's
+//     RSS-native GUID for the same episode via a private member feed
+//
+// Preserving destination identifiers ensures downstream writers (e.g. the
+// Overcast writer, which keys its index on the destination's feed URL) can
+// locate the episode after the merge.
+func resolveConflictCrossFeed(src, dst model.EpisodeState, strategy provider.ConflictStrategy) model.EpisodeState {
+	winner := resolveConflict(src, dst, strategy)
+	// Always use destination identifiers; apply only the play state from the winner.
+	out := dst
+	out.PlayState = winner.PlayState
+	out.PlayPosition = winner.PlayPosition
+	return out
 }
 
 func resolveConflict(src, dst model.EpisodeState, strategy provider.ConflictStrategy) model.EpisodeState {

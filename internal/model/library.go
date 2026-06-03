@@ -74,10 +74,12 @@ type Library struct {
 	ExportedAt     time.Time
 	SourceProvider string
 
-	// SkippedPaywalledEpisodes is the count of episodes excluded because they
-	// are behind an Apple-proprietary paywall (PSUB/PLUS) — their GUIDs are
-	// Apple-internal and their enclosure URLs are Apple DRM streams.
-	SkippedPaywalledEpisodes int
+	// PaywalledEpisodesIncluded is the count of PSUB/PLUS episodes (Apple
+	// Podcasts Subscriptions) that were included in the episode list for fuzzy
+	// matching. These have Apple-proprietary GUIDs and DRM enclosure URLs, so
+	// feed-URL-based matching will not work for them; the engine will attempt
+	// to match them via podcast title + pub date against the destination.
+	PaywalledEpisodesIncluded int
 
 	// SkippedInternalPodcasts is the count of subscriptions excluded because
 	// their feed URL uses the Apple-internal "internal://" scheme, meaning

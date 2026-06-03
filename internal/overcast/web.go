@@ -32,8 +32,13 @@ import (
 	"github.com/tyler/podcast-migrate/internal/model"
 )
 
+var overcastBaseURL = "https://overcast.fm"
+
+// SetBaseURLForTest overrides the Overcast base URL for unit tests that use
+// an httptest.Server. Must be reset to "https://overcast.fm" after each test.
+func SetBaseURLForTest(u string) { overcastBaseURL = u }
+
 const (
-	overcastBaseURL = "https://overcast.fm"
 
 	// PlayedSentinel is sent as the p parameter to mark an episode as fully played.
 	// Overcast treats any position ≥ episode duration as played; INT32_MAX is the
@@ -372,6 +377,82 @@ func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, over
 	}
 
 	return "", nil // not found
+}
+
+// SubscribedPodcast holds the page URL and title of one podcast from /podcasts.
+type SubscribedPodcast struct {
+	PageURL string // absolute URL, e.g. "https://overcast.fm/itunes1234567890"
+	Title   string // podcast title as displayed in Overcast
+}
+
+// feedCellRe matches a subscribed podcast anchor on the /podcasts page.
+// Attribute order in the <a> tag is unconstrained (href may precede or follow class).
+//
+//	1. attributes before href (checked for "feedcell" class)
+//	2. podcast page path: "/itunes{digits}" or "/p/{anything}"
+//	3. attributes after href (checked for "feedcell" class)
+//	4. cell body HTML (searched for the title2 element)
+var feedCellRe = regexp.MustCompile(
+	`(?s)<a\b([^>]*)\bhref="(/(?:itunes\d+|p/[^"]+))"([^>]*)>(.*?)</a>`)
+
+// cellTitle2Re extracts the podcast title from inside a feed cell body.
+// Overcast uses class="title2" for the primary podcast title on feed cells.
+var cellTitle2Re = regexp.MustCompile(
+	`<[^>]+\bclass="[^"]*\btitle2\b[^"]*"[^>]*>([^<]+)<`)
+
+// FetchSubscribedPodcasts returns every podcast currently subscribed in the
+// authenticated Overcast account by fetching the /podcasts page. One request
+// replaces the per-podcast search_autocomplete calls previously needed to
+// resolve each podcast's listing page URL, and it surfaces private
+// subscriptions that have no iTunes ID and therefore cannot be found by search.
+//
+// The client must be authenticated (obtained from Login).
+func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]SubscribedPodcast, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, overcastBaseURL+"/podcasts", nil)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: build /podcasts request: %w", err)
+	}
+	req.Header.Set("User-Agent", overcastUA)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("overcast/web: GET /podcasts: %w", err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RateLimitError{Wait: rateLimitWait(resp, 30*time.Second)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("overcast/web: /podcasts returned HTTP %d", resp.StatusCode)
+	}
+
+	var podcasts []SubscribedPodcast
+	for _, m := range feedCellRe.FindAllSubmatch(body, -1) {
+		// m[1]: attrs before href, m[3]: attrs after href.
+		// At least one must contain "feedcell" to confirm this is a podcast cell
+		// (not an unrelated link to /itunes... or /p/... elsewhere on the page).
+		attrsBefore, attrsAfter := string(m[1]), string(m[3])
+		if !strings.Contains(attrsBefore, "feedcell") && !strings.Contains(attrsAfter, "feedcell") {
+			continue
+		}
+		path := string(m[2])
+		cellBody := m[4]
+
+		title := ""
+		if tm := cellTitle2Re.FindSubmatch(cellBody); tm != nil {
+			title = strings.TrimSpace(htmlpkg.UnescapeString(string(tm[1])))
+		}
+		if title == "" {
+			continue // skip cells without a recognisable title
+		}
+		podcasts = append(podcasts, SubscribedPodcast{
+			PageURL: overcastBaseURL + path,
+			Title:   title,
+		})
+	}
+	return podcasts, nil
 }
 
 // PodcastEpisodeListing holds the minimal data for one episode extracted from a podcast page.

@@ -703,3 +703,76 @@ func TestSearchPodcastITunesID_ExactMatchNotAffectedByPlusFallback(t *testing.T)
 		t.Errorf("iTunesID: got %q, want '999'", id)
 	}
 }
+
+// --- FetchSubscribedPodcasts ---
+
+const mockPodcastsPage = `<!DOCTYPE html><html><body>
+<a class="feedcell extendedfeedcell" href="/itunes1200361736">
+  <img class="art" src="/art1.jpg">
+  <div class="titleStack">
+    <div class="title2">Pod Save America</div>
+    <div class="caption2">Crooked Media</div>
+  </div>
+</a>
+<a class="feedcell extendedfeedcell" href="/itunes1200361737">
+  <div class="title2">Fresh Air</div>
+</a>
+<a class="feedcell extendedfeedcell" href="/p/private-rss-slug">
+  <div class="title2">Private Members Show</div>
+</a>
+<a href="/itunes9999" class="someothercell">
+  <div class="title2">Not A Subscription</div>
+</a>
+</body></html>`
+
+func TestFetchSubscribedPodcasts_ParsesCells(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/podcasts" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, mockPodcastsPage)
+	}))
+	defer srv.Close()
+
+	overcast.SetBaseURLForTest(srv.URL)
+	defer overcast.SetBaseURLForTest("https://overcast.fm")
+
+	podcasts, err := overcast.FetchSubscribedPodcasts(context.Background(), srv.Client())
+	if err != nil {
+		t.Fatalf("FetchSubscribedPodcasts: %v", err)
+	}
+	if len(podcasts) != 3 {
+		t.Fatalf("got %d podcasts, want 3; entries: %+v", len(podcasts), podcasts)
+	}
+	byTitle := make(map[string]string)
+	for _, p := range podcasts {
+		byTitle[p.Title] = p.PageURL
+	}
+	if url := byTitle["Pod Save America"]; url != srv.URL+"/itunes1200361736" {
+		t.Errorf("Pod Save America URL: got %q, want %q", url, srv.URL+"/itunes1200361736")
+	}
+	if url := byTitle["Private Members Show"]; url != srv.URL+"/p/private-rss-slug" {
+		t.Errorf("Private Members Show URL: got %q, want %q", url, srv.URL+"/p/private-rss-slug")
+	}
+	// Non-feedcell link must be excluded.
+	if _, found := byTitle["Not A Subscription"]; found {
+		t.Error("non-feedcell link should not be included")
+	}
+}
+
+func TestFetchSubscribedPodcasts_Non200ReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	overcast.SetBaseURLForTest(srv.URL)
+	defer overcast.SetBaseURLForTest("https://overcast.fm")
+
+	_, err := overcast.FetchSubscribedPodcasts(context.Background(), srv.Client())
+	if err == nil {
+		t.Fatal("expected error for non-200 response")
+	}
+}

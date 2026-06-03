@@ -551,10 +551,37 @@ func augmentIndexFromPodcastPages(
 	if unmatched == 0 {
 		return 0
 	}
-	fmt.Printf("overcast: extended matching: %d feed(s) have episodes not in OPML — resolving via search API...\n", unmatched)
+	fmt.Printf("overcast: extended matching: %d feed(s) have episodes not in OPML — resolving via /podcasts page...\n", unmatched)
 
-	// Step 2: for each feed with unmatched episodes, search for the podcast by
-	// title+overcastID to get its iTunes ID, then construct the episode listing URL.
+	// Step 2: resolve each Apple feed to its Overcast podcast listing page URL.
+	//
+	// Primary: fetch /podcasts once to get every subscribed podcast's page URL.
+	// This replaces N per-podcast search_autocomplete calls, handles private
+	// subscriptions (no iTunes ID), and costs only one HTTP request.
+	//
+	// Fallback: if the /podcasts fetch fails or a podcast isn't found there,
+	// fall back to the search_autocomplete API (original behaviour).
+	pageURLByNormTitle := make(map[string]string) // normalised title → page URL
+	subs, subsErr := FetchSubscribedPodcasts(ctx, client)
+	if subsErr != nil {
+		fmt.Printf("  warning: could not fetch /podcasts page (%v) — falling back to per-podcast search\n", subsErr)
+	} else {
+		for _, s := range subs {
+			norm := strings.ToLower(strings.TrimSpace(s.Title))
+			if _, exists := pageURLByNormTitle[norm]; !exists {
+				pageURLByNormTitle[norm] = s.PageURL
+			}
+			// Also index under the Plus-normalised title so "Fresh Air Plus" matches
+			// a source podcast titled "Fresh Air" (and vice-versa).
+			if base := model.NormalizePlusTitle(s.Title); base != norm {
+				if _, exists := pageURLByNormTitle[base]; !exists {
+					pageURLByNormTitle[base] = s.PageURL
+				}
+			}
+		}
+		fmt.Printf("overcast: /podcasts page listed %d subscribed podcast(s)\n", len(subs))
+	}
+
 	feedToPageURL := make(map[string]string)
 	skippedFeeds := 0
 	for feedURL, apEps := range appleByFeed {
@@ -575,19 +602,12 @@ func augmentIndexFromPodcastPages(
 		// Look up Overcast podcast info by normalised feed URL first.
 		info, ok := opmlByNormFeed[normFeed]
 		if !ok && !strictFeedMatch {
-			// Feed URL mismatch — try matching by podcast title.
-			// feedToTitle values are already lowercased by buildFeedToTitle.
-			// Skipped when strictFeedMatch is true: only feed-URL-anchored results allowed.
 			if appleTitle := feedToTitle[feedURL]; appleTitle != "" {
 				if titleInfo, found := opmlByTitle[appleTitle]; found {
 					info = titleInfo
 					ok = true
 					fmt.Printf("  note: feed URL mismatch for %q — matched by podcast title\n", info.title)
 				}
-				// Also try the Plus-normalised Apple title ("Fresh Air Plus" → "Fresh Air").
-				// opmlByTitle already contains Plus-normalised keys for Overcast podcasts,
-				// so this covers the case where Apple has the paid feed and Overcast has
-				// the public feed (or vice-versa at the index level).
 				if !ok {
 					baseTitle := model.NormalizePlusTitle(appleTitle)
 					if baseTitle != appleTitle {
@@ -603,9 +623,24 @@ func augmentIndexFromPodcastPages(
 		}
 		if !ok {
 			skippedFeeds++
-			continue // not subscribed in Overcast and title not found
+			continue // not subscribed in Overcast
 		}
 
+		// Try the /podcasts page map first (one request for all podcasts).
+		normInfoTitle := strings.ToLower(strings.TrimSpace(info.title))
+		if pageURL, found := pageURLByNormTitle[normInfoTitle]; found {
+			feedToPageURL[feedURL] = pageURL
+			continue
+		}
+		if base := model.NormalizePlusTitle(info.title); base != normInfoTitle {
+			if pageURL, found := pageURLByNormTitle[base]; found {
+				feedToPageURL[feedURL] = pageURL
+				continue
+			}
+		}
+
+		// Fall back to search_autocomplete if not found in /podcasts results
+		// (e.g. /podcasts fetch failed, or title mismatch between OPML and page).
 		iTunesID, err := searchPodcastITunesIDWithRetry(ctx, client, info.title, info.overcastID, requestDelay)
 		if err != nil {
 			fmt.Printf("  warning: search failed for %q: %v\n", info.title, err)
@@ -613,7 +648,7 @@ func augmentIndexFromPodcastPages(
 			continue
 		}
 		if iTunesID == "" {
-			fmt.Printf("  warning: %q not found in Overcast search results\n", info.title)
+			fmt.Printf("  warning: %q not found in Overcast account or search\n", info.title)
 			skippedFeeds++
 			continue
 		}

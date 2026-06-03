@@ -166,6 +166,11 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	}
 	writeLogHeader(opts.LogWriter)
 
+	// Early exit: nothing to process.
+	if len(episodes) == 0 {
+		return 0, nil
+	}
+
 	// 2. Resolve the matching library:
 	//    - Explicit matchOPMLPath: read from file (no login needed yet).
 	//    - No matchOPMLPath: login and auto-fetch the live account library.
@@ -200,10 +205,38 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	// 3. Build the episode-ID index from the resolved matching library.
 	index := buildOvercastIndex(matchLib)
 
-	// 4. In dry-run mode, report what would be written without making any further
-	//    web requests. Extended matching (which fetches podcast and episode pages)
-	//    is not run in dry-run, so episodes absent from the matching OPML appear
-	//    as not_found even if they would resolve at write time.
+	// 4. Authenticate (if not already done during OPML auto-fetch above).
+	//    This runs for both dry-run and live — augmentIndexFromPodcastPages (step 5)
+	//    is read-only and must run in both modes to give an accurate dry-run preview.
+	if !loginDone {
+		fmt.Printf("overcast: authenticating as %s...\n", p.email)
+		var err error
+		httpClient, err = Login(ctx, p.email, p.password)
+		if err != nil {
+			return 0, fmt.Errorf("overcast: authentication failed: %w", err)
+		}
+	}
+
+	// 5. Resolve the request delay: honour the caller's preference, or fall
+	//    back to the conservative default.
+	requestDelay := opts.RequestDelay
+	if requestDelay <= 0 {
+		requestDelay = DefaultRequestDelay
+	}
+
+	// 6. Augment the index with episode IDs from Overcast podcast pages.
+	//    This handles episodes absent from the matching OPML (e.g. episodes the
+	//    user listened to in Apple but never opened in Overcast). Runs in both
+	//    dry-run and live mode: the page fetches are read-only GETs, so running
+	//    them in dry-run gives an accurate preview of what the live run will do.
+	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch)
+	if added > 0 {
+		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
+	}
+
+	// 7. In dry-run mode, report what would be written without making any state
+	//    changes. The index is now fully populated (including extended matching),
+	//    so not_found here means the episode genuinely has no match in the account.
 	if opts.DryRun {
 		n := 0
 		for _, ep := range episodes {
@@ -215,7 +248,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			if !ok {
 				writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
 					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-					"not in matching OPML (extended matching skipped in dry-run)")
+					"no match found in Overcast account")
 				continue
 			}
 			if !opts.ForceUpdate {
@@ -233,32 +266,6 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			n++
 		}
 		return n, nil
-	}
-
-	// 5. Authenticate (if not already done during OPML auto-fetch above).
-	if !loginDone {
-		fmt.Printf("overcast: authenticating as %s...\n", p.email)
-		var err error
-		httpClient, err = Login(ctx, p.email, p.password)
-		if err != nil {
-			return 0, fmt.Errorf("overcast: authentication failed: %w", err)
-		}
-	}
-
-	// 6. Resolve the request delay: honour the caller's preference, or fall
-	//    back to the conservative default.
-	requestDelay := opts.RequestDelay
-	if requestDelay <= 0 {
-		requestDelay = DefaultRequestDelay
-	}
-
-	// 7. Augment the index with episode IDs from Overcast podcast pages.
-	//    This handles episodes in shared feeds that weren't in the matching OPML
-	//    (e.g. episodes the user listened to in Apple but never opened in Overcast,
-	//    or episodes from a different feed URL resolved via Plus-title normalization).
-	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch)
-	if added > 0 {
-		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
 
 	// 8. Pre-count: how many episodes need an API call vs. are already satisfied.

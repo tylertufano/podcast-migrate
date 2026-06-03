@@ -166,17 +166,18 @@ func TestOvercastProvider_WithCredentials_NoSourceOPML_WritePlayStateTrue(t *tes
 }
 
 func TestOvercastProvider_SetLibrary_PlayStateDryRun(t *testing.T) {
-	// Dry-run play state write: should count matched episodes without making any HTTP calls.
-	// SetMatchOPMLPath is required here so the dry-run reads from a file instead of
-	// trying to authenticate and auto-fetch the live account library.
+	// Dry-run with no episodes in scope: exits before any auth or HTTP calls.
+	// Note: in real usage dry-run DOES authenticate and fetch podcast pages via
+	// augmentIndexFromPodcastPages (read-only) to give an accurate preview.
+	// This test exercises the zero-episode early-exit path only.
 	importPath := writeMinimalOvercastOPML(t)
 	outPath := filepath.Join(t.TempDir(), "out.opml")
 	p := overcast.NewProviderWithCredentials(importPath, outPath, "user@example.com", "secret")
-	p.SetMatchOPMLPath(importPath) // use the source OPML for matching — avoids live login in tests
+	p.SetMatchOPMLPath(importPath)
 
 	lib := &model.Library{
 		Podcasts: []model.Podcast{{FeedURL: "https://feeds.example.com/show-a", Title: "Show A"}},
-		// No episodes with play state — dry-run should complete with zero updates.
+		// No episodes with play state → early exit, no auth attempted.
 	}
 	if err := p.SetLibrary(context.Background(), lib, provider.WriteOptions{DryRun: true}); err != nil {
 		t.Fatalf("SetLibrary dry-run with credentials: %v", err)

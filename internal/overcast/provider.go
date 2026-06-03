@@ -16,9 +16,10 @@ import (
 )
 
 // DefaultRequestDelay is the pause between consecutive Overcast API requests
-// when WriteOptions.RequestDelay is not set. 500 ms keeps the client well
-// within Overcast's undocumented rate limit (2 requests/second).
-const DefaultRequestDelay = 500 * time.Millisecond
+// when WriteOptions.RequestDelay is not set. 1 s is conservative enough to
+// avoid triggering Overcast's rate limiter, especially during the extended
+// matching phase which fetches one page per subscribed podcast.
+const DefaultRequestDelay = 1 * time.Second
 
 // Provider implements provider.Provider for Overcast.
 //

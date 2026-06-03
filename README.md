@@ -161,7 +161,7 @@ podcast-migrate migrate --from overcast --to podcasts \
 
 **Token lifetimes:** The Bearer token is a short-lived JWT signed by Apple — capture a fresh one if you get `401` errors. The `media-user-token` is your account session and lasts longer but will eventually expire. Both are re-captured the same way (one network request in DevTools).
 
-**Rate limiting:** The tool sends one API request per episode with a 500 ms delay between calls by default. Override with `--request-delay` (e.g. `--request-delay 1s`) if you hit rate limits.
+**Rate limiting:** The tool sends one API request per episode with a 1 s delay between calls by default. Override with `--request-delay` (e.g. `--request-delay 2s`) if you hit rate limits.
 
 #### Limit to specific podcasts
 
@@ -251,7 +251,7 @@ podcast-migrate import --to overcast \
 | `--play-state` | Write episode play state |
 | `--podcast` | Limit play-state sync to podcasts matching this word/phrase (repeatable) |
 | `--podcast-list` | Path to a file with one podcast title/word per line |
-| `--request-delay` | Delay between API requests (default 500ms; increase if you hit rate limits) |
+| `--request-delay` | Delay between API requests (default 1s; increase if you hit rate limits) |
 | `--log-file` | Write per-episode CSV detail log (columns: status, podcast, episode, pub_date, source_state, target_state, note) |
 | `--overcast-source-opml` | Path to Overcast extended OPML export used as the migration source (`--from overcast`) |
 | `--overcast-match-opml` | Path to Overcast OPML used for destination episode matching when writing play state (optional; if omitted and credentials are set, the live account library is fetched automatically) |

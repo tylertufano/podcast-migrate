@@ -389,16 +389,20 @@ type SubscribedPodcast struct {
 // Attribute order in the <a> tag is unconstrained (href may precede or follow class).
 //
 //	1. attributes before href (checked for "feedcell" class)
-//	2. podcast page path: "/itunes{digits}" or "/p/{anything}"
+//	2. podcast page path: "/itunes{anything}" or "/p/{anything}"
 //	3. attributes after href (checked for "feedcell" class)
-//	4. cell body HTML (searched for the title2 element)
+//	4. cell body HTML (searched for the title element)
+//
+// Note: Overcast slugs podcast URLs as /itunes{ID}/{slug} — the path after /itunes
+// is NOT limited to digits; [^"]+ captures the full path up to the closing quote.
 var feedCellRe = regexp.MustCompile(
-	`(?s)<a\b([^>]*)\bhref="(/(?:itunes\d+|p/[^"]+))"([^>]*)>(.*?)</a>`)
+	`(?s)<a\b([^>]*)\bhref="(/(?:itunes|p/)[^"]+)"([^>]*)>(.*?)</a>`)
 
-// cellTitle2Re extracts the podcast title from inside a feed cell body.
-// Overcast uses class="title2" for the primary podcast title on feed cells.
-var cellTitle2Re = regexp.MustCompile(
-	`<[^>]+\bclass="[^"]*\btitle2\b[^"]*"[^>]*>([^<]+)<`)
+// cellTitleRe extracts the podcast title from inside a feed cell body.
+// Tries several candidate class names used by Overcast across page variants:
+// title2, title, feedtitle. The first match wins.
+var cellTitleRe = regexp.MustCompile(
+	`<[^>]+\bclass="[^"]*\b(?:title2|title|feedtitle)\b[^"]*"[^>]*>([^<]+)<`)
 
 // FetchSubscribedPodcasts returns every podcast currently subscribed in the
 // authenticated Overcast account by fetching the /podcasts page. One request
@@ -432,26 +436,36 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]Subscr
 	for _, m := range feedCellRe.FindAllSubmatch(body, -1) {
 		// m[1]: attrs before href, m[3]: attrs after href.
 		// At least one must contain "feedcell" to confirm this is a podcast cell
-		// (not an unrelated link to /itunes... or /p/... elsewhere on the page).
+		// (not an unrelated link to /itunes... elsewhere on the page).
 		attrsBefore, attrsAfter := string(m[1]), string(m[3])
 		if !strings.Contains(attrsBefore, "feedcell") && !strings.Contains(attrsAfter, "feedcell") {
 			continue
 		}
+
 		path := string(m[2])
 		cellBody := m[4]
 
 		title := ""
-		if tm := cellTitle2Re.FindSubmatch(cellBody); tm != nil {
+		if tm := cellTitleRe.FindSubmatch(cellBody); tm != nil {
 			title = strings.TrimSpace(htmlpkg.UnescapeString(string(tm[1])))
 		}
 		if title == "" {
-			continue // skip cells without a recognisable title
+			continue // no usable title — skip
 		}
 		podcasts = append(podcasts, SubscribedPodcast{
 			PageURL: overcastBaseURL + path,
 			Title:   title,
 		})
 	}
+
+	// When parsing yields nothing, save the raw HTML for inspection so the
+	// regex can be refined against the actual page structure.
+	if len(podcasts) == 0 && len(body) > 0 {
+		debugPath := filepath.Join(os.TempDir(), "overcast-podcasts-page-debug.html")
+		_ = os.WriteFile(debugPath, body, 0644)
+		fmt.Printf("overcast: /podcasts page parsed 0 podcasts — raw HTML saved to %s for inspection\n", debugPath)
+	}
+
 	return podcasts, nil
 }
 

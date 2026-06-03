@@ -98,7 +98,11 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 }
 
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
-	writeSubscriptions := !opts.OnlyPlayState
+	// Only write subscriptions when an export path is configured and play-state-only
+	// mode was not explicitly requested. When exportOPMLPath is empty we skip the
+	// subscription write silently — the caller already knows WriteSubscriptions is
+	// false via Capabilities() and has chosen not to provide a path.
+	writeSubscriptions := !opts.OnlyPlayState && p.exportOPMLPath != ""
 	writePlayState := !opts.OnlySubscriptions && p.email != ""
 
 	// When OnlyPlayState is explicitly requested but no credentials are configured,
@@ -110,13 +114,15 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 		}
 	}
 
-	if writeSubscriptions {
-		if p.exportOPMLPath == "" {
-			return &provider.ErrCapabilityUnsupported{
-				Provider:  p.Name(),
-				Operation: "write subscriptions (no export OPML path configured)",
-			}
+	// Guard against a no-op call: nothing to write.
+	if !writeSubscriptions && !writePlayState {
+		return &provider.ErrCapabilityUnsupported{
+			Provider:  p.Name(),
+			Operation: "write anything (no export OPML path and no credentials configured)",
 		}
+	}
+
+	if writeSubscriptions {
 		if opts.DryRun {
 			fmt.Printf("[dry-run] would write %d subscriptions to %s\n",
 				len(lib.Podcasts), p.exportOPMLPath)

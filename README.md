@@ -182,6 +182,38 @@ podcast-migrate migrate --from overcast --to podcasts \
   --play-state --podcast-list ~/my-podcasts.txt
 ```
 
+### Overcast → Overcast (restore play state from an old export)
+
+Useful when you've cleaned up your Overcast subscriptions — e.g. removed duplicate public/paid feeds — and want to restore play state from an earlier export.
+
+```sh
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
+
+# Dry-run first to preview what will be restored
+podcast-migrate migrate --from overcast --to overcast \
+  --overcast-source-opml ~/Downloads/old-export.opml \
+  --play-state --force-update --dry-run
+
+# Live run
+podcast-migrate migrate --from overcast --to overcast \
+  --overcast-source-opml ~/Downloads/old-export.opml \
+  --play-state --force-update
+```
+
+**How it works:** The source OPML (`--overcast-source-opml`) provides the play history from your old account state. The tool authenticates and auto-fetches your current live library as the destination — no second OPML needed. `--force-update` overwrites episodes the destination already marks as played, which is what you want when restoring from an older snapshot.
+
+**Plus-feed matching:** If your old export has both a public feed ("Fresh Air") and a paid feed ("Fresh Air Plus") and your cleaned-up account keeps only one of them, the tool matches episodes across those feeds by normalizing the title — so play state is restored to whichever variant is currently subscribed.
+
+If you'd rather match against a specific snapshot of the cleaned account instead of the live state:
+
+```sh
+podcast-migrate migrate --from overcast --to overcast \
+  --overcast-source-opml ~/Downloads/old-export.opml \
+  --overcast-match-opml ~/Downloads/cleaned-export.opml \
+  --play-state --force-update --dry-run
+```
+
 ### Export your library to JSON
 
 Snapshots your library as a portable JSON file. Useful for inspection, backup, or staging a migration.

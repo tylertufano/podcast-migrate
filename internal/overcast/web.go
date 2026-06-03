@@ -577,6 +577,11 @@ type PodcastEpisodeListing struct {
 	OvercastURL string // "https://overcast.fm/+HASH"
 	DateStr     string // "YYYY-MM-DD" — day-level precision
 	Title       string // episode title extracted from cell HTML (may be empty)
+	// NumericID is the data-item-id value required by set_progress. It is populated
+	// opportunistically when the episode cell anchor already carries data-item-id as
+	// an HTML attribute — saving a per-episode player-page fetch. Empty string means
+	// the ID must be fetched separately via FetchEpisodeNumericID.
+	NumericID string
 }
 
 // episodeCellRe matches an episode anchor and captures five groups:
@@ -659,10 +664,19 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 		if !ok {
 			continue
 		}
+		// Opportunistically extract data-item-id from the <a> tag attributes. Some
+		// Overcast page variants embed it directly on the cell anchor, which eliminates
+		// the need for a separate per-episode player-page fetch in step 4.
+		var numericID string
+		allAttrs := attrsBefore + " " + attrsAfter
+		if idM := numericIDRe.FindStringSubmatch(allAttrs); idM != nil {
+			numericID = idM[1]
+		}
 		listings = append(listings, PodcastEpisodeListing{
 			OvercastURL: overcastBaseURL + hash,
 			DateStr:     dateStr,
 			Title:       title,
+			NumericID:   numericID,
 		})
 	}
 	// When no episode cells were found the page is almost certainly JavaScript-rendered.

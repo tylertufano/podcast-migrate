@@ -686,7 +686,19 @@ func augmentIndexFromPodcastPages(
 	// and the raw HTML has been saved to disk for inspection.
 	var emptyPages []string
 
-	matched := 0
+	// podPageCache deduplicates podcast page fetches keyed by Overcast page URL.
+	// Multiple Apple feed URLs (e.g. public feed + Plus feed) may resolve to the
+	// same Overcast podcast page via Plus-normalised title matching; without this
+	// cache the same page would be fetched once per Apple feed URL.
+	type podPageResult struct {
+		listings []PodcastEpisodeListing
+		failed   bool // true = fetch returned an error
+	}
+	podPageCache := make(map[string]podPageResult)
+
+	// added counts entries written into index (either directly from listing NumericID
+	// in step 3, or resolved via per-episode page fetch in step 4).
+	added := 0
 	for feedURL, apEps := range appleByFeed {
 		normFeed := normalizeFeedURL(feedURL)
 		pageURL, ok := feedToPageURL[feedURL]
@@ -694,23 +706,38 @@ func augmentIndexFromPodcastPages(
 			continue // not subscribed or search failed
 		}
 
-		listings, err := fetchPodcastEpisodesWithRetry(ctx, client, pageURL, requestDelay)
-		if err != nil {
-			fmt.Printf("  warning: could not fetch podcast page %s: %v\n", pageURL, err)
-			continue
-		}
-		time.Sleep(requestDelay)
+		var listings []PodcastEpisodeListing
+		if cached, hit := podPageCache[pageURL]; hit {
+			// Re-use a previously fetched result; skip this feed if the page
+			// failed or returned no episode cells (JS-rendered).
+			if cached.failed || len(cached.listings) == 0 {
+				continue
+			}
+			listings = cached.listings
+		} else {
+			fetched, err := fetchPodcastEpisodesWithRetry(ctx, client, pageURL, requestDelay)
+			if err != nil {
+				fmt.Printf("  warning: could not fetch podcast page %s: %v\n", pageURL, err)
+				podPageCache[pageURL] = podPageResult{failed: true}
+				continue
+			}
+			time.Sleep(requestDelay)
 
-		if len(listings) == 0 {
-			// No episode cells in the static HTML — the page is almost certainly
-			// JavaScript-rendered. Record it and skip per-episode matching for this feed.
-			emptyPages = append(emptyPages, pageURL)
-			continue
+			if len(fetched) == 0 {
+				// No episode cells — page is almost certainly JavaScript-rendered.
+				emptyPages = append(emptyPages, pageURL)
+				podPageCache[pageURL] = podPageResult{} // mark as attempted, empty
+				continue
+			}
+			listings = fetched
+			podPageCache[pageURL] = podPageResult{listings: listings}
 		}
 
-		// Build date → episode URL map for this podcast page.
+		// Build date → listing and URL → listing maps for this podcast page.
 		// Key is "YYYY-MM-DD"; Overcast pages use day-level precision.
-		dateToURL := make(map[string]string, len(listings))
+		dateToListing := make(map[string]PodcastEpisodeListing, len(listings))
+		// urlToListing allows O(1) NumericID lookup once we have a URL match.
+		urlToListing := make(map[string]PodcastEpisodeListing, len(listings))
 		// Also build a normalised-title list for fallback matching when date matching fails.
 		// The cell body HTML may contain the podcast name before the episode title, so we
 		// use strings.Contains (case-insensitive) rather than an exact map key lookup.
@@ -720,9 +747,10 @@ func augmentIndexFromPodcastPages(
 		}
 		var titleEntries []titleEntry
 		for _, l := range listings {
-			if _, exists := dateToURL[l.DateStr]; !exists {
-				dateToURL[l.DateStr] = l.OvercastURL
+			if _, exists := dateToListing[l.DateStr]; !exists {
+				dateToListing[l.DateStr] = l
 			}
+			urlToListing[l.OvercastURL] = l
 			if l.Title != "" {
 				titleEntries = append(titleEntries, titleEntry{
 					normTitle: strings.ToLower(l.Title),
@@ -738,45 +766,55 @@ func augmentIndexFromPodcastPages(
 			}
 			// Try to find the episode by the date portion of its UTC pubDate (±1 day tolerance).
 			apDate := ap.PubDate.UTC().Format("2006-01-02")
-			epURL := dateToURL[apDate]
-			if epURL == "" {
-				epURL = dateToURL[ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02")]
-			}
-			if epURL == "" {
-				epURL = dateToURL[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]
+			var matched PodcastEpisodeListing
+			if l, ok := dateToListing[apDate]; ok {
+				matched = l
+			} else if l, ok := dateToListing[ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02")]; ok {
+				matched = l
+			} else if l, ok := dateToListing[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]; ok {
+				matched = l
 			}
 			// Fallback: title-based matching when date matching fails.
 			// This handles episodes where the pubDate stored in Apple Podcasts doesn't
 			// align with the date Overcast shows on the podcast page (e.g. timezone
 			// differences in the RSS feed's pubDate field).
 			// Skipped when strictFeedMatch is true: only date-anchored results allowed.
-			if epURL == "" && !strictFeedMatch && ap.Title != "" {
+			if matched.OvercastURL == "" && !strictFeedMatch && ap.Title != "" {
 				normAppleTitle := strings.ToLower(strings.TrimSpace(ap.Title))
 				// Exact match first (cell text == episode title).
 				for _, te := range titleEntries {
 					if te.normTitle == normAppleTitle {
-						epURL = te.url
+						matched = urlToListing[te.url]
 						break
 					}
 				}
 				// Broader contains-match: cell text may include podcast name prefix.
-				if epURL == "" {
+				if matched.OvercastURL == "" {
 					for _, te := range titleEntries {
 						if strings.Contains(te.normTitle, normAppleTitle) {
-							epURL = te.url
+							matched = urlToListing[te.url]
 							break
 						}
 					}
 				}
-				if epURL != "" {
+				if matched.OvercastURL != "" {
 					fmt.Printf("  title match: %q (date match failed)\n", ap.Title)
 				}
 			}
-			if epURL == "" {
+			if matched.OvercastURL == "" {
 				continue
 			}
-			pending = append(pending, pendingFetch{normFeed, ap.PubDate.UTC().Format(time.RFC3339), epURL})
-			matched++
+			// If the listing page already provided data-item-id, add to index directly —
+			// no per-episode player-page fetch needed.
+			if matched.NumericID != "" {
+				key := "feeddate:" + normFeed + "|" + ap.PubDate.UTC().Format(time.RFC3339)
+				if _, exists := index[key]; !exists {
+					index[key] = overcastIndexEntry{numericID: matched.NumericID}
+					added++
+				}
+				continue
+			}
+			pending = append(pending, pendingFetch{normFeed, ap.PubDate.UTC().Format(time.RFC3339), matched.OvercastURL})
 		}
 	}
 
@@ -806,12 +844,12 @@ func augmentIndexFromPodcastPages(
 	}
 	fmt.Printf("overcast: fetching numeric IDs for %d additional episode(s) via episode pages...\n", len(pending))
 
-	// Step 4: resolve hashes → numeric IDs sequentially with retry on 429.
-	// Sequential (one request at a time) keeps us well within Overcast's
-	// undocumented rate limit. At ~300ms per request, 10 K episodes ≈ 50 min.
+	// Step 4: resolve hashes → numeric IDs via per-episode player-page fetches.
+	// This step only runs for episodes whose numeric ID was NOT embedded in the
+	// podcast listing page HTML (i.e. when FetchPodcastEpisodes returned NumericID="").
+	// Requests are sequential with 429-triggered backoff (no pre-emptive sleep).
 	const maxFetchRetries = 4
 
-	added := 0
 	consecutiveErrors := 0
 	for i, item := range pending {
 		var numericID string
@@ -868,11 +906,11 @@ func augmentIndexFromPodcastPages(
 			fmt.Printf("  resolved %d/%d episode IDs (%d added to index)\n",
 				i+1, len(pending), added)
 		}
-
-		time.Sleep(requestDelay)
+		// No pre-emptive sleep here: episode player-page fetches are read-only GETs
+		// and Overcast's read rate limit is much more lenient than its write limit.
+		// The 429 retry loop above handles any actual throttling with Retry-After backoff.
 	}
 
-	_ = matched // matched is the upper bound; added is the confirmed count
 	return added
 }
 

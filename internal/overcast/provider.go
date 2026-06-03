@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/model"
@@ -842,75 +843,174 @@ func augmentIndexFromPodcastPages(
 		fmt.Printf("overcast: extended matching found no additional episodes\n")
 		return 0
 	}
-	fmt.Printf("overcast: fetching numeric IDs for %d additional episode(s) via episode pages...\n", len(pending))
 
-	// Step 4: resolve hashes → numeric IDs via per-episode player-page fetches.
-	// This step only runs for episodes whose numeric ID was NOT embedded in the
-	// podcast listing page HTML (i.e. when FetchPodcastEpisodes returned NumericID="").
-	// Requests are sequential with 429-triggered backoff (no pre-emptive sleep).
-	const maxFetchRetries = 4
+	// Step 4: resolve hashes → numeric IDs.
+	//
+	// Strategy:
+	//  1. Load a persistent on-disk cache. Episodes resolved in prior runs are
+	//     served instantly with no HTTP request.
+	//  2. Fetch remaining (cache misses) with a bounded pool of concurrent GETs.
+	//  3. Save the updated cache to disk for the next run.
+	//
+	// On the first sync the cache is empty and all episodes need fetching.
+	// On every subsequent sync only new episodes require fetches.
+	const (
+		maxFetchRetries = 4
+		maxFetchWorkers = 5  // concurrent episode-page GETs
+		maxFetchErrors  = 10 // abort if this many goroutine errors accumulate
+	)
 
-	consecutiveErrors := 0
-	for i, item := range pending {
-		var numericID string
-		for attempt := 0; attempt < maxFetchRetries; attempt++ {
-			if attempt > 0 {
-				// Exponential backoff: 30 s, 60 s, 120 s.
-				wait := time.Duration(1<<uint(attempt)) * 30 * time.Second
-				fmt.Printf("  rate limited — waiting %v before retry (attempt %d/%d)...\n",
-					wait, attempt+1, maxFetchRetries)
-				select {
-				case <-ctx.Done():
-					return added
-				case <-time.After(wait):
-				}
-			}
+	idCache := loadEpisodeIDCache()
 
-			id, err := FetchEpisodeNumericID(ctx, client, item.episodeURL)
-			if err != nil {
-				var rl *RateLimitError
-				if errors.As(err, &rl) {
-					fmt.Printf("  rate limited (429) — waiting %v\n", rl.Wait)
-					select {
-					case <-ctx.Done():
-						return added
-					case <-time.After(rl.Wait):
-					}
-					continue // retry same attempt slot
-				}
-				// Log the first few individual errors so the root cause is visible.
-				if consecutiveErrors < 3 {
-					fmt.Printf("  error fetching %s: %v\n", item.episodeURL, err)
-				}
-				consecutiveErrors++
-				if consecutiveErrors > 10 {
-					fmt.Printf("  too many consecutive errors, stopping extended matching\n")
-					return added
-				}
-				break // non-rate-limit error — skip this episode
-			}
-			numericID = id
-			consecutiveErrors = 0
-			break
+	// Pass A: serve cache hits immediately.
+	cacheHits := 0
+	for _, item := range pending {
+		id := idCache.get(item.episodeURL)
+		if id == "" {
+			continue
 		}
+		key := "feeddate:" + item.normFeedURL + "|" + item.dateRFC3339
+		if _, exists := index[key]; !exists {
+			index[key] = overcastIndexEntry{numericID: id}
+			added++
+			cacheHits++
+		}
+	}
 
-		if numericID != "" {
+	// Build the miss list (episodes not yet in cache).
+	var misses []pendingFetch
+	for _, item := range pending {
+		if idCache.get(item.episodeURL) == "" {
+			misses = append(misses, item)
+		}
+	}
+
+	if idCache.size() > 0 {
+		if cacheHits > 0 {
+			fmt.Printf("overcast: episode ID cache: %d hits (no fetch needed), %d misses\n",
+				cacheHits, len(misses))
+		} else {
+			fmt.Printf("overcast: episode ID cache: %d entries loaded, %d misses\n",
+				idCache.size(), len(misses))
+		}
+	}
+
+	if len(misses) == 0 {
+		idCache.save()
+		return added
+	}
+
+	fmt.Printf("overcast: fetching numeric IDs for %d episode(s) via episode pages (%d workers)...\n",
+		len(misses), maxFetchWorkers)
+
+	// Pass B: fetch cache misses concurrently.
+	type fetchResult struct {
+		key       string
+		numericID string
+	}
+
+	results := make(chan fetchResult, len(misses))
+	sem := make(chan struct{}, maxFetchWorkers)
+	var wg sync.WaitGroup
+
+	var errMu sync.Mutex
+	errCount := 0
+
+	// Sub-context so we can cancel all workers if too many errors accumulate.
+	fetchCtx, cancelFetch := context.WithCancel(ctx)
+	defer cancelFetch()
+
+	for _, item := range misses {
+		item := item // capture loop variable
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Acquire a worker slot; respect cancellation while waiting.
+			select {
+			case sem <- struct{}{}:
+			case <-fetchCtx.Done():
+				results <- fetchResult{}
+				return
+			}
+			defer func() { <-sem }()
+
 			key := "feeddate:" + item.normFeedURL + "|" + item.dateRFC3339
-			if _, exists := index[key]; !exists {
-				index[key] = overcastIndexEntry{numericID: numericID}
+			var numericID string
+
+			for attempt := 0; attempt < maxFetchRetries; attempt++ {
+				if attempt > 0 {
+					// Exponential back-off between retry attempts: 30 s, 60 s, 120 s.
+					wait := time.Duration(1<<uint(attempt)) * 30 * time.Second
+					select {
+					case <-fetchCtx.Done():
+						results <- fetchResult{key, ""}
+						return
+					case <-time.After(wait):
+					}
+				}
+
+				id, err := FetchEpisodeNumericID(fetchCtx, client, item.episodeURL)
+				if err != nil {
+					var rl *RateLimitError
+					if errors.As(err, &rl) {
+						select {
+						case <-fetchCtx.Done():
+							results <- fetchResult{key, ""}
+							return
+						case <-time.After(rl.Wait):
+						}
+						continue // retry after Retry-After delay
+					}
+					// Non-rate-limit error: log the first few and abort if persistent.
+					errMu.Lock()
+					errCount++
+					n := errCount
+					errMu.Unlock()
+					if n <= 3 {
+						fmt.Printf("  error fetching %s: %v\n", item.episodeURL, err)
+					}
+					if n > maxFetchErrors {
+						fmt.Printf("  too many errors (%d), stopping extended matching\n", n)
+						cancelFetch()
+					}
+					results <- fetchResult{key, ""}
+					return
+				}
+				numericID = id
+				break
+			}
+
+			if numericID != "" {
+				idCache.set(item.episodeURL, numericID)
+			}
+			results <- fetchResult{key, numericID}
+		}()
+	}
+
+	// Close results channel once all workers finish.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results on the main goroutine (index map is not thread-safe).
+	resolved := 0
+	for r := range results {
+		resolved++
+		if r.numericID != "" && r.key != "" {
+			if _, exists := index[r.key]; !exists {
+				index[r.key] = overcastIndexEntry{numericID: r.numericID}
 				added++
 			}
 		}
-
-		if (i+1)%200 == 0 {
+		if resolved%200 == 0 {
 			fmt.Printf("  resolved %d/%d episode IDs (%d added to index)\n",
-				i+1, len(pending), added)
+				resolved, len(misses), added-cacheHits)
 		}
-		// No pre-emptive sleep here: episode player-page fetches are read-only GETs
-		// and Overcast's read rate limit is much more lenient than its write limit.
-		// The 429 retry loop above handles any actual throttling with Retry-After backoff.
 	}
 
+	idCache.save()
 	return added
 }
 

@@ -151,7 +151,7 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 		for _, ep := range unmatched {
 			if !ep.PubDate.IsZero() && ep.FeedURL != "" && len(dstCrossIndex) > 0 {
 				if podTitle := srcFeedToTitle[ep.FeedURL]; podTitle != "" {
-					xKey := "xfeed:" + model.NormalizePlusTitle(podTitle) + "|" + ep.PubDate.UTC().Format("2006-01-02T15:04:05")
+					xKey := "xfeed:" + model.NormalizePlusTitle(podTitle) + "|" + ep.PubDate.UTC().Format("2006-01-02")
 					if existing, ok := dstCrossIndex[xKey]; ok {
 						// Guard: only match if the dst episode wasn't already claimed in
 						// the first pass (possible when primary and cross-feed keys collide).
@@ -197,10 +197,17 @@ func buildFeedToTitle(lib *model.Library) map[string]string {
 }
 
 // buildCrossFeedIndex indexes lib's episodes by Plus-normalised podcast title +
-// pub date (format "xfeed:<normTitle>|<UTC date>"). Intended as a secondary index
-// used only when primary feed-URL-based matching fails, so that episodes from
-// paid-tier variants (e.g. "Fresh Air Plus") can match their public counterparts
-// ("Fresh Air") across providers.
+// pub date (format "xfeed:<normTitle>|<YYYY-MM-DD UTC date>"). Intended as a
+// secondary index used only when primary feed-URL-based matching fails, so that
+// episodes from paid-tier variants (e.g. "Fresh Air Plus") or private/member
+// feeds can match their public counterparts across providers.
+//
+// Date-only precision is intentional: private/member feeds often release
+// episodes several hours before the public RSS (early-access window), so the
+// exact pub-date timestamps differ even though it is the same episode. Using
+// the UTC calendar date as the key tolerates those timing differences while
+// keeping the podcast title in the key to avoid false-positive matches between
+// unrelated shows that happen to publish on the same day.
 func buildCrossFeedIndex(lib *model.Library) map[string]model.EpisodeState {
 	if lib == nil {
 		return nil
@@ -215,7 +222,7 @@ func buildCrossFeedIndex(lib *model.Library) map[string]model.EpisodeState {
 		if podTitle == "" {
 			continue
 		}
-		key := "xfeed:" + model.NormalizePlusTitle(podTitle) + "|" + ep.PubDate.UTC().Format("2006-01-02T15:04:05")
+		key := "xfeed:" + model.NormalizePlusTitle(podTitle) + "|" + ep.PubDate.UTC().Format("2006-01-02")
 		if _, exists := idx[key]; !exists {
 			idx[key] = ep
 		}

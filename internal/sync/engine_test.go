@@ -712,6 +712,47 @@ func TestMerge_CrossFeed_DestIdentifiersPreservedFurthestWins(t *testing.T) {
 	}
 }
 
+// TestMerge_CrossFeed_EarlyAccessTimingDifference verifies that when a
+// private/member feed releases an episode hours before the public RSS
+// (early-access window), the cross-feed match still succeeds because the
+// key uses the UTC calendar date rather than an exact timestamp.
+func TestMerge_CrossFeed_EarlyAccessTimingDifference(t *testing.T) {
+	privateFeed := "https://feeds.example.com/members/pod-save-america"
+	publicFeed := "https://feeds.example.com/pod-save-america"
+
+	// Private feed releases at 02:00 ET = 06:00 UTC.
+	privateRelease := time.Date(2024, 9, 12, 6, 0, 0, 0, time.UTC)
+	// Public feed releases 8 hours later, same calendar day.
+	publicRelease := time.Date(2024, 9, 12, 14, 0, 0, 0, time.UTC)
+
+	src := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: privateFeed, Title: "Pod Save America"}},
+		Episodes: []model.EpisodeState{
+			{GUID: "apple-private-guid", FeedURL: privateFeed, Title: "JD Is Lame", PubDate: privateRelease, PlayState: model.PlayStatePlayed},
+		},
+	}
+	dst := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: publicFeed, Title: "Pod Save America"}},
+		Episodes: []model.EpisodeState{
+			{GUID: "rss-public-guid", FeedURL: publicFeed, Title: "JD Is Lame", PubDate: publicRelease, PlayState: model.PlayStateUnplayed},
+		},
+	}
+
+	result := merge(src, dst, provider.WriteOptions{ConflictStrategy: provider.FurthestWins})
+
+	if len(result.Episodes) != 1 {
+		t.Fatalf("early-access timing: expected 1 merged episode, got %d (8-hour pub-date gap broke cross-feed match)", len(result.Episodes))
+	}
+	ep := result.Episodes[0]
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("FurthestWins: PlayState got %v, want Played", ep.PlayState)
+	}
+	// Destination identifiers preserved.
+	if ep.GUID != "rss-public-guid" {
+		t.Errorf("GUID should be destination's %q, got %q", "rss-public-guid", ep.GUID)
+	}
+}
+
 // TestMerge_PSUBEpisode_MatchesCrossFeed simulates the PSUB scenario: a source
 // episode has an Apple-proprietary GUID and a public feed URL, but the destination
 // has the same episode under a different (private/Plus) feed URL. The engine should
@@ -828,7 +869,7 @@ func TestBuildCrossFeedIndex(t *testing.T) {
 
 	idx := buildCrossFeedIndex(lib)
 
-	wantKey := "xfeed:fresh air|2024-03-10T14:00:00"
+	wantKey := "xfeed:fresh air|2024-03-10"
 	if _, ok := idx[wantKey]; !ok {
 		t.Errorf("buildCrossFeedIndex: key %q not found in index; keys = %v", wantKey, keys(idx))
 	}

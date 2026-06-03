@@ -551,7 +551,7 @@ func augmentIndexFromPodcastPages(
 	if unmatched == 0 {
 		return 0
 	}
-	fmt.Printf("overcast: extended matching: %d feed(s) have episodes not in OPML — resolving via /podcasts page...\n", unmatched)
+	fmt.Printf("overcast: extended matching: %d feed(s) have unmatched episodes — resolving via /podcasts page...\n", unmatched)
 
 	// Step 2: resolve each Apple feed to its Overcast podcast listing page URL.
 	//

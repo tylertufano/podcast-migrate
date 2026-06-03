@@ -762,6 +762,77 @@ func TestFetchSubscribedPodcasts_ParsesCells(t *testing.T) {
 	}
 }
 
+// --- SubscribeToPodcast ---
+
+const mockPodcastPageSubscribe = `<!DOCTYPE html><html><body>
+<form method="post" action="/itunes1234567890">
+  <input type="hidden" name="feedURL" value="https://feeds.example.com/show">
+  <input type="hidden" name="action" value="subscribe">
+  <button type="submit" class="fullbutton">Subscribe</button>
+</form>
+</body></html>`
+
+const mockPodcastPageAlreadySubscribed = `<!DOCTYPE html><html><body>
+<form method="post" action="/itunes1234567890">
+  <input type="hidden" name="action" value="unsubscribe">
+  <button type="submit" class="fullbutton">Unsubscribe</button>
+</form>
+</body></html>`
+
+func TestSubscribeToPodcast_PostsForm(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/itunes1234567890":
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, mockPodcastPageSubscribe)
+		case r.Method == http.MethodPost && r.URL.Path == "/itunes1234567890":
+			_ = r.ParseForm()
+			gotBody = r.Form.Encode()
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	overcast.SetBaseURLForTest(srv.URL)
+	defer overcast.SetBaseURLForTest("https://overcast.fm")
+
+	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(),
+		srv.URL+"/itunes1234567890")
+	if err != nil {
+		t.Fatalf("SubscribeToPodcast: %v", err)
+	}
+	if !strings.Contains(gotBody, "subscribe") {
+		t.Errorf("POST body should contain subscribe fields, got: %q", gotBody)
+	}
+}
+
+func TestSubscribeToPodcast_AlreadySubscribedIsNoop(t *testing.T) {
+	posted := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posted = true
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, mockPodcastPageAlreadySubscribed)
+	}))
+	defer srv.Close()
+
+	overcast.SetBaseURLForTest(srv.URL)
+	defer overcast.SetBaseURLForTest("https://overcast.fm")
+
+	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(),
+		srv.URL+"/itunes1234567890")
+	if err != nil {
+		t.Fatalf("SubscribeToPodcast (already subscribed): %v", err)
+	}
+	if posted {
+		t.Error("should not POST when already subscribed (unsubscribe form detected)")
+	}
+}
+
 func TestFetchSubscribedPodcasts_Non200ReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)

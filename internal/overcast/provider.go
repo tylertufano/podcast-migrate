@@ -621,16 +621,27 @@ func augmentIndexFromPodcastPages(
 				}
 			}
 		}
+		// needsSubscribe is true when the podcast is not yet in the Overcast account.
+		// We'll subscribe before fetching its episode page so play state writes stick.
+		needsSubscribe := false
 		if !ok {
-			skippedFeeds++
-			continue // not subscribed in Overcast
+			// Not found in the Overcast OPML by feed URL or title.
+			// Use the Apple podcast title to search — if found, subscribe first.
+			appleTitle := feedToTitle[feedURL]
+			if appleTitle == "" || strictFeedMatch {
+				skippedFeeds++
+				continue
+			}
+			info = opmlPodInfo{title: appleTitle}
+			needsSubscribe = true
 		}
 
 		// Try the /podcasts page map first (one request for all podcasts).
+		// Finding a podcast here means it's already subscribed.
 		normInfoTitle := strings.ToLower(strings.TrimSpace(info.title))
 		if pageURL, found := pageURLByNormTitle[normInfoTitle]; found {
 			feedToPageURL[feedURL] = pageURL
-			continue
+			continue // already subscribed — no subscribe step needed
 		}
 		if base := model.NormalizePlusTitle(info.title); base != normInfoTitle {
 			if pageURL, found := pageURLByNormTitle[base]; found {
@@ -639,8 +650,8 @@ func augmentIndexFromPodcastPages(
 			}
 		}
 
-		// Fall back to search_autocomplete if not found in /podcasts results
-		// (e.g. /podcasts fetch failed, or title mismatch between OPML and page).
+		// Fall back to search_autocomplete — covers title mismatches and unsubscribed
+		// podcasts not yet on the /podcasts page.
 		iTunesID, err := searchPodcastITunesIDWithRetry(ctx, client, info.title, info.overcastID, requestDelay)
 		if err != nil {
 			fmt.Printf("  warning: search failed for %q: %v\n", info.title, err)
@@ -648,12 +659,26 @@ func augmentIndexFromPodcastPages(
 			continue
 		}
 		if iTunesID == "" {
-			fmt.Printf("  warning: %q not found in Overcast account or search\n", info.title)
+			fmt.Printf("  warning: %q not found in Overcast search\n", info.title)
 			skippedFeeds++
 			continue
 		}
-		feedToPageURL[feedURL] = overcastBaseURL + "/itunes" + iTunesID
+		pageURL := overcastBaseURL + "/itunes" + iTunesID
 		time.Sleep(requestDelay)
+
+		// Subscribe before writing play state — Overcast discards set_progress calls
+		// for podcasts the account is not subscribed to.
+		if needsSubscribe {
+			fmt.Printf("  subscribing to %q...\n", info.title)
+			if err := SubscribeToPodcast(ctx, client, pageURL); err != nil {
+				fmt.Printf("  warning: could not subscribe to %q: %v — play state may not persist\n",
+					info.title, err)
+			} else {
+				fmt.Printf("  subscribed to %q\n", info.title)
+			}
+			time.Sleep(requestDelay)
+		}
+		feedToPageURL[feedURL] = pageURL
 	}
 
 	// Step 3: for each shared feed, fetch the podcast page and collect

@@ -455,6 +455,105 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]Subscr
 	return podcasts, nil
 }
 
+// subscribeFormRe matches POST forms on an Overcast podcast page.
+//
+//	1. podcast page path used as form action (e.g. "/itunes1234567890")
+//	2. form body HTML (searched for hidden inputs and the subscribe button)
+var subscribeFormRe = regexp.MustCompile(
+	`(?si)<form\b[^>]*\bmethod="[Pp][Oo][Ss][Tt]"[^>]*\baction="(/[^"]+)"[^>]*>(.*?)</form>`)
+
+// hiddenInputTagRe matches a single <input type="hidden"> tag.
+var hiddenInputTagRe = regexp.MustCompile(`(?i)<input\b[^>]*\btype="hidden"[^>]*>`)
+
+// inputAttrNameRe / inputAttrValueRe extract name/value from an input tag.
+var inputAttrNameRe = regexp.MustCompile(`\bname="([^"]+)"`)
+var inputAttrValueRe = regexp.MustCompile(`\bvalue="([^"]*)"`)
+
+// SubscribeToPodcast subscribes to a podcast by locating and posting the subscribe
+// form on its Overcast podcast listing page. It is a no-op (returns nil) when the
+// page shows an unsubscribe option instead, meaning the account is already subscribed.
+//
+// The client must be authenticated (obtained from Login).
+func SubscribeToPodcast(ctx context.Context, client *http.Client, podcastPageURL string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, podcastPageURL, nil)
+	if err != nil {
+		return fmt.Errorf("overcast/web: subscribe page request: %w", err)
+	}
+	req.Header.Set("User-Agent", overcastUA)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("overcast/web: GET %s: %w", podcastPageURL, err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return &RateLimitError{Wait: rateLimitWait(resp, 30*time.Second)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("overcast/web: GET %s returned HTTP %d", podcastPageURL, resp.StatusCode)
+	}
+
+	// Find a POST form whose body contains "subscribe" but not "unsubscribe".
+	// Overcast renders an unsubscribe form when already subscribed — we treat
+	// that as a no-op rather than an error.
+	var formAction string
+	formFields := url.Values{}
+
+	for _, m := range subscribeFormRe.FindAllSubmatch(body, -1) {
+		action := string(m[1])
+		formBody := m[2]
+		bodyLower := strings.ToLower(string(formBody))
+		if strings.Contains(bodyLower, "unsubscribe") {
+			return nil // already subscribed — nothing to do
+		}
+		if !strings.Contains(bodyLower, "subscribe") {
+			continue // unrelated form
+		}
+		// Winning form: extract hidden fields.
+		formAction = action
+		for _, tag := range hiddenInputTagRe.FindAll(formBody, -1) {
+			tagStr := string(tag)
+			nm := inputAttrNameRe.FindStringSubmatch(tagStr)
+			val := inputAttrValueRe.FindStringSubmatch(tagStr)
+			if len(nm) > 1 && len(val) > 1 {
+				formFields.Set(nm[1], htmlpkg.UnescapeString(val[1]))
+			}
+		}
+		break
+	}
+
+	if formAction == "" {
+		return fmt.Errorf("overcast/web: subscribe form not found on %s (page may be JS-rendered or already subscribed)", podcastPageURL)
+	}
+
+	postReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		overcastBaseURL+formAction, strings.NewReader(formFields.Encode()))
+	if err != nil {
+		return fmt.Errorf("overcast/web: build subscribe POST: %w", err)
+	}
+	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postReq.Header.Set("User-Agent", overcastUA)
+	postReq.Header.Set("Referer", podcastPageURL)
+
+	postResp, err := client.Do(postReq)
+	if err != nil {
+		return fmt.Errorf("overcast/web: subscribe POST: %w", err)
+	}
+	_, _ = io.Copy(io.Discard, postResp.Body)
+	_ = postResp.Body.Close()
+
+	if postResp.StatusCode == http.StatusTooManyRequests {
+		return &RateLimitError{Wait: rateLimitWait(postResp, 30*time.Second)}
+	}
+	if postResp.StatusCode >= 400 {
+		return fmt.Errorf("overcast/web: subscribe POST to %s returned HTTP %d",
+			overcastBaseURL+formAction, postResp.StatusCode)
+	}
+	return nil
+}
+
 // PodcastEpisodeListing holds the minimal data for one episode extracted from a podcast page.
 type PodcastEpisodeListing struct {
 	OvercastURL string // "https://overcast.fm/+HASH"

@@ -37,9 +37,11 @@ func migrateCmd() *cobra.Command {
 		logFile                 string   // --log-file (per-episode CSV log)
 		appleBearerToken    string       // --apple-bearer-token / APPLE_BEARER_TOKEN
 		appleMediaUserToken string       // --apple-media-user-token / APPLE_MEDIA_USER_TOKEN
-		strictFeedMatch     bool         // --strict-feed-match
-		forceUpdate         bool         // --force-update
-		subscribedOnly      bool         // --subscribed-only
+		strictFeedMatch     bool          // --strict-feed-match
+		forceUpdate         bool          // --force-update
+		subscribedOnly      bool          // --subscribed-only
+		episodeCacheMaxAge  time.Duration // --episode-cache-max-age
+		clearEpisodeCache   bool          // --clear-episode-cache
 	)
 
 	cmd := &cobra.Command{
@@ -160,6 +162,8 @@ func migrateCmd() *cobra.Command {
 				StrictFeedMatch:         strictFeedMatch,
 				ForceUpdate:             forceUpdate,
 				SubscribedOnly:          subscribedOnly,
+				EpisodeCacheMaxAge:      episodeCacheMaxAge,
+				ClearEpisodeCache:       clearEpisodeCache,
 			}
 
 			if logFile != "" {
@@ -221,6 +225,12 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&strictFeedMatch, "strict-feed-match", false, "only match episodes using feed-URL-anchored strategies (pub date or title + same feed URL); skips cross-feed title fallbacks (strategies 3 and 4)")
 	cmd.Flags().BoolVar(&forceUpdate, "force-update", false, "write source play state even if the destination already shows the episode as played or further along; bypasses the server-state check")
 	cmd.Flags().BoolVar(&subscribedOnly, "subscribed-only", false, "only sync play state for podcasts already subscribed to at the destination; skips search and subscribe for unsubscribed feeds")
+	cmd.Flags().DurationVar(&episodeCacheMaxAge, "episode-cache-max-age", 0,
+		"maximum age of cached Overcast episode numeric IDs; entries older than this are\n"+
+			"re-fetched (e.g. 720h = 30 days); 0 means cached IDs are valid indefinitely")
+	cmd.Flags().BoolVar(&clearEpisodeCache, "clear-episode-cache", false,
+		"discard all cached Overcast episode numeric IDs before syncing and re-fetch\n"+
+			"them from Overcast; the cache is repopulated with fresh data during the run")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")

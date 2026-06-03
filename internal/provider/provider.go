@@ -84,6 +84,18 @@ type WriteOptions struct {
 	// triggering the search-and-subscribe flow. Useful when you want to sync
 	// play state without adding any new subscriptions.
 	SubscribedOnly bool
+
+	// EpisodeCacheMaxAge, when non-zero, treats cached episode numeric IDs older
+	// than this duration as stale and re-fetches them from Overcast. Entries with
+	// no timestamp (migrated from a pre-v0.8.7 cache) are also treated as stale.
+	// A value of 0 (default) means cached entries are valid indefinitely —
+	// Overcast numeric IDs are stable and do not change under normal circumstances.
+	EpisodeCacheMaxAge time.Duration
+
+	// ClearEpisodeCache, when true, discards all cached episode numeric IDs before
+	// the sync and re-fetches them from Overcast. The cache is repopulated with
+	// fresh data during the run. Takes precedence over EpisodeCacheMaxAge.
+	ClearEpisodeCache bool
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

@@ -231,7 +231,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	//    user listened to in Apple but never opened in Overcast). Runs in both
 	//    dry-run and live mode: the page fetches are read-only GETs, so running
 	//    them in dry-run gives an accurate preview of what the live run will do.
-	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch, opts.SubscribedOnly)
+	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch, opts.SubscribedOnly, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
@@ -510,6 +510,8 @@ func augmentIndexFromPodcastPages(
 	feedToTitle map[string]string, // Apple feedURL → lowercased podcast title (for title-based fallback)
 	strictFeedMatch bool,
 	subscribedOnly bool,
+	episodeCacheMaxAge time.Duration,
+	clearEpisodeCache bool,
 ) int {
 	// Build per-feed Apple episode set (only episodes with play state, by feed).
 	appleByFeed := make(map[string][]model.EpisodeState)
@@ -862,10 +864,19 @@ func augmentIndexFromPodcastPages(
 
 	idCache := loadEpisodeIDCache()
 
+	// Honour --clear-episode-cache: wipe all entries before this run.
+	// The cache will be repopulated with fresh data during the run.
+	if clearEpisodeCache {
+		n := idCache.clear()
+		if n > 0 {
+			fmt.Printf("overcast: episode ID cache cleared (%d entries discarded)\n", n)
+		}
+	}
+
 	// Pass A: serve cache hits immediately.
 	cacheHits := 0
 	for _, item := range pending {
-		id := idCache.get(item.episodeURL)
+		id := idCache.get(item.episodeURL, episodeCacheMaxAge)
 		if id == "" {
 			continue
 		}
@@ -877,15 +888,15 @@ func augmentIndexFromPodcastPages(
 		}
 	}
 
-	// Build the miss list (episodes not yet in cache).
+	// Build the miss list (episodes absent from cache or with stale entries).
 	var misses []pendingFetch
 	for _, item := range pending {
-		if idCache.get(item.episodeURL) == "" {
+		if idCache.get(item.episodeURL, episodeCacheMaxAge) == "" {
 			misses = append(misses, item)
 		}
 	}
 
-	if idCache.size() > 0 {
+	if idCache.size() > 0 && !clearEpisodeCache {
 		if cacheHits > 0 {
 			fmt.Printf("overcast: episode ID cache: %d hits (no fetch needed), %d misses\n",
 				cacheHits, len(misses))

@@ -389,14 +389,18 @@ type SubscribedPodcast struct {
 // Attribute order in the <a> tag is unconstrained (href may precede or follow class).
 //
 //	1. attributes before href (checked for "feedcell" class)
-//	2. podcast page path: "/itunes{anything}" or "/p/{anything}"
+//	2. podcast page path
 //	3. attributes after href (checked for "feedcell" class)
 //	4. cell body HTML (searched for the title element)
 //
-// Note: Overcast slugs podcast URLs as /itunes{ID}/{slug} — the path after /itunes
-// is NOT limited to digits; [^"]+ captures the full path up to the closing quote.
+// Two URL formats are used by Overcast:
+//   - iTunes-indexed:  /itunes{ID}/{slug}  e.g. /itunes917918570/serial
+//   - Private/direct:  /p{ID}-{hash}       e.g. /p2537820-KcG3mF
+//
+// The /p format starts with a digit immediately after /p (distinguishing it
+// from /podcasts and other /p... paths on the page).
 var feedCellRe = regexp.MustCompile(
-	`(?s)<a\b([^>]*)\bhref="(/(?:itunes|p/)[^"]+)"([^>]*)>(.*?)</a>`)
+	`(?s)<a\b([^>]*)\bhref="(/(?:itunes[^"]+|p\d[^"]*))\"([^>]*)>(.*?)</a>`)
 
 // cellTitleRe extracts the podcast title from inside a feed cell body.
 // Tries several candidate class names used by Overcast across page variants:

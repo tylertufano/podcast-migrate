@@ -707,21 +707,21 @@ func TestSearchPodcastITunesID_ExactMatchNotAffectedByPlusFallback(t *testing.T)
 // --- FetchSubscribedPodcasts ---
 
 const mockPodcastsPage = `<!DOCTYPE html><html><body>
-<a class="feedcell extendedfeedcell" href="/itunes1200361736/pod-save-america">
+<a class="feedcell" href="/itunes1200361736/pod-save-america">
   <img class="art" src="/art1.jpg">
-  <div class="titleStack">
-    <div class="title2">Pod Save America</div>
+  <div class="titlestack">
+    <div class="title">Pod Save America</div>
     <div class="caption2">Crooked Media</div>
   </div>
 </a>
-<a class="feedcell extendedfeedcell" href="/itunes1200361737/fresh-air">
-  <div class="title2">Fresh Air</div>
+<a class="feedcell" href="/itunes1200361737/fresh-air">
+  <div class="titlestack"><div class="title">Fresh Air</div></div>
 </a>
-<a class="feedcell extendedfeedcell" href="/p/private-rss-slug">
-  <div class="title2">Private Members Show</div>
+<a class="feedcell" href="/p2537820-KcG3mF">
+  <div class="titlestack"><div class="title">Private Members Show</div></div>
 </a>
 <a href="/itunes9999/other" class="someothercell">
-  <div class="title2">Not A Subscription</div>
+  <div class="title">Not A Subscription</div>
 </a>
 </body></html>`
 
@@ -753,8 +753,8 @@ func TestFetchSubscribedPodcasts_ParsesCells(t *testing.T) {
 	if url := byTitle["Pod Save America"]; url != srv.URL+"/itunes1200361736/pod-save-america" {
 		t.Errorf("Pod Save America URL: got %q, want %q", url, srv.URL+"/itunes1200361736/pod-save-america")
 	}
-	if url := byTitle["Private Members Show"]; url != srv.URL+"/p/private-rss-slug" {
-		t.Errorf("Private Members Show URL: got %q, want %q", url, srv.URL+"/p/private-rss-slug")
+	if url := byTitle["Private Members Show"]; url != srv.URL+"/p2537820-KcG3mF" {
+		t.Errorf("Private Members Show URL: got %q, want %q", url, srv.URL+"/p2537820-KcG3mF")
 	}
 	// Non-feedcell link must be excluded.
 	if _, found := byTitle["Not A Subscription"]; found {

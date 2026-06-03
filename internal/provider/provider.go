@@ -77,6 +77,13 @@ type WriteOptions struct {
 	// at or beyond the target state (to avoid redundant writes and rewinding
 	// in-progress positions). Enable this to force a full re-sync.
 	ForceUpdate bool
+
+	// SubscribedOnly, when true, restricts play-state writes to podcasts that
+	// are already subscribed to at the destination. Episodes from podcasts not
+	// found in the destination's subscription list are skipped rather than
+	// triggering the search-and-subscribe flow. Useful when you want to sync
+	// play state without adding any new subscriptions.
+	SubscribedOnly bool
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

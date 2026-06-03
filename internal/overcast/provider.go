@@ -230,7 +230,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	//    user listened to in Apple but never opened in Overcast). Runs in both
 	//    dry-run and live mode: the page fetches are read-only GETs, so running
 	//    them in dry-run gives an accurate preview of what the live run will do.
-	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch)
+	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch, opts.SubscribedOnly)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
@@ -508,6 +508,7 @@ func augmentIndexFromPodcastPages(
 	requestDelay time.Duration,
 	feedToTitle map[string]string, // Apple feedURL → lowercased podcast title (for title-based fallback)
 	strictFeedMatch bool,
+	subscribedOnly bool,
 ) int {
 	// Build per-feed Apple episode set (only episodes with play state, by feed).
 	appleByFeed := make(map[string][]model.EpisodeState)
@@ -624,7 +625,14 @@ func augmentIndexFromPodcastPages(
 			}
 		}
 
-		// Step B: not on /podcasts — fall back to search_autocomplete.
+		// Step B: not on /podcasts — podcast is not subscribed at the destination.
+		// When --subscribed-only is set, skip rather than searching and subscribing.
+		if subscribedOnly {
+			skippedFeeds++
+			continue
+		}
+
+		// Fall back to search_autocomplete, subscribe, then add to page-fetch list.
 		// Use the overcastID from the OPML as a hint to verify the search result
 		// (empty string is fine — search will fall back to title matching).
 		overcastID := ""
@@ -786,7 +794,11 @@ func augmentIndexFromPodcastPages(
 	}
 
 	if skippedFeeds > 0 {
-		fmt.Printf("overcast: extended matching: %d feed(s) not found in Overcast or search (not subscribed / no iTunes ID)\n", skippedFeeds)
+		if subscribedOnly {
+			fmt.Printf("overcast: extended matching: %d feed(s) skipped — not subscribed at destination (--subscribed-only)\n", skippedFeeds)
+		} else {
+			fmt.Printf("overcast: extended matching: %d feed(s) not found in Overcast or search (not subscribed / no iTunes ID)\n", skippedFeeds)
+		}
 	}
 	if len(pending) == 0 {
 		fmt.Printf("overcast: extended matching found no additional episodes\n")

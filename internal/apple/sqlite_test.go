@@ -132,6 +132,11 @@ func setupSQLiteDB(t *testing.T) string {
 	//      Mirrors the real-world case where an episode was played on another device but
 	//      ZPLAYSTATE was never updated (e.g. episode 298 of #SistersInLaw).
 	insertEpisode(9, 1, "rss-guid-9", "Shadow Played", 692000000.0, 3000.0, 0, 1, 0.0, 692100000.0, "STDQ")
+	// ep10: false-positive "played" — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0, ZLASTDATEPLAYED set.
+	//       Apple sets ZLASTDATEPLAYED for non-playback events (queuing, downloading, iCloud
+	//       background sync). Without ZPLAYSTATE or ZPLAYCOUNT corroboration this is not
+	//       evidence of genuine listening; the episode must be excluded from migration.
+	insertEpisode(10, 1, "rss-guid-10", "False Positive Unplayed", 691000000.0, 1800.0, 0, 0, 0.0, 691100000.0, "STDQ")
 
 	return path
 }
@@ -331,8 +336,19 @@ func TestSQLiteReader_CountsIncludedPaywalledEpisodes(t *testing.T) {
 func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	// ep1 (played) + ep2 (in-progress) + ep3 (has position) + ep6 (PSUB) + ep7 (PLUS) + ep9 (shadow played) = 6
+	// ep10 (ZLASTDATEPLAYED-only, no ZPLAYSTATE/ZPLAYCOUNT) is excluded — not genuine playback.
 	if len(lib.Episodes) != 6 {
 		t.Errorf("got %d episodes, want 6 (played + in-progress + has-position + PSUB + PLUS + shadow-played)", len(lib.Episodes))
+	}
+}
+
+func TestSQLiteReader_ZLastDatePlayedAloneExcludesEpisode(t *testing.T) {
+	// ep10: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0, ZLASTDATEPLAYED set.
+	// Apple sets ZLASTDATEPLAYED for non-playback events; without ZPLAYSTATE or
+	// ZPLAYCOUNT this is not evidence of genuine listening and must be excluded.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	if ep := findEpisode(lib, "rss-guid-10"); ep != nil {
+		t.Errorf("episode with only ZLASTDATEPLAYED set should be excluded from library, got PlayState=%d", ep.PlayState)
 	}
 }
 

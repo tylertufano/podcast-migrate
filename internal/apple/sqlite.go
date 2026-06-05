@@ -177,7 +177,9 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			e.ZPUBDATE,
 			e.ZDURATION,
 			e.ZPLAYHEAD,
-			e.ZLASTDATEPLAYED
+			e.ZLASTDATEPLAYED,
+			e.ZPLAYSTATE,
+			e.ZPLAYCOUNT
 		FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
@@ -203,11 +205,14 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			durationSec   sql.NullFloat64
 			playHeadSec   sql.NullFloat64
 			lastPlayedRaw sql.NullFloat64
+			playState     sql.NullInt64
+			playCount     sql.NullInt64
 		)
 		if err := rows.Scan(
 			&guid, &feedURL, &title,
 			&pubDateRaw, &durationSec,
 			&playHeadSec, &lastPlayedRaw,
+			&playState, &playCount,
 		); err != nil {
 			return nil, 0, fmt.Errorf("apple/sqlite: scan episode: %w", err)
 		}
@@ -224,15 +229,26 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		if durationSec.Valid && durationSec.Float64 > 0 {
 			ep.Duration = time.Duration(durationSec.Float64 * float64(time.Second))
 		}
-		if playHeadSec.Valid && playHeadSec.Float64 > 0 {
-			// Non-zero playhead means the episode is partially listened to.
+		switch {
+		case playHeadSec.Valid && playHeadSec.Float64 > 0:
+			// Non-zero playhead: episode is partially listened to.
 			ep.PlayPosition = time.Duration(playHeadSec.Float64 * float64(time.Second))
 			ep.PlayState = model.PlayStateInProgress
-		} else {
-			// No active playhead — episode was played to completion (or marked played).
-			// The WHERE clause guarantees at least one play indicator is set, so this
-			// row represents a listened-to episode even if ZPLAYSTATE happens to be 0.
+		case playState.Valid && playState.Int64 >= 1:
+			// ZPLAYSTATE 1 (in-progress) or 2 (played): app explicitly tracked this
+			// as listened. Use PlayStatePlayed — if there were an active playhead it
+			// would have been caught by the case above.
 			ep.PlayState = model.PlayStatePlayed
+		case playCount.Valid && playCount.Int64 > 0:
+			// Played at least once (possibly on another device). ZPLAYSTATE may not
+			// have synced back to this device yet.
+			ep.PlayState = model.PlayStatePlayed
+		default:
+			// Only ZLASTDATEPLAYED is non-null — insufficient evidence of genuine
+			// playback. Apple sets this field in scenarios that don't represent
+			// listening (e.g. queuing, downloading, background iCloud sync). Skip
+			// this episode entirely; it has no play state worth migrating.
+			continue
 		}
 		if lastPlayedRaw.Valid {
 			ep.LastPlayed = coreDataEpoch.Add(time.Duration(lastPlayedRaw.Float64 * float64(time.Second)))

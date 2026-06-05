@@ -145,6 +145,14 @@ func setupSQLiteDB(t *testing.T) string {
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 2 WHERE Z_PK = 11`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep11: %v", err)
 	}
+	// ep12: played episode on an UNSUBSCRIBED podcast (pk=4, ZSUBSCRIBED=0).
+	//       Episodes from podcasts the user is no longer subscribed to must not be
+	//       included — they have no Overcast counterpart to write to and produce
+	//       empty podcast names and not_found results in the migration log.
+	insertEpisode(12, 4, "rss-guid-12", "Unsubscribed Podcast Episode", 689000000.0, 1800.0, 2, 0, 0.0, 689100000.0, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 12`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep12: %v", err)
+	}
 
 	return path
 }
@@ -368,6 +376,17 @@ func TestSQLiteReader_AutoMarkedEpisodeExcluded(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if ep := findEpisode(lib, "rss-guid-11"); ep != nil {
 		t.Errorf("auto-marked episode (ZPLAYSTATESOURCE=2, no ZLASTDATEPLAYED) should be excluded, got PlayState=%d", ep.PlayState)
+	}
+}
+
+func TestSQLiteReader_UnsubscribedPodcastEpisodesExcluded(t *testing.T) {
+	// ep12: played episode on podcast pk=4 (ZSUBSCRIBED=0).
+	// Episodes from podcasts the user is not currently subscribed to must be
+	// excluded — they have no Overcast subscription to write to and produce
+	// empty podcast names and not_found results in the migration log.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	if ep := findEpisode(lib, "rss-guid-12"); ep != nil {
+		t.Errorf("episode from unsubscribed podcast should be excluded, got PlayState=%d", ep.PlayState)
 	}
 }
 

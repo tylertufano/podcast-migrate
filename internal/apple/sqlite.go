@@ -185,6 +185,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
 		  AND e.ZGUID IS NOT NULL
+		  AND p.ZSUBSCRIBED = 1
 		  AND p.ZFEEDURL IS NOT NULL
 		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
 		  AND p.ZFEEDURL NOT LIKE 'internal://%'
@@ -288,6 +289,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
 		  AND e.ZGUID IS NOT NULL
+		  AND p.ZSUBSCRIBED = 1
 		  AND p.ZFEEDURL IS NOT NULL
 		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
 		  AND p.ZFEEDURL NOT LIKE 'internal://%'

@@ -137,6 +137,14 @@ func setupSQLiteDB(t *testing.T) string {
 	//       background sync). Without ZPLAYSTATE or ZPLAYCOUNT corroboration this is not
 	//       evidence of genuine listening; the episode must be excluded from migration.
 	insertEpisode(10, 1, "rss-guid-10", "False Positive Unplayed", 691000000.0, 1800.0, 0, 0, 0.0, 691100000.0, "STDQ")
+	// ep11: auto-marked as played (ZPLAYSTATESOURCE=2) — ZPLAYSTATE=2, ZPLAYHEAD=0,
+	//       ZLASTDATEPLAYED=NULL. Apple sets ZPLAYSTATESOURCE=2 when a new episode
+	//       arrives for a daily/news show and the previous one was never listened to.
+	//       Must be excluded from migration (not genuine playback).
+	insertEpisode(11, 1, "rss-guid-11", "Auto-Marked Played", 690000000.0, 1800.0, 2, 0, 0.0, nil, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 2 WHERE Z_PK = 11`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep11: %v", err)
+	}
 
 	return path
 }
@@ -349,6 +357,17 @@ func TestSQLiteReader_ZLastDatePlayedAloneExcludesEpisode(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if ep := findEpisode(lib, "rss-guid-10"); ep != nil {
 		t.Errorf("episode with only ZLASTDATEPLAYED set should be excluded from library, got PlayState=%d", ep.PlayState)
+	}
+}
+
+func TestSQLiteReader_AutoMarkedEpisodeExcluded(t *testing.T) {
+	// ep11: ZPLAYSTATE=2, ZPLAYSTATESOURCE=2, ZPLAYHEAD=0, ZLASTDATEPLAYED=NULL.
+	// Apple sets ZPLAYSTATESOURCE=2 when a new episode arrives for a daily/news show
+	// and auto-marks the previous one as played — the user never listened.
+	// Such episodes must not be migrated as played.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	if ep := findEpisode(lib, "rss-guid-11"); ep != nil {
+		t.Errorf("auto-marked episode (ZPLAYSTATESOURCE=2, no ZLASTDATEPLAYED) should be excluded, got PlayState=%d", ep.PlayState)
 	}
 }
 

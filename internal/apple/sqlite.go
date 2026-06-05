@@ -179,7 +179,8 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			e.ZPLAYHEAD,
 			e.ZLASTDATEPLAYED,
 			e.ZPLAYSTATE,
-			e.ZPLAYCOUNT
+			e.ZPLAYCOUNT,
+			e.ZPLAYSTATESOURCE
 		FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
@@ -198,21 +199,23 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 	var out []model.EpisodeState
 	for rows.Next() {
 		var (
-			guid          string
-			feedURL       string
-			title         string
-			pubDateRaw    sql.NullFloat64
-			durationSec   sql.NullFloat64
-			playHeadSec   sql.NullFloat64
-			lastPlayedRaw sql.NullFloat64
-			playState     sql.NullInt64
-			playCount     sql.NullInt64
+			guid            string
+			feedURL         string
+			title           string
+			pubDateRaw      sql.NullFloat64
+			durationSec     sql.NullFloat64
+			playHeadSec     sql.NullFloat64
+			lastPlayedRaw   sql.NullFloat64
+			playState       sql.NullInt64
+			playCount       sql.NullInt64
+			playStateSource sql.NullInt64
 		)
 		if err := rows.Scan(
 			&guid, &feedURL, &title,
 			&pubDateRaw, &durationSec,
 			&playHeadSec, &lastPlayedRaw,
 			&playState, &playCount,
+			&playStateSource,
 		); err != nil {
 			return nil, 0, fmt.Errorf("apple/sqlite: scan episode: %w", err)
 		}
@@ -229,25 +232,42 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		if durationSec.Valid && durationSec.Float64 > 0 {
 			ep.Duration = time.Duration(durationSec.Float64 * float64(time.Second))
 		}
+		// trustedPlayed reports whether a ZPLAYSTATE=2 row represents genuine
+		// listening rather than Apple's automatic "mark as played" behaviour.
+		//
+		// Apple sets ZPLAYSTATESOURCE to indicate why an episode was marked played:
+		//   3 — listened to completion on this device
+		//   4 — synced from another device that had it as played
+		//   1 — manually marked by the user in the UI
+		//   2 — auto-marked when a newer episode arrived (daily/news shows, not listened)
+		//   6 — default/initial state; also used for auto-marks with no play record
+		//
+		// ZPLAYSTATESOURCE=2 and =6 rows always have ZLASTDATEPLAYED=NULL and
+		// ZPLAYHEAD=0, confirming they were never actually listened to. We treat
+		// them as unplayed rather than migrating them as played.
+		//
+		// Fallback: any row with ZLASTDATEPLAYED set is trusted regardless of
+		// ZPLAYSTATESOURCE — a recorded play timestamp is independent evidence.
+		trustedPlayed := playState.Valid && playState.Int64 == 2 &&
+			(playStateSource.Int64 == 3 || playStateSource.Int64 == 4 || lastPlayedRaw.Valid)
+
 		switch {
 		case playHeadSec.Valid && playHeadSec.Float64 > 0:
 			// Non-zero playhead: episode is partially listened to.
 			ep.PlayPosition = time.Duration(playHeadSec.Float64 * float64(time.Second))
 			ep.PlayState = model.PlayStateInProgress
-		case playState.Valid && playState.Int64 >= 1:
-			// ZPLAYSTATE 1 (in-progress) or 2 (played): app explicitly tracked this
-			// as listened. Use PlayStatePlayed — if there were an active playhead it
-			// would have been caught by the case above.
+		case trustedPlayed:
+			ep.PlayState = model.PlayStatePlayed
+		case playState.Valid && playState.Int64 == 1:
+			// ZPLAYSTATE=1 (in-progress) without a stored playhead — app explicitly
+			// set the episode as started; treat as played rather than silently dropping.
 			ep.PlayState = model.PlayStatePlayed
 		case playCount.Valid && playCount.Int64 > 0:
-			// Played at least once (possibly on another device). ZPLAYSTATE may not
-			// have synced back to this device yet.
+			// Played at least once (possibly on another device before iCloud sync
+			// back-filled ZPLAYSTATE). Rare with modern sync but kept as a fallback.
 			ep.PlayState = model.PlayStatePlayed
 		default:
-			// Only ZLASTDATEPLAYED is non-null — insufficient evidence of genuine
-			// playback. Apple sets this field in scenarios that don't represent
-			// listening (e.g. queuing, downloading, background iCloud sync). Skip
-			// this episode entirely; it has no play state worth migrating.
+			// No reliable evidence of genuine playback; skip this episode.
 			continue
 		}
 		if lastPlayedRaw.Valid {

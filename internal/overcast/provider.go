@@ -520,6 +520,11 @@ func augmentIndexFromPodcastPages(
 	episodeCacheMaxAge time.Duration,
 	clearEpisodeCache bool,
 ) int {
+	// Guard against a zero/negative delay — callers such as tests may pass 0.
+	if requestDelay <= 0 {
+		requestDelay = DefaultRequestDelay
+	}
+
 	// Build per-feed Apple episode set (only episodes with play state, by feed).
 	appleByFeed := make(map[string][]model.EpisodeState)
 	for _, ep := range episodes {
@@ -854,8 +859,10 @@ func augmentIndexFromPodcastPages(
 		}
 	}
 	if len(pending) == 0 {
-		fmt.Printf("overcast: extended matching found no additional episodes\n")
-		return 0
+		if added == 0 {
+			fmt.Printf("overcast: extended matching found no additional episodes\n")
+		}
+		return added
 	}
 
 	// Step 4: resolve hashes → numeric IDs.
@@ -943,6 +950,13 @@ func augmentIndexFromPodcastPages(
 	fetchCtx, cancelFetch := context.WithCancel(ctx)
 	defer cancelFetch()
 
+	// Rate limiter: one request per requestDelay across all workers.
+	// Episode-page GETs are serialised at the same cadence as listing-page
+	// fetches in step 3 to avoid triggering Overcast's rate limiter, which
+	// can lock out access for many hours once tripped.
+	rateTicker := time.NewTicker(requestDelay)
+	defer rateTicker.Stop()
+
 	for _, item := range misses {
 		item := item // capture loop variable
 		wg.Add(1)
@@ -971,6 +985,17 @@ func augmentIndexFromPodcastPages(
 						return
 					case <-time.After(wait):
 					}
+				}
+
+				// Acquire a rate-limit slot before every HTTP request — including
+				// retries. This serialises all concurrent workers to one request
+				// per requestDelay, matching the pacing of step 3's listing-page
+				// fetches and avoiding Overcast's long-duration rate-limit lockout.
+				select {
+				case <-rateTicker.C:
+				case <-fetchCtx.Done():
+					results <- fetchResult{key, ""}
+					return
 				}
 
 				id, err := FetchEpisodeNumericID(fetchCtx, client, item.episodeURL)

@@ -42,7 +42,13 @@ type episodeIDCache struct {
 // loadEpisodeIDCache reads the cache from disk and returns it. If the file does
 // not exist or cannot be parsed, an empty cache is returned.
 func loadEpisodeIDCache() *episodeIDCache {
-	path := episodeIDCachePath()
+	return loadFromPath(episodeIDCachePath())
+}
+
+// loadFromPath reads the cache from an arbitrary file path. This exists as a
+// separate function so tests can supply a temp-dir path without touching the
+// real user cache directory.
+func loadFromPath(path string) *episodeIDCache {
 	c := &episodeIDCache{path: path, items: make(map[string]episodeCacheEntry)}
 
 	data, err := os.ReadFile(path)
@@ -69,8 +75,20 @@ func loadEpisodeIDCache() *episodeIDCache {
 	return c
 }
 
+// episodeCacheTestPath, when non-empty, overrides the default cache path.
+// Only set via setEpisodeCachePathForTest; never in production code.
+var episodeCacheTestPath string
+
+// setEpisodeCachePathForTest redirects the episode ID cache to path so that
+// tests can use a temp directory instead of the real user cache. Reset to ""
+// to restore the default behaviour.
+func setEpisodeCachePathForTest(path string) { episodeCacheTestPath = path }
+
 // episodeIDCachePath returns the absolute path of the cache file.
 func episodeIDCachePath() string {
+	if episodeCacheTestPath != "" {
+		return episodeCacheTestPath
+	}
 	dir, err := os.UserCacheDir()
 	if err != nil {
 		return filepath.Join(os.TempDir(), "podcast-migrate-overcast-episode-ids.json")

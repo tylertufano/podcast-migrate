@@ -847,3 +847,172 @@ func TestFetchSubscribedPodcasts_Non200ReturnsError(t *testing.T) {
 		t.Fatal("expected error for non-200 response")
 	}
 }
+
+// ---- Rate-limit (429) tests for exported web functions ----
+
+func TestFetchEpisodeNumericID_RateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "10")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	_, err := overcast.FetchEpisodeNumericID(context.Background(), client, srv.URL+"/+ep_rl")
+	if err == nil {
+		t.Fatal("expected error for 429, got nil")
+	}
+	rl, ok := err.(*overcast.RateLimitError)
+	if !ok {
+		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
+	}
+	if rl.Wait != 10*time.Second {
+		t.Errorf("Wait: got %v, want 10s", rl.Wait)
+	}
+}
+
+func TestFetchEpisodeNumericID_FallbackToSetProgressURL(t *testing.T) {
+	// Page has no data-item-id attribute, but contains a set_progress URL.
+	// The fallback regex should extract the numeric ID from the URL.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<html><body>
+<a href="/podcasts/set_progress/555777">Play</a>
+</body></html>`))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	id, err := overcast.FetchEpisodeNumericID(context.Background(), client, srv.URL+"/+fallback")
+	if err != nil {
+		t.Fatalf("FetchEpisodeNumericID (set_progress fallback): %v", err)
+	}
+	if id != "555777" {
+		t.Errorf("id: got %q, want %q", id, "555777")
+	}
+}
+
+func TestFetchSubscribedPodcasts_RateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	overcast.SetBaseURLForTest(srv.URL)
+	defer overcast.SetBaseURLForTest("https://overcast.fm")
+
+	_, err := overcast.FetchSubscribedPodcasts(context.Background(), srv.Client())
+	if err == nil {
+		t.Fatal("expected RateLimitError for 429, got nil")
+	}
+	rl, ok := err.(*overcast.RateLimitError)
+	if !ok {
+		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
+	}
+	if rl.Wait != 30*time.Second {
+		t.Errorf("Wait: got %v, want 30s", rl.Wait)
+	}
+}
+
+func TestFetchExtendedOPML_RateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	_, err := overcast.FetchExtendedOPML(context.Background(), client)
+	if err == nil {
+		t.Fatal("expected RateLimitError for 429, got nil")
+	}
+	rl, ok := err.(*overcast.RateLimitError)
+	if !ok {
+		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
+	}
+	if rl.Wait != 60*time.Second {
+		t.Errorf("Wait: got %v, want 60s", rl.Wait)
+	}
+}
+
+func TestFetchPodcastEpisodes_RateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	_, err := overcast.FetchPodcastEpisodes(context.Background(), client, srv.URL+"/itunes999/test")
+	if err == nil {
+		t.Fatal("expected RateLimitError for 429, got nil")
+	}
+	rl, ok := err.(*overcast.RateLimitError)
+	if !ok {
+		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
+	}
+	if rl.Wait != 5*time.Second {
+		t.Errorf("Wait: got %v, want 5s", rl.Wait)
+	}
+}
+
+func TestSubscribeToPodcast_GetError(t *testing.T) {
+	// GET fails with a non-200 status → error returned.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	overcast.SetBaseURLForTest(srv.URL)
+	defer overcast.SetBaseURLForTest("https://overcast.fm")
+
+	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(), srv.URL+"/itunes999")
+	if err == nil {
+		t.Error("expected error when GET returns 404, got nil")
+	}
+}
+
+func TestSubscribeToPodcast_NoFormFound(t *testing.T) {
+	// Page exists but has no subscribe form → error returned.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<html><body><p>No form here</p></body></html>`))
+	}))
+	defer srv.Close()
+
+	overcast.SetBaseURLForTest(srv.URL)
+	defer overcast.SetBaseURLForTest("https://overcast.fm")
+
+	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(), srv.URL+"/itunes999")
+	if err == nil {
+		t.Error("expected error when subscribe form not found, got nil")
+	}
+}
+
+func TestFetchPodcastEpisodes_NumericIDInCellAttrs(t *testing.T) {
+	// Episode cell carries data-item-id — should be captured as NumericID.
+	const pageWithID = `<!DOCTYPE html><html><body>
+<a class="extendedepisodecell" data-item-id="777" href="/+HASHX">
+  <div>Ep With ID<span class="caption2">Jun 15, 2024 • 30 min</span></div>
+</a>
+</body></html>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(pageWithID))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{target: srv.URL}}
+	listings, err := overcast.FetchPodcastEpisodes(context.Background(), client, srv.URL+"/itunes12345/test")
+	if err != nil {
+		t.Fatalf("FetchPodcastEpisodes: %v", err)
+	}
+	if len(listings) != 1 {
+		t.Fatalf("got %d listings, want 1", len(listings))
+	}
+	if listings[0].NumericID != "777" {
+		t.Errorf("NumericID: got %q, want %q", listings[0].NumericID, "777")
+	}
+}

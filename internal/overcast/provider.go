@@ -1010,7 +1010,17 @@ func augmentIndexFromPodcastPages(
 						}
 						continue // retry after Retry-After delay
 					}
-					// Non-rate-limit error: log the first few and abort if persistent.
+					// 5xx / network-level transient error — retry with the
+					// exponential backoff already applied at the top of the loop
+					// (30 s, 60 s, 120 s for attempts 1-3).
+					var te *TransientError
+					if errors.As(err, &te) {
+						if attempt < maxFetchRetries-1 {
+							fmt.Printf("  transient error fetching %s (%v) — will retry\n", item.episodeURL, err)
+						}
+						continue
+					}
+					// Permanent error: log the first few and abort if persistent.
 					errMu.Lock()
 					errCount++
 					n := errCount

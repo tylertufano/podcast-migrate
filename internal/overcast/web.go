@@ -170,6 +170,11 @@ func FetchEpisodeNumericID(ctx context.Context, client *http.Client, episodeURL 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return "", &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
 	}
+	if resp.StatusCode >= 500 {
+		// 5xx responses are transient — the server or a proxy is temporarily
+		// unavailable. Wrap as TransientError so callers can retry with backoff.
+		return "", &TransientError{cause: fmt.Errorf("overcast/web: GET %s returned HTTP %d", episodeURL, resp.StatusCode)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("overcast/web: GET %s returned HTTP %d", episodeURL, resp.StatusCode)
 	}

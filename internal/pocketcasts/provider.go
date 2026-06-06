@@ -83,10 +83,9 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 		}
 		podUUIDToFeedURL[ap.UUID] = ap.URL
 		podcasts = append(podcasts, model.Podcast{
-			FeedURL:  ap.URL,
-			Title:    ap.Title,
-			Author:   ap.Author,
-			ImageURL: ap.ThumbnailURL,
+			FeedURL: ap.URL,
+			Title:   ap.Title,
+			Author:  ap.Author,
 		})
 	}
 	fmt.Printf("pocketcasts: %d subscribed podcast(s)\n", len(podcasts))
@@ -275,29 +274,24 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			}
 			podTitle := normFeedToPodTitle[normFeed]
 
-			fetched := 0
-			for page := 1; page <= maxPhaseBPagesPerPodcast; page++ {
-				pageEps, total, err := fetchPodcastEpisodesWithRetry(ctx, client, podUUID, page, requestDelay)
+			for page := 0; page < maxPhaseBPagesPerPodcast; page++ {
+				pageEps, hasMore, err := fetchPodcastEpisodesWithRetry(ctx, client, podUUID, page, requestDelay)
 				if err != nil {
 					fmt.Printf("  warning: could not fetch episodes for %q (page %d): %v\n", podTitle, page, err)
 					break
 				}
 
 				beforeAdd := len(index)
+				feedURL := podUUIDToFeedURL[podUUID]
 				for _, ep := range pageEps {
-					feedURL := podUUIDToFeedURL[ep.PodcastUUID]
-					if feedURL == "" {
-						feedURL = podUUIDToFeedURL[podUUID]
-					}
 					if feedURL == "" || ep.IsDeleted {
 						continue
 					}
 					addToIndex(index, &ep, feedURL)
 				}
 				added += len(index) - beforeAdd
-				fetched += len(pageEps)
 
-				if fetched >= total {
+				if !hasMore {
 					break // all pages exhausted
 				}
 				time.Sleep(requestDelay)
@@ -600,7 +594,7 @@ func pcPlayingStatusToModel(status int) model.PlayState {
 // fetchPodcastEpisodesWithRetry calls FetchPodcastEpisodes with retry on
 // rate-limit (429) responses. Up to 4 attempts with exponential back-off.
 func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client,
-	podcastUUID string, page int, requestDelay time.Duration) ([]APIEpisode, int, error) {
+	podcastUUID string, page int, requestDelay time.Duration) ([]APIEpisode, bool, error) {
 
 	const maxAttempts = 4
 	var lastErr error
@@ -611,14 +605,14 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client,
 				page, wait, attempt+1, maxAttempts)
 			select {
 			case <-ctx.Done():
-				return nil, 0, ctx.Err()
+				return nil, false, ctx.Err()
 			case <-time.After(wait):
 			}
 		}
 
-		eps, total, err := FetchPodcastEpisodes(ctx, client, podcastUUID, page)
+		eps, hasMore, err := FetchPodcastEpisodes(ctx, client, podcastUUID, page)
 		if err == nil {
-			return eps, total, nil
+			return eps, hasMore, nil
 		}
 
 		var rl *RateLimitError
@@ -628,16 +622,16 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client,
 				fmt.Printf("  rate limited — waiting %v...\n", wait)
 				select {
 				case <-ctx.Done():
-					return nil, 0, ctx.Err()
+					return nil, false, ctx.Err()
 				case <-time.After(wait):
 				}
 			}
 			lastErr = err
 			continue
 		}
-		return nil, 0, err // non-rate-limit error: give up immediately
+		return nil, false, err // non-rate-limit error: give up immediately
 	}
-	return nil, 0, lastErr
+	return nil, false, lastErr
 }
 
 // ---- Helpers shared with the write path ----

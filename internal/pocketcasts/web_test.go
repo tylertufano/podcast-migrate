@@ -6,43 +6,39 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/pocketcasts"
 )
 
-// newTestServer returns a test server with the given handler and sets the
-// package base URL to point at it. The caller must call restore() when done.
-func newTestServer(t *testing.T, handler http.Handler) (client *http.Client, restore func()) {
+// newTestServer creates an httptest.Server with the given mux, points both
+// pcBaseURL and pcCacheURL at it, and returns a restore func. The caller must
+// defer the restore func to reset the URLs and close the server.
+func newTestServer(t *testing.T, mux *http.ServeMux) func() {
 	t.Helper()
-	srv := httptest.NewServer(handler)
+	srv := httptest.NewServer(mux)
 	pocketcasts.SetBaseURLForTest(srv.URL)
-	return srv.Client(), func() {
+	pocketcasts.SetCacheURLForTest(srv.URL)
+	return func() {
 		srv.Close()
-		pocketcasts.SetBaseURLForTest("https://play.pocketcasts.com")
+		pocketcasts.SetBaseURLForTest("https://api.pocketcasts.com")
+		pocketcasts.SetCacheURLForTest("https://cache.pocketcasts.com")
 	}
 }
 
-// loginServer returns a handler that serves a successful login (sets a cookie)
-// and delegates all other requests to next.
-func loginServer(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/users/sign_in" {
-			http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "testsession", Path: "/"})
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if next != nil {
-			next.ServeHTTP(w, r)
-		}
-	})
+// loginHandler is an http.HandlerFunc that simulates a successful Pocket Casts
+// login by returning a JSON Bearer token response.
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"token":"test-token","uuid":"test-uuid"}`))
 }
 
-// authedClient returns an http.Client that has already authenticated against
-// the currently-configured test server (pcBaseURL must already be set via
-// newTestServer before calling this). The /users/sign_in handler must be
-// registered on the active test server.
+// authedClient calls Login against the currently-active test server and returns
+// the resulting *http.Client (which injects "Authorization: Bearer test-token"
+// on every request). The /user/login route must be registered on the active
+// test server before calling this.
 func authedClient(t *testing.T) *http.Client {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -58,14 +54,23 @@ func authedClient(t *testing.T) *http.Client {
 
 func TestLogin_Success(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("Login: expected POST, got %s", r.Method)
 		}
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok123", Path: "/"})
-		w.WriteHeader(http.StatusOK)
+		var body struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+			Scope    string `json:"scope"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Scope != "webplayer" {
+			t.Errorf("Login: scope = %q, want webplayer", body.Scope)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"token":"tok123","uuid":"user-1"}`))
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
 	ctx := context.Background()
@@ -80,12 +85,11 @@ func TestLogin_Success(t *testing.T) {
 
 func TestLogin_InvalidCredentials(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		// No cookie — invalid credentials: response contains error text
-		_, _ = w.Write([]byte("Invalid email or password"))
+	mux.HandleFunc("/user/login", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"invalid credentials"}`))
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
 	ctx := context.Background()
@@ -95,19 +99,20 @@ func TestLogin_InvalidCredentials(t *testing.T) {
 	}
 }
 
-func TestLogin_NoCookie_ReturnsError(t *testing.T) {
+func TestLogin_NoToken_ReturnsError(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		// Return 200 but no cookie — simulates a broken login flow.
-		w.WriteHeader(http.StatusOK)
+	mux.HandleFunc("/user/login", func(w http.ResponseWriter, r *http.Request) {
+		// HTTP 200 but no token field — simulates a broken login response.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"uuid":"user-1"}`))
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
 	ctx := context.Background()
 	_, err := pocketcasts.Login(ctx, "user@example.com", "pass")
 	if err == nil {
-		t.Fatal("Login with no cookie: expected error, got nil")
+		t.Fatal("Login with no token: expected error, got nil")
 	}
 }
 
@@ -115,13 +120,15 @@ func TestLogin_NoCookie_ReturnsError(t *testing.T) {
 
 func TestFetchSubscribedPodcasts_ReturnsPodcasts(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/podcasts/all.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/podcast/list", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("FetchSubscribedPodcasts: expected POST, got %s", r.Method)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if v, _ := body["v"].(float64); v != 1 {
+			t.Errorf("FetchSubscribedPodcasts: body[v] = %v, want 1", body["v"])
 		}
 		payload := map[string]any{
 			"podcasts": []map[string]any{
@@ -132,7 +139,7 @@ func TestFetchSubscribedPodcasts_ReturnsPodcasts(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(payload)
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
 	ctx := context.Background()
@@ -146,7 +153,7 @@ func TestFetchSubscribedPodcasts_ReturnsPodcasts(t *testing.T) {
 		t.Fatalf("FetchSubscribedPodcasts: got %d podcasts, want 2", len(pods))
 	}
 	if pods[0].UUID != "pod1" {
-		t.Errorf("pods[0].UUID = %q, want %q", pods[0].UUID, "pod1")
+		t.Errorf("pods[0].UUID = %q, want pod1", pods[0].UUID)
 	}
 	if pods[0].URL != "https://feeds.example.com/test" {
 		t.Errorf("pods[0].URL = %q, want RSS feed URL", pods[0].URL)
@@ -155,21 +162,16 @@ func TestFetchSubscribedPodcasts_ReturnsPodcasts(t *testing.T) {
 
 func TestFetchSubscribedPodcasts_Empty(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/podcasts/all.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/podcast/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"podcasts":[]}`))
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	pods, err := pocketcasts.FetchSubscribedPodcasts(ctx, client)
+	pods, err := pocketcasts.FetchSubscribedPodcasts(context.Background(), client)
 	if err != nil {
 		t.Fatalf("FetchSubscribedPodcasts empty: %v", err)
 	}
@@ -180,21 +182,16 @@ func TestFetchSubscribedPodcasts_Empty(t *testing.T) {
 
 func TestFetchSubscribedPodcasts_RateLimit(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/podcasts/all.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/podcast/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "30")
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	_, err := pocketcasts.FetchSubscribedPodcasts(ctx, client)
+	_, err := pocketcasts.FetchSubscribedPodcasts(context.Background(), client)
 	var rl *pocketcasts.RateLimitError
 	if !isRateLimitError(err, &rl) {
 		t.Fatalf("expected RateLimitError, got: %v", err)
@@ -208,11 +205,11 @@ func TestFetchSubscribedPodcasts_RateLimit(t *testing.T) {
 
 func TestFetchInProgressEpisodes_ReturnsEpisodes(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/episodes/in_progress_episodes.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/in_progress", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("FetchInProgressEpisodes: expected POST, got %s", r.Method)
+		}
 		payload := map[string]any{
 			"episodes": []map[string]any{
 				{
@@ -220,7 +217,7 @@ func TestFetchInProgressEpisodes_ReturnsEpisodes(t *testing.T) {
 					"podcast_uuid":   "pod1",
 					"title":          "Episode One",
 					"url":            "https://cdn.example.com/ep1.mp3",
-					"published_at":   "2024-03-15 10:00:00",
+					"published_at":   "2024-03-15T10:00:00Z",
 					"duration":       3600,
 					"playing_status": 2,
 					"played_up_to":   900,
@@ -232,13 +229,11 @@ func TestFetchInProgressEpisodes_ReturnsEpisodes(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(payload)
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	eps, err := pocketcasts.FetchInProgressEpisodes(ctx, client)
+	eps, err := pocketcasts.FetchInProgressEpisodes(context.Background(), client)
 	if err != nil {
 		t.Fatalf("FetchInProgressEpisodes: %v", err)
 	}
@@ -247,7 +242,7 @@ func TestFetchInProgressEpisodes_ReturnsEpisodes(t *testing.T) {
 	}
 	ep := eps[0]
 	if ep.UUID != "ep-uuid-1" {
-		t.Errorf("UUID = %q, want %q", ep.UUID, "ep-uuid-1")
+		t.Errorf("UUID = %q, want ep-uuid-1", ep.UUID)
 	}
 	if ep.PlayedUpTo != 900 {
 		t.Errorf("PlayedUpTo = %d, want 900", ep.PlayedUpTo)
@@ -266,48 +261,41 @@ func TestFetchInProgressEpisodes_ReturnsEpisodes(t *testing.T) {
 
 func TestFetchPodcastEpisodes_SinglePage(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/episodes/find_by_podcast.json", func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			t.Errorf("ParseForm: %v", err)
+	mux.HandleFunc("/user/login", loginHandler)
+	// Cache CDN endpoint: GET /podcast/full/{uuid}/{page}/3/1000
+	mux.HandleFunc("/podcast/full/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("FetchPodcastEpisodes: expected GET, got %s", r.Method)
 		}
-		if r.FormValue("uuid") != "pod-abc" {
-			t.Errorf("uuid = %q, want %q", r.FormValue("uuid"), "pod-abc")
-		}
-		if r.FormValue("page") != "1" {
-			t.Errorf("page = %q, want %q", r.FormValue("page"), "1")
+		// /podcast/full/pod-abc/0/3/1000
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/podcast/full/"), "/")
+		if len(parts) < 1 || parts[0] != "pod-abc" {
+			t.Errorf("unexpected path UUID in %s", r.URL.Path)
 		}
 		payload := map[string]any{
-			"result": map[string]any{
-				"total": 2,
+			"podcast": map[string]any{
+				"uuid": "pod-abc",
 				"episodes": []map[string]any{
-					{"uuid": "ep1", "podcast_uuid": "pod-abc", "title": "Ep 1",
-						"published_at": "2024-01-10 08:00:00", "duration": 1800,
-						"playing_status": 3, "played_up_to": 1800},
-					{"uuid": "ep2", "podcast_uuid": "pod-abc", "title": "Ep 2",
-						"published_at": "2024-01-03 08:00:00", "duration": 2400,
-						"playing_status": 0, "played_up_to": 0},
+					{"uuid": "ep1", "title": "Ep 1", "published": "2024-01-10T08:00:00Z", "duration": 1800},
+					{"uuid": "ep2", "title": "Ep 2", "published": "2024-01-03T08:00:00Z", "duration": 2400},
 				},
 			},
+			"has_more_episodes": false,
+			"episode_count":     2,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(payload)
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	eps, total, err := pocketcasts.FetchPodcastEpisodes(ctx, client, "pod-abc", 1)
+	eps, hasMore, err := pocketcasts.FetchPodcastEpisodes(context.Background(), client, "pod-abc", 0)
 	if err != nil {
 		t.Fatalf("FetchPodcastEpisodes: %v", err)
 	}
-	if total != 2 {
-		t.Errorf("total = %d, want 2", total)
+	if hasMore {
+		t.Errorf("hasMore = true, want false")
 	}
 	if len(eps) != 2 {
 		t.Fatalf("len(eps) = %d, want 2", len(eps))
@@ -315,45 +303,78 @@ func TestFetchPodcastEpisodes_SinglePage(t *testing.T) {
 	if eps[0].UUID != "ep1" {
 		t.Errorf("eps[0].UUID = %q, want ep1", eps[0].UUID)
 	}
+	// PodcastUUID is injected from the request parameter, not the response body.
+	if eps[0].PodcastUUID != "pod-abc" {
+		t.Errorf("eps[0].PodcastUUID = %q, want pod-abc", eps[0].PodcastUUID)
+	}
+	// Cache CDN has no play state — expect unplayed.
+	if eps[0].PlayingStatus != pocketcasts.PlayingUnplayed {
+		t.Errorf("eps[0].PlayingStatus = %d, want %d (unplayed)", eps[0].PlayingStatus, pocketcasts.PlayingUnplayed)
+	}
+}
+
+func TestFetchPodcastEpisodes_HasMore(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/podcast/full/", func(w http.ResponseWriter, r *http.Request) {
+		payload := map[string]any{
+			"podcast": map[string]any{
+				"uuid": "pod-xyz",
+				"episodes": []map[string]any{
+					{"uuid": "ep1", "title": "Ep 1", "published": "2024-01-10T08:00:00Z", "duration": 1800},
+				},
+			},
+			"has_more_episodes": true, // more pages exist
+			"episode_count":     500,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(payload)
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	client := authedClient(t)
+	_, hasMore, err := pocketcasts.FetchPodcastEpisodes(context.Background(), client, "pod-xyz", 0)
+	if err != nil {
+		t.Fatalf("FetchPodcastEpisodes: %v", err)
+	}
+	if !hasMore {
+		t.Error("hasMore = false, want true")
+	}
 }
 
 // ---- UpdateEpisodeProgress ----
 
 func TestUpdateEpisodeProgress_Played(t *testing.T) {
-	var gotUUID, gotPodUUID string
-	var gotStatus, gotPlayedUpTo, gotDuration int
+	var gotUUID, gotPodcast string
+	var gotStatus, gotPosition int
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/episodes/update_episode_position.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/sync/update_episode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("UpdateEpisodeProgress: expected POST, got %s", r.Method)
+		}
 		var body struct {
-			UUID          string `json:"uuid"`
-			PodcastUUID   string `json:"podcast_uuid"`
-			PlayingStatus int    `json:"playing_status"`
-			PlayedUpTo    int    `json:"played_up_to"`
-			Duration      int    `json:"duration"`
+			UUID     string `json:"uuid"`
+			Podcast  string `json:"podcast"`
+			Status   int    `json:"status"`
+			Position int    `json:"position"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode body: %v", err)
 		}
 		gotUUID = body.UUID
-		gotPodUUID = body.PodcastUUID
-		gotStatus = body.PlayingStatus
-		gotPlayedUpTo = body.PlayedUpTo
-		gotDuration = body.Duration
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		gotPodcast = body.Podcast
+		gotStatus = body.Status
+		gotPosition = body.Position
+		w.WriteHeader(http.StatusOK)
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	err := pocketcasts.UpdateEpisodeProgress(ctx, client, "ep-uuid", "pod-uuid",
+	err := pocketcasts.UpdateEpisodeProgress(context.Background(), client, "ep-uuid", "pod-uuid",
 		pocketcasts.PlayingPlayed, 3600, 3600)
 	if err != nil {
 		t.Fatalf("UpdateEpisodeProgress: %v", err)
@@ -361,74 +382,61 @@ func TestUpdateEpisodeProgress_Played(t *testing.T) {
 	if gotUUID != "ep-uuid" {
 		t.Errorf("uuid = %q, want ep-uuid", gotUUID)
 	}
-	if gotPodUUID != "pod-uuid" {
-		t.Errorf("podcast_uuid = %q, want pod-uuid", gotPodUUID)
+	if gotPodcast != "pod-uuid" {
+		t.Errorf("podcast = %q, want pod-uuid", gotPodcast)
 	}
 	if gotStatus != pocketcasts.PlayingPlayed {
-		t.Errorf("playing_status = %d, want %d (played)", gotStatus, pocketcasts.PlayingPlayed)
+		t.Errorf("status = %d, want %d (played)", gotStatus, pocketcasts.PlayingPlayed)
 	}
-	if gotPlayedUpTo != 3600 {
-		t.Errorf("played_up_to = %d, want 3600", gotPlayedUpTo)
-	}
-	if gotDuration != 3600 {
-		t.Errorf("duration = %d, want 3600", gotDuration)
+	if gotPosition != 3600 {
+		t.Errorf("position = %d, want 3600", gotPosition)
 	}
 }
 
 func TestUpdateEpisodeProgress_InProgress(t *testing.T) {
-	var gotStatus, gotPlayedUpTo int
+	var gotStatus, gotPosition int
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/episodes/update_episode_position.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/sync/update_episode", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			PlayingStatus int `json:"playing_status"`
-			PlayedUpTo    int `json:"played_up_to"`
+			Status   int `json:"status"`
+			Position int `json:"position"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		gotStatus = body.PlayingStatus
-		gotPlayedUpTo = body.PlayedUpTo
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		gotStatus = body.Status
+		gotPosition = body.Position
+		w.WriteHeader(http.StatusOK)
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	err := pocketcasts.UpdateEpisodeProgress(ctx, client, "ep-uuid", "pod-uuid",
+	err := pocketcasts.UpdateEpisodeProgress(context.Background(), client, "ep-uuid", "pod-uuid",
 		pocketcasts.PlayingInProgress, 450, 1800)
 	if err != nil {
 		t.Fatalf("UpdateEpisodeProgress in-progress: %v", err)
 	}
 	if gotStatus != pocketcasts.PlayingInProgress {
-		t.Errorf("playing_status = %d, want %d", gotStatus, pocketcasts.PlayingInProgress)
+		t.Errorf("status = %d, want %d (in-progress)", gotStatus, pocketcasts.PlayingInProgress)
 	}
-	if gotPlayedUpTo != 450 {
-		t.Errorf("played_up_to = %d, want 450", gotPlayedUpTo)
+	if gotPosition != 450 {
+		t.Errorf("position = %d, want 450", gotPosition)
 	}
 }
 
 func TestUpdateEpisodeProgress_RateLimit(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/episodes/update_episode_position.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/sync/update_episode", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	err := pocketcasts.UpdateEpisodeProgress(ctx, client, "e", "p", pocketcasts.PlayingPlayed, 100, 100)
+	err := pocketcasts.UpdateEpisodeProgress(context.Background(), client, "e", "p", pocketcasts.PlayingPlayed, 100, 100)
 	var rl *pocketcasts.RateLimitError
 	if !isRateLimitError(err, &rl) {
 		t.Fatalf("expected RateLimitError, got: %v", err)
@@ -440,52 +448,47 @@ func TestUpdateEpisodeProgress_RateLimit(t *testing.T) {
 
 func TestUpdateEpisodeProgress_TransientError(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/web/episodes/update_episode_position.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/sync/update_episode", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	err := pocketcasts.UpdateEpisodeProgress(ctx, client, "e", "p", pocketcasts.PlayingPlayed, 100, 100)
+	err := pocketcasts.UpdateEpisodeProgress(context.Background(), client, "e", "p", pocketcasts.PlayingPlayed, 100, 100)
 	var te *pocketcasts.TransientError
 	if !isTransientError(err, &te) {
 		t.Fatalf("expected TransientError for 5xx, got: %v", err)
 	}
 }
 
-func TestUpdateEpisodeProgress_ServerErrorStatus(t *testing.T) {
+func TestUpdateEpisodeProgress_BadRequest(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/users/sign_in", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: "_pocketcasts_session", Value: "tok", Path: "/"})
-		w.WriteHeader(http.StatusOK)
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/sync/update_episode", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"message":"invalid episode uuid"}`))
 	})
-	mux.HandleFunc("/web/episodes/update_episode_position.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"error","message":"something went wrong"}`))
-	})
-	_, restore := newTestServer(t, mux)
+	restore := newTestServer(t, mux)
 	defer restore()
 
-	ctx := context.Background()
 	client := authedClient(t)
-
-	err := pocketcasts.UpdateEpisodeProgress(ctx, client, "e", "p", pocketcasts.PlayingPlayed, 100, 100)
+	err := pocketcasts.UpdateEpisodeProgress(context.Background(), client, "bad", "pod", pocketcasts.PlayingPlayed, 0, 0)
 	if err == nil {
-		t.Fatal("expected error for status=error response, got nil")
+		t.Fatal("expected error for 400 response, got nil")
+	}
+	// 400 is a permanent error, not transient.
+	var te *pocketcasts.TransientError
+	if errors.As(err, &te) {
+		t.Error("400 should not be wrapped as TransientError")
 	}
 }
 
 // ---- APIEpisode.ParsePublishedAt ----
 
 func TestAPIEpisode_ParsePublishedAt_Valid(t *testing.T) {
-	ep := pocketcasts.APIEpisode{PublishedAt: "2024-06-15 14:30:00"}
+	ep := pocketcasts.APIEpisode{PublishedAt: "2024-06-15T14:30:00Z"}
 	got := ep.ParsePublishedAt()
 	want := time.Date(2024, 6, 15, 14, 30, 0, 0, time.UTC)
 	if !got.Equal(want) {

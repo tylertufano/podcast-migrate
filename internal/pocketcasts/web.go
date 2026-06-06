@@ -1,19 +1,22 @@
 package pocketcasts
 
-// web.go implements the unofficial Pocket Casts web API used for reading and
-// writing episode play state and podcast subscriptions.
+// web.go implements the Pocket Casts API used for reading and writing episode
+// play state and podcast subscriptions.
 //
 // Pocket Casts has no official public API. This implementation targets the
-// same JSON/form endpoints used by the Pocket Casts web player at
-// play.pocketcasts.com and may break without notice if Pocket Casts changes
-// its backend.
+// JSON endpoints used by the Pocket Casts web player and may break without
+// notice if Pocket Casts changes its backend.
+//
+// Authentication uses a Bearer token obtained from POST /user/login. All
+// subsequent requests inject the token via a custom http.RoundTripper so
+// callers use the returned *http.Client normally without per-call setup.
 //
 // Endpoints used:
-//   POST https://play.pocketcasts.com/users/sign_in                         — authenticate, get session cookie
-//   POST https://play.pocketcasts.com/web/podcasts/all.json                  — subscribed podcast list
-//   POST https://play.pocketcasts.com/web/episodes/in_progress_episodes.json — in-progress episodes
-//   POST https://play.pocketcasts.com/web/episodes/find_by_podcast.json      — paginated episode list per podcast
-//   POST https://play.pocketcasts.com/web/episodes/update_episode_position.json — set play position/status
+//   POST https://api.pocketcasts.com/user/login                          — authenticate, get Bearer token
+//   POST https://api.pocketcasts.com/user/podcast/list                   — subscribed podcast list
+//   POST https://api.pocketcasts.com/user/in_progress                    — in-progress episodes
+//   GET  https://cache.pocketcasts.com/podcast/full/{uuid}/{page}/3/1000 — paginated episode metadata
+//   POST https://api.pocketcasts.com/sync/update_episode                 — set play position/status
 
 import (
 	"bytes"
@@ -22,28 +25,27 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
 
-var pcBaseURL = "https://play.pocketcasts.com"
+var pcBaseURL  = "https://api.pocketcasts.com"
+var pcCacheURL = "https://cache.pocketcasts.com"
 
-// SetBaseURLForTest overrides the Pocket Casts base URL for unit tests that use
-// an httptest.Server. Must be reset to the production URL after each test.
+// SetBaseURLForTest overrides the Pocket Casts API base URL for unit tests
+// that spin up an httptest.Server. Must be reset after each test.
 func SetBaseURLForTest(u string) { pcBaseURL = u }
+
+// SetCacheURLForTest overrides the Pocket Casts cache CDN base URL for unit
+// tests. Must be reset after each test.
+func SetCacheURLForTest(u string) { pcCacheURL = u }
 
 const (
 	pcUA = "podcast-migrate/1.0 (github.com/tyler/podcast-migrate)"
 
-	// pcTimeLayout is the date-time format returned by the Pocket Casts API.
-	// Times are stored and returned in UTC without an explicit timezone marker.
-	pcTimeLayout = "2006-01-02 15:04:05"
-
 	// Playing status constants mirror the values used by the Pocket Casts API.
-	PlayingUnplayed   = 0 // episode not started
+	PlayingUnplayed   = 1 // episode not started
 	PlayingInProgress = 2 // episode partially listened to
 	PlayingPlayed     = 3 // episode listened to completion
 )
@@ -67,13 +69,32 @@ type TransientError struct {
 func (e *TransientError) Error() string { return e.cause.Error() }
 func (e *TransientError) Unwrap() error { return e.cause }
 
-// APIPodcast is a podcast as returned by /web/podcasts/all.json.
+// bearerTransport injects an Authorization: Bearer header on every outgoing
+// request. It is set as the Transport on the *http.Client returned by Login.
+type bearerTransport struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r2 := req.Clone(req.Context())
+	r2.Header.Set("Authorization", "Bearer "+t.token)
+	if r2.Header.Get("User-Agent") == "" {
+		r2.Header.Set("User-Agent", pcUA)
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(r2)
+}
+
+// APIPodcast is a podcast as returned by /user/podcast/list.
 type APIPodcast struct {
-	UUID         string `json:"uuid"`
-	Title        string `json:"title"`
-	Author       string `json:"author"`
-	URL          string `json:"url"`          // RSS feed URL
-	ThumbnailURL string `json:"thumbnail_url"`
+	UUID   string `json:"uuid"`
+	Title  string `json:"title"`
+	Author string `json:"author"`
+	URL    string `json:"url"` // RSS feed URL
 }
 
 // APIEpisode is an episode as returned by episode list endpoints.
@@ -84,22 +105,23 @@ type APIEpisode struct {
 	UUID          string `json:"uuid"`
 	PodcastUUID   string `json:"podcast_uuid"`
 	Title         string `json:"title"`
-	URL           string `json:"url"`            // enclosure/audio URL (not RSS GUID)
-	PublishedAt   string `json:"published_at"`   // "YYYY-MM-DD HH:MM:SS" UTC
-	Duration      int    `json:"duration"`       // seconds
-	PlayingStatus int    `json:"playing_status"` // 0=unplayed, 2=in-progress, 3=played
-	PlayedUpTo    int    `json:"played_up_to"`   // seconds
+	URL           string `json:"url"`
+	PublishedAt   string `json:"published_at"`   // ISO 8601 UTC, e.g. "2024-03-15T10:00:00Z"
+	Duration      int    `json:"duration"`        // seconds
+	PlayingStatus int    `json:"playing_status"`  // 1=unplayed, 2=in-progress, 3=played
+	PlayedUpTo    int    `json:"played_up_to"`    // seconds
 	Starred       bool   `json:"starred"`
 	IsDeleted     bool   `json:"is_deleted"`
 }
 
 // ParsePublishedAt parses the episode's PublishedAt field as a UTC time.
+// Accepts ISO 8601 / RFC3339 format (e.g. "2024-03-15T10:00:00Z").
 // Returns the zero time if the field is empty or cannot be parsed.
 func (e *APIEpisode) ParsePublishedAt() time.Time {
 	if e.PublishedAt == "" {
 		return time.Time{}
 	}
-	t, err := time.ParseInLocation(pcTimeLayout, e.PublishedAt, time.UTC)
+	t, err := time.Parse(time.RFC3339, e.PublishedAt)
 	if err != nil {
 		return time.Time{}
 	}
@@ -116,99 +138,94 @@ func rateLimitWait(resp *http.Response, defaultWait time.Duration) time.Duration
 	return defaultWait
 }
 
-// Login authenticates with Pocket Casts and returns an *http.Client whose cookie
-// jar holds a valid session. The client must be reused for all subsequent API
-// calls within the same migration run — creating a new client loses the session.
+// Login authenticates with Pocket Casts and returns an *http.Client whose
+// every request automatically carries the session Bearer token. The client
+// must be reused for all subsequent API calls within the same migration run.
 func Login(ctx context.Context, email, password string) (*http.Client, error) {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, fmt.Errorf("pocketcasts/web: create cookie jar: %w", err)
+	type loginReq struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Scope    string `json:"scope"`
 	}
-	client := &http.Client{
-		Jar:     jar,
-		Timeout: 30 * time.Second,
-		// Follow redirects but detect landing on an error page.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("pocketcasts/web: too many redirects during login")
-			}
-			return nil
-		},
+	type loginResp struct {
+		Token string `json:"token"`
 	}
 
-	form := url.Values{
-		"[user]email":    {email},
-		"[user]password": {password},
+	reqBody, err := json.Marshal(loginReq{Email: email, Password: password, Scope: "webplayer"})
+	if err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: marshal login request: %w", err)
 	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		pcBaseURL+"/users/sign_in", strings.NewReader(form.Encode()))
+		pcBaseURL+"/user/login", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: build login request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", pcUA)
 
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: login POST: %w", err)
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound {
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("pocketcasts/web: login failed (HTTP %d) — check credentials", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("pocketcasts/web: login returned HTTP %d — check credentials", resp.StatusCode)
 	}
-	// The login page embeds an error message in the response body on failure.
-	if strings.Contains(strings.ToLower(string(body)), "invalid email or password") {
-		return nil, fmt.Errorf("pocketcasts/web: login failed — invalid email or password")
+
+	var lr loginResp
+	if err := json.Unmarshal(respBody, &lr); err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: parse login response: %w", err)
+	}
+	if lr.Token == "" {
+		return nil, fmt.Errorf("pocketcasts/web: login succeeded (HTTP 200) but no token in response — check credentials")
 	}
 
-	// Confirm the cookie jar received a session cookie.
-	// Check against the final request URL (after any redirects) so the path matches
-	// where the cookie was actually set. Fall back to the base URL if unavailable.
-	checkURL, _ := url.Parse(pcBaseURL)
-	if resp.Request != nil && resp.Request.URL != nil {
-		checkURL = resp.Request.URL
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &bearerTransport{token: lr.Token},
 	}
-	if len(client.Jar.Cookies(checkURL)) == 0 {
-		return nil, fmt.Errorf("pocketcasts/web: login succeeded (HTTP %d) but no session cookie was set — check credentials", resp.StatusCode)
-	}
-
 	return client, nil
 }
 
 // FetchSubscribedPodcasts returns all podcasts the authenticated user is
 // currently subscribed to, including their RSS feed URLs.
 func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]APIPodcast, error) {
+	reqBody, _ := json.Marshal(map[string]int{"v": 1})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		pcBaseURL+"/web/podcasts/all.json", nil)
+		pcBaseURL+"/user/podcast/list", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: build subscribed-podcasts request: %w", err)
 	}
-	req.Header.Set("User-Agent", pcUA)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("pocketcasts/web: POST /web/podcasts/all.json: %w", err)
+		return nil, fmt.Errorf("pocketcasts/web: POST /user/podcast/list: %w", err)
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /web/podcasts/all.json returned HTTP %d", resp.StatusCode)}
+		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/podcast/list returned HTTP %d", resp.StatusCode)}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("pocketcasts/web: /web/podcasts/all.json returned HTTP %d: %s",
-			resp.StatusCode, bodyExcerpt(body))
+		return nil, fmt.Errorf("pocketcasts/web: /user/podcast/list returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(respBody))
 	}
 
 	var payload struct {
 		Podcasts []APIPodcast `json:"podcasts"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := json.Unmarshal(respBody, &payload); err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: parse subscribed-podcasts response: %w", err)
 	}
 	return payload.Podcasts, nil
@@ -216,92 +233,105 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]APIPod
 
 // FetchInProgressEpisodes returns all episodes the authenticated user currently
 // has in progress (partially listened to). This does not include episodes that
-// have been played to completion — use per-podcast episode listing for a full
-// picture of play state.
+// have been played to completion — use FetchPodcastEpisodes for a full picture.
 func FetchInProgressEpisodes(ctx context.Context, client *http.Client) ([]APIEpisode, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		pcBaseURL+"/web/episodes/in_progress_episodes.json", nil)
+		pcBaseURL+"/user/in_progress", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: build in-progress request: %w", err)
 	}
-	req.Header.Set("User-Agent", pcUA)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("pocketcasts/web: POST in_progress_episodes.json: %w", err)
+		return nil, fmt.Errorf("pocketcasts/web: POST /user/in_progress: %w", err)
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: in_progress_episodes.json returned HTTP %d", resp.StatusCode)}
+		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/in_progress returned HTTP %d", resp.StatusCode)}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("pocketcasts/web: in_progress_episodes.json returned HTTP %d: %s",
-			resp.StatusCode, bodyExcerpt(body))
+		return nil, fmt.Errorf("pocketcasts/web: /user/in_progress returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(respBody))
 	}
 
 	var payload struct {
 		Episodes []APIEpisode `json:"episodes"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := json.Unmarshal(respBody, &payload); err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: parse in-progress response: %w", err)
 	}
 	return payload.Episodes, nil
 }
 
-// FetchPodcastEpisodes fetches one page of episodes for a podcast.
-// page is 1-indexed; episodes are sorted newest-first.
-// Returns the episode list, total episode count across all pages, and any error.
-//
-// The total count allows callers to determine whether more pages exist:
-// keep requesting pages until the cumulative fetched count equals total.
-func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastUUID string, page int) ([]APIEpisode, int, error) {
-	form := url.Values{
-		"uuid": {podcastUUID},
-		"page": {strconv.Itoa(page)},
-		"sort": {"3"}, // 3 = newest to oldest
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		pcBaseURL+"/web/episodes/find_by_podcast.json",
-		strings.NewReader(form.Encode()))
+// cacheEpisode is the episode structure returned by the Pocket Casts cache CDN.
+// It carries metadata only; play state is not available from this endpoint.
+type cacheEpisode struct {
+	UUID      string `json:"uuid"`
+	Title     string `json:"title"`
+	URL       string `json:"url"`
+	Duration  int    `json:"duration"`
+	Published string `json:"published"` // ISO 8601, e.g. "2024-01-15T10:00:00Z"
+}
+
+// FetchPodcastEpisodes fetches one page of episode metadata for a podcast from
+// the Pocket Casts cache CDN. page is 0-indexed; episodes are sorted newest
+// first. Returns the episode list, hasMore (true if more pages exist), and any
+// error. Returned episodes have PlayingStatus = PlayingUnplayed since the cache
+// CDN does not carry play state.
+func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastUUID string, page int) ([]APIEpisode, bool, error) {
+	url := fmt.Sprintf("%s/podcast/full/%s/%d/3/1000", pcCacheURL, podcastUUID, page)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, 0, fmt.Errorf("pocketcasts/web: build episode-list request: %w", err)
+		return nil, false, fmt.Errorf("pocketcasts/web: build episode-list request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", pcUA)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("pocketcasts/web: POST find_by_podcast.json: %w", err)
+		return nil, false, fmt.Errorf("pocketcasts/web: GET podcast/full: %w", err)
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, 0, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, false, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, 0, &TransientError{cause: fmt.Errorf("pocketcasts/web: find_by_podcast.json returned HTTP %d", resp.StatusCode)}
+		return nil, false, &TransientError{cause: fmt.Errorf("pocketcasts/web: podcast/full returned HTTP %d", resp.StatusCode)}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("pocketcasts/web: find_by_podcast.json returned HTTP %d: %s",
-			resp.StatusCode, bodyExcerpt(body))
+		return nil, false, fmt.Errorf("pocketcasts/web: podcast/full returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(respBody))
 	}
 
 	var payload struct {
-		Result struct {
-			Episodes []APIEpisode `json:"episodes"`
-			Total    int          `json:"total"`
-		} `json:"result"`
+		Podcast struct {
+			Episodes []cacheEpisode `json:"episodes"`
+		} `json:"podcast"`
+		HasMoreEpisodes bool `json:"has_more_episodes"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, 0, fmt.Errorf("pocketcasts/web: parse episode-list response: %w", err)
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return nil, false, fmt.Errorf("pocketcasts/web: parse episode-list response: %w", err)
 	}
-	return payload.Result.Episodes, payload.Result.Total, nil
+
+	episodes := make([]APIEpisode, 0, len(payload.Podcast.Episodes))
+	for _, ce := range payload.Podcast.Episodes {
+		episodes = append(episodes, APIEpisode{
+			UUID:          ce.UUID,
+			PodcastUUID:   podcastUUID,
+			Title:         ce.Title,
+			URL:           ce.URL,
+			PublishedAt:   ce.Published, // same ISO 8601 format as APIEpisode.PublishedAt
+			Duration:      ce.Duration,
+			PlayingStatus: PlayingUnplayed, // cache CDN does not include play state
+		})
+	}
+	return episodes, payload.HasMoreEpisodes, nil
 }
 
 // UpdateEpisodeProgress sets the playback position and status for an episode.
@@ -310,23 +340,22 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastUUID 
 //   - podcastUUID: Pocket Casts internal podcast UUID
 //   - status: PlayingUnplayed, PlayingInProgress, or PlayingPlayed
 //   - positionSec: playback position in seconds (0 for played/unplayed)
-//   - durationSec: episode duration in seconds (0 when unknown)
+//   - durationSec: episode duration in seconds (currently unused by the API but
+//     kept for call-site compatibility)
 func UpdateEpisodeProgress(ctx context.Context, client *http.Client,
 	episodeUUID, podcastUUID string, status, positionSec, durationSec int) error {
 
 	type updateBody struct {
-		UUID          string `json:"uuid"`
-		PodcastUUID   string `json:"podcast_uuid"`
-		PlayingStatus int    `json:"playing_status"`
-		PlayedUpTo    int    `json:"played_up_to"`
-		Duration      int    `json:"duration"`
+		UUID     string `json:"uuid"`
+		Podcast  string `json:"podcast"`
+		Status   int    `json:"status"`
+		Position int    `json:"position"`
 	}
 	payload := updateBody{
-		UUID:          episodeUUID,
-		PodcastUUID:   podcastUUID,
-		PlayingStatus: status,
-		PlayedUpTo:    positionSec,
-		Duration:      durationSec,
+		UUID:     episodeUUID,
+		Podcast:  podcastUUID,
+		Status:   status,
+		Position: positionSec,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -334,18 +363,16 @@ func UpdateEpisodeProgress(ctx context.Context, client *http.Client,
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		pcBaseURL+"/web/episodes/update_episode_position.json",
-		bytes.NewReader(data))
+		pcBaseURL+"/sync/update_episode", bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("pocketcasts/web: build update request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", pcUA)
 
 	resp, err := client.Do(req)
 	if err != nil {
 		// Network-level failure — transient, caller may retry.
-		return &TransientError{cause: fmt.Errorf("pocketcasts/web: update_episode_position.json: %w", err)}
+		return &TransientError{cause: fmt.Errorf("pocketcasts/web: /sync/update_episode: %w", err)}
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
@@ -354,23 +381,13 @@ func UpdateEpisodeProgress(ctx context.Context, client *http.Client,
 		return &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return &TransientError{cause: fmt.Errorf("pocketcasts/web: update_episode_position.json returned HTTP %d: %s",
+		return &TransientError{cause: fmt.Errorf("pocketcasts/web: /sync/update_episode returned HTTP %d: %s",
 			resp.StatusCode, bodyExcerpt(body))}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("pocketcasts/web: update_episode_position.json returned HTTP %d: %s",
+		return fmt.Errorf("pocketcasts/web: /sync/update_episode returned HTTP %d: %s",
 			resp.StatusCode, bodyExcerpt(body))
 	}
-
-	// The API returns {"status":"ok"} on success. Treat any non-"ok" status as an error.
-	var result struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(body, &result); err == nil && result.Status != "" && result.Status != "ok" {
-		return fmt.Errorf("pocketcasts/web: update_episode_position.json: server returned status %q: %s",
-			result.Status, bodyExcerpt(body))
-	}
-
 	return nil
 }
 

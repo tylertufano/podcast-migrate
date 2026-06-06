@@ -147,13 +147,17 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 		prefix = "[dry-run] "
 	}
 
-	// Step 1: subscribe to any missing podcasts.
-	subCount, err := p.doWriteSubscriptions(ctx, lib, opts)
-	if err != nil {
-		return err
-	}
-	if subCount > 0 {
-		fmt.Printf("%ssubscribed to %d podcast(s)\n", prefix, subCount)
+	// Step 1: subscribe to any missing podcasts (unless --subscribed-only, which
+	// means "only write play state for already-subscribed feeds, don't subscribe
+	// to new ones").
+	if !opts.SubscribedOnly {
+		subCount, err := p.doWriteSubscriptions(ctx, lib, opts)
+		if err != nil {
+			return err
+		}
+		if subCount > 0 {
+			fmt.Printf("%ssubscribed to %d podcast(s)\n", prefix, subCount)
+		}
 	}
 
 	if opts.OnlySubscriptions {

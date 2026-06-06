@@ -23,12 +23,12 @@ podcast-migrate reads your library directly from the source app's local data, me
 
 - Generates an OPML file ready to import via Overcast › Settings › Import OPML
 - Reads an Overcast OPML export for inspection or two-way merging
-- **Play state write** via the unofficial Overcast web API. See [Apple Podcasts → Overcast](#apple-podcasts--overcast-sync-play-state) for details.
+- **Play state write** via the unofficial Overcast web API — and automatically subscribes to any source podcast not yet in your Overcast library before writing its episodes (Overcast silently drops play-state updates for unsubscribed podcasts). Use `--subscribed-only` to skip the subscribe step and only write state for feeds already in your account. See [Apple Podcasts → Overcast](#apple-podcasts--overcast-sync-play-state) for details.
 
 **Pocket Casts (source and destination)**
 
 - Reads subscriptions and in-progress episode play state via the Pocket Casts web API (authenticated with your account credentials)
-- **Play state write** via the same unofficial web API the Pocket Casts web player uses — propagates to iPhone, Android, and all devices through Pocket Casts' own sync
+- **Play state write** via the same unofficial web API the Pocket Casts web player uses — propagates to iPhone, Android, and all devices through Pocket Casts' own sync. Also automatically subscribes to any source podcast not yet in your Pocket Casts library before writing its episodes, so a full cross-app migration works in a single run. Use `--subscribed-only` to skip the subscribe step.
 - Two-phase episode matching: Phase A indexes in-progress episodes (fast); Phase B fetches per-podcast episode pages for any episodes not found in Phase A, handling episodes you've never started in Pocket Casts
 - **Phase 1 limitation:** `--from pocketcasts` returns only episodes currently in-progress. Fully played history requires a future Phase 2 release (see [Future work](#future-work))
 
@@ -46,10 +46,11 @@ podcast-migrate reads your library directly from the source app's local data, me
 | Provider | Read subscriptions | Read play state | Write subscriptions | Write play state |
 |---|:---:|:---:|:---:|:---:|
 | Apple Podcasts | ✅ | ✅ | — | ✅ (web API → syncs to all devices) |
-| Overcast | ✅ | ✅ | ✅ (OPML) | ✅ (unofficial web API) |
-| Pocket Casts | ✅ | ✅ in-progress¹ | — | ✅ (unofficial web API) |
+| Overcast | ✅ | ✅ | ✅ (OPML + auto on play-state write²) | ✅ (unofficial web API) |
+| Pocket Casts | ✅ | ✅ in-progress¹ | ✅ (auto on play-state write²) | ✅ (unofficial web API) |
 
-¹ Fully played history requires Phase 2 (see [Future work](#future-work)).
+¹ Fully played history requires Phase 2 (see [Future work](#future-work)).  
+² Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
 
 ## Installation
 
@@ -107,6 +108,8 @@ podcast-migrate migrate --from podcasts --to overcast \
 ```
 
 **How it works:** Authenticates with your Overcast account, automatically fetches your current library from `overcast.fm/account/export_opml/extended`, and calls the same internal API endpoint the Overcast web player uses to save episode positions. For each played episode, it fetches the episode's Overcast page to resolve its internal numeric ID, then POSTs the played position.
+
+**Subscription handling:** Any podcast in your Apple Podcasts library that is not yet subscribed in Overcast is automatically subscribed before its episodes are updated. Overcast silently drops play-state updates for unsubscribed podcasts, so this step is required for a complete migration. To skip it and only update episodes for podcasts you're already subscribed to in Overcast, add `--subscribed-only`.
 
 `--overcast-out` is optional — omit it to sync play state without generating an OPML file.
 
@@ -239,7 +242,7 @@ podcast-migrate migrate --from podcasts --to pocketcasts \
   --play-state
 ```
 
-**How it works:** Reads your Apple Podcasts play state from `MTLibrary.sqlite`, authenticates with Pocket Casts, and calls the same internal API endpoint the Pocket Casts web player uses to save positions. Changes sync to all your Pocket Casts devices automatically.
+**How it works:** Reads your Apple Podcasts play state from `MTLibrary.sqlite`, authenticates with Pocket Casts, and calls the same internal API endpoint the Pocket Casts web player uses to save positions. Any podcast in your Apple Podcasts library not yet subscribed in Pocket Casts is automatically subscribed first. Changes sync to all your Pocket Casts devices automatically. Add `--subscribed-only` to only update already-subscribed feeds without subscribing to new ones.
 
 Episode matching uses two keys in order: publish date + feed URL (primary), then normalized title + feed URL (fallback). Episodes not found in Pocket Casts are skipped and reported. Episodes already marked played or further ahead in Pocket Casts are left alone.
 
@@ -287,6 +290,8 @@ podcast-migrate migrate --from pocketcasts --to overcast \
   --play-state
 ```
 
+Any podcast from your Pocket Casts library not yet subscribed in Overcast is automatically subscribed before its episodes are written. Add `--subscribed-only` to only update already-subscribed feeds without subscribing to new ones.
+
 ### Overcast → Pocket Casts (sync play state)
 
 ```sh
@@ -333,7 +338,8 @@ podcast-migrate import --to overcast \
 | Flag | Description |
 |---|---|
 | `--dry-run` | Preview changes without writing anything |
-| `--only-subscriptions` | Migrate subscriptions, skip episode play state |
+| `--only-subscriptions` | Subscribe to podcasts only, skip episode play state |
+| `--subscribed-only` | Only write play state for podcasts already subscribed at the destination; skip auto-subscribe for new feeds (Overcast and Pocket Casts destinations) |
 | `--conflict` | Conflict resolution: `furthest` (default), `source`, `target` |
 | `--sqlite` | Custom path to `MTLibrary.sqlite` (auto-detected by default) |
 | `--opml-fallback` | Apple Podcasts OPML export to use if SQLite is inaccessible |
@@ -360,7 +366,6 @@ The current Pocket Casts provider (Phase 1) has one known limitation: `--from po
 
 - Fetch full play history so `--from pocketcasts` covers all played + in-progress episodes (not just the ones currently in progress)
 - Add `--since` support for the Pocket Casts source (delta sync)
-- Add subscribe/unsubscribe via the API so `--only-subscriptions` works in both directions
 
 ### Additional providers
 The `Provider` interface makes adding new services straightforward. Candidates:

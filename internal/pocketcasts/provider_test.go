@@ -542,6 +542,37 @@ func TestProvider_SetLibrary_SubscribesNewPodcast(t *testing.T) {
 	}
 }
 
+func TestProvider_SetLibrary_SubscribedOnly_SkipsSubscribeStep(t *testing.T) {
+	// With --subscribed-only, doWriteSubscriptions must not be called even when
+	// the lib contains a podcast that is not yet in the PC account.
+	var subscribeCalls []string
+	restore := newFullTestServer(t, testServerConfig{
+		feedURLToUUID:  map[string]string{"https://feeds.example.com/gamma": "pod3"},
+		subscribeCalls: &subscribeCalls,
+		// In-progress + podcastEpisodes empty: no play-state writes expected either.
+	})
+	defer restore()
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.example.com/gamma", Title: "Gamma Show"},
+		},
+	}
+
+	p := pocketcasts.NewProvider("user@example.com", "pass")
+	opts := provider.WriteOptions{
+		SubscribedOnly: true,
+		RequestDelay:   time.Millisecond,
+	}
+	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
+		t.Fatalf("SetLibrary SubscribedOnly: %v", err)
+	}
+
+	if len(subscribeCalls) != 0 {
+		t.Errorf("--subscribed-only: expected 0 subscribe calls, got %d (%v)", len(subscribeCalls), subscribeCalls)
+	}
+}
+
 func TestProvider_SetLibrary_SkipsAlreadySubscribed(t *testing.T) {
 	// lib has a podcast (alpha) that IS already in the server's existing
 	// subscriptions. The provider should not call /user/podcast/subscribe.

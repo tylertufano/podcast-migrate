@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,7 @@ func migrateCmd() *cobra.Command {
 		subscribedOnly      bool          // --subscribed-only
 		episodeCacheMaxAge  time.Duration // --episode-cache-max-age
 		clearEpisodeCache   bool          // --clear-episode-cache
+		sinceStr            string        // --since (delta sync cutoff)
 	)
 
 	cmd := &cobra.Command{
@@ -121,6 +123,20 @@ func migrateCmd() *cobra.Command {
 			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", "", "")
 			if err != nil {
 				return fmt.Errorf("source: %w", err)
+			}
+
+			// --since: limit the Apple source to episodes modified after the cutoff.
+			// Only applicable when the source is Apple Podcasts (SQLite); ignored otherwise.
+			if sinceStr != "" {
+				t, err := parseSince(sinceStr)
+				if err != nil {
+					return err
+				}
+				if ap, ok := src.(*apple.Provider); ok {
+					ap.SetSinceTime(t)
+				} else {
+					fmt.Fprintf(os.Stderr, "warning: --since is only supported when --from podcasts; flag ignored\n")
+				}
 			}
 			// Pass sqlitePath and opmlFallback for the destination too — needed when
 			// the destination is Apple Podcasts (reverse sync: overcast → podcasts).
@@ -231,6 +247,10 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&clearEpisodeCache, "clear-episode-cache", false,
 		"discard all cached Overcast episode numeric IDs before syncing and re-fetch\n"+
 			"them from Overcast; the cache is repopulated with fresh data during the run")
+	cmd.Flags().StringVar(&sinceStr, "since", "",
+		"delta sync: only process Apple Podcasts episodes whose play state changed after\n"+
+			"this cutoff. Accepts a duration (e.g. 24h, 7d) or a date (e.g. 2026-06-01).\n"+
+			"Only effective when --from podcasts.")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")
@@ -289,6 +309,44 @@ func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, 
 	default:
 		return nil, fmt.Errorf("unknown provider %q (supported: podcasts, overcast)", name)
 	}
+}
+
+// parseSince parses a --since value into an absolute time.
+// Accepted forms:
+//
+//	"7d", "30d"         — N days ago (d suffix, not a standard Go duration)
+//	"24h", "1h30m"      — standard Go duration, subtracted from now
+//	"2026-06-01"        — date (local midnight)
+//	"2026-06-01T15:04"  — date + time (local)
+//	"2026-06-01T15:04:05Z07:00" — RFC3339
+func parseSince(s string) (time.Time, error) {
+	// Day-suffix shorthand: "7d", "30d"
+	if strings.HasSuffix(s, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err == nil && n > 0 {
+			return time.Now().Add(-time.Duration(n) * 24 * time.Hour), nil
+		}
+	}
+	// Standard Go duration: "24h", "1h30m", etc.
+	if d, err := time.ParseDuration(s); err == nil {
+		if d <= 0 {
+			return time.Time{}, fmt.Errorf("--since: duration must be positive, got %q", s)
+		}
+		return time.Now().Add(-d), nil
+	}
+	// Date / datetime layouts (local timezone unless explicit offset).
+	for _, layout := range []string{
+		"2006-01-02",
+		"2006-01-02T15:04",
+		"2006-01-02T15:04:05",
+		time.RFC3339,
+	} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf(
+		"--since: cannot parse %q — use a duration (e.g. 24h, 7d) or a date (e.g. 2026-06-01)", s)
 }
 
 func parseConflictStrategy(s string) provider.ConflictStrategy {

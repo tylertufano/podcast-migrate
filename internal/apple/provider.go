@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
@@ -24,7 +25,13 @@ type Provider struct {
 	sqlitePath string
 	opmlPath   string // optional fallback; empty disables it
 	webAPI     *WebAPIWriter
+	sinceTime  time.Time // when set, only episodes modified after this time are read
 }
+
+// SetSinceTime restricts GetLibrary to episodes whose play state was modified
+// after t (uses ZPLAYSTATELASTMODIFIEDDATE). A zero t reads all episodes.
+// Only effective when reading from SQLite; the OPML fallback ignores it.
+func (p *Provider) SetSinceTime(t time.Time) { p.sinceTime = t }
 
 // NewProvider returns an Apple Podcasts provider.
 // sqlitePath defaults to DefaultSQLitePath() when empty.
@@ -59,7 +66,13 @@ func (p *Provider) Capabilities() provider.Capabilities {
 
 func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 	if _, err := os.Stat(p.sqlitePath); err == nil {
-		lib, err := NewSQLiteReader(p.sqlitePath).Read(ctx)
+		r := NewSQLiteReader(p.sqlitePath)
+		if !p.sinceTime.IsZero() {
+			r.SetSinceTime(p.sinceTime)
+			fmt.Printf("apple: delta mode — reading episodes modified since %s\n",
+				p.sinceTime.Local().Format("2006-01-02 15:04:05"))
+		}
+		lib, err := r.Read(ctx)
 		if err == nil {
 			return lib, nil
 		}

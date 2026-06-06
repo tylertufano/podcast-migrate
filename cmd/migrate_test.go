@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tyler/podcast-migrate/internal/overcast"
 	"github.com/tyler/podcast-migrate/internal/provider"
@@ -244,6 +245,73 @@ func TestBuildProvider_Unknown_ReturnsError(t *testing.T) {
 		_, err := buildProvider(name, "", "", "", "", "", "")
 		if err == nil {
 			t.Errorf("buildProvider(%q): expected error for unknown provider, got nil", name)
+		}
+	}
+}
+
+// ---- parseSince ----
+
+func TestParseSince_DaySuffix(t *testing.T) {
+	before := time.Now().Add(-7 * 24 * time.Hour)
+	got, err := parseSince("7d")
+	if err != nil {
+		t.Fatalf("parseSince(7d): %v", err)
+	}
+	after := time.Now().Add(-7 * 24 * time.Hour)
+	if got.Before(before.Add(-time.Second)) || got.After(after.Add(time.Second)) {
+		t.Errorf("parseSince(7d) = %v, expected ~%v", got, before)
+	}
+}
+
+func TestParseSince_GoDuration(t *testing.T) {
+	before := time.Now().Add(-24 * time.Hour)
+	got, err := parseSince("24h")
+	if err != nil {
+		t.Fatalf("parseSince(24h): %v", err)
+	}
+	after := time.Now().Add(-24 * time.Hour)
+	if got.Before(before.Add(-time.Second)) || got.After(after.Add(time.Second)) {
+		t.Errorf("parseSince(24h) = %v, expected ~%v", got, before)
+	}
+}
+
+func TestParseSince_DateOnly(t *testing.T) {
+	got, err := parseSince("2026-06-01")
+	if err != nil {
+		t.Fatalf("parseSince(2026-06-01): %v", err)
+	}
+	want := time.Date(2026, 6, 1, 0, 0, 0, 0, time.Local)
+	if !got.Equal(want) {
+		t.Errorf("parseSince(2026-06-01) = %v, want %v", got, want)
+	}
+}
+
+func TestParseSince_DateTimeNoZone(t *testing.T) {
+	got, err := parseSince("2026-06-01T12:30")
+	if err != nil {
+		t.Fatalf("parseSince(2026-06-01T12:30): %v", err)
+	}
+	want := time.Date(2026, 6, 1, 12, 30, 0, 0, time.Local)
+	if !got.Equal(want) {
+		t.Errorf("parseSince(2026-06-01T12:30) = %v, want %v", got, want)
+	}
+}
+
+func TestParseSince_RFC3339(t *testing.T) {
+	got, err := parseSince("2026-06-01T12:00:00Z")
+	if err != nil {
+		t.Fatalf("parseSince RFC3339: %v", err)
+	}
+	want := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("parseSince RFC3339 = %v, want %v", got, want)
+	}
+}
+
+func TestParseSince_InvalidReturnsError(t *testing.T) {
+	for _, s := range []string{"", "yesterday", "2026/06/01", "-1d", "0h"} {
+		if _, err := parseSince(s); err == nil {
+			t.Errorf("parseSince(%q) expected error, got nil", s)
 		}
 	}
 }

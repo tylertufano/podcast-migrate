@@ -28,12 +28,18 @@ func DefaultSQLitePath() string {
 // SQLiteReader reads subscriptions and episode states from the Apple Podcasts
 // local SQLite database (MTLibrary.sqlite).
 type SQLiteReader struct {
-	dbPath string
+	dbPath    string
+	sinceTime time.Time // when set, only episodes modified after this time are returned
 }
 
 func NewSQLiteReader(dbPath string) *SQLiteReader {
 	return &SQLiteReader{dbPath: dbPath}
 }
+
+// SetSinceTime restricts the episode read to episodes whose
+// ZPLAYSTATELASTMODIFIEDDATE is after t. Episodes with no recorded modification
+// date are excluded. A zero t disables the filter (default).
+func (r *SQLiteReader) SetSinceTime(t time.Time) { r.sinceTime = t }
 
 func (r *SQLiteReader) Read(ctx context.Context) (*model.Library, error) {
 	db, err := sql.Open("sqlite", "file:"+r.dbPath+"?mode=ro&_journal=off")
@@ -151,6 +157,16 @@ func cleanFeedURL(rawURL string) string {
 }
 
 func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.EpisodeState, int, error) {
+	// When a since-time is set, only episodes whose ZPLAYSTATELASTMODIFIEDDATE
+	// is after the cutoff are returned. The cutoff is converted to CoreData
+	// epoch seconds (seconds since 2001-01-01 UTC).
+	var sinceArgs []any
+	sinceClause := ""
+	if !r.sinceTime.IsZero() {
+		sinceSecs := r.sinceTime.Sub(coreDataEpoch).Seconds()
+		sinceClause = "\n\t\t  AND e.ZPLAYSTATELASTMODIFIEDDATE > ?"
+		sinceArgs = append(sinceArgs, sinceSecs)
+	}
 	// Fetch all episodes with any evidence of having been played. Apple Podcasts
 	// uses several fields to track play history — no single column is authoritative:
 	//
@@ -169,7 +185,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 	// their GUIDs are Apple-internal hex IDs (not RSS <guid> values) and their
 	// enclosure URLs are Apple DRM streams — neither will match or play in any
 	// other app. The parent podcast subscription is still exported.
-	const q = `
+	q := `
 		SELECT
 			e.ZGUID,
 			p.ZFEEDURL,
@@ -188,10 +204,11 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		  AND p.ZSUBSCRIBED = 1
 		  AND p.ZFEEDURL IS NOT NULL
 		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
-		  AND p.ZFEEDURL NOT LIKE 'internal://%'
+		  AND p.ZFEEDURL NOT LIKE 'internal://%'` +
+		sinceClause + `
 		ORDER BY e.ZPUBDATE DESC`
 
-	rows, err := db.QueryContext(ctx, q)
+	rows, err := db.QueryContext(ctx, q, sinceArgs...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("apple/sqlite: query episodes: %w", err)
 	}

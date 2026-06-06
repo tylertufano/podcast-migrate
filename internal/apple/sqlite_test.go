@@ -629,3 +629,43 @@ func TestAppleProvider_SetLibrary_ReturnsUnsupported_ForSubscriptions(t *testing
 		_ = capErr
 	}
 }
+
+func TestSQLiteReader_SinceTime_FiltersEpisodes(t *testing.T) {
+	path := setupSQLiteDB(t)
+
+	// Set ZPLAYSTATELASTMODIFIEDDATE on ep1 (pk=1) to a recent time and ep2 (pk=2)
+	// to an older time, so that a since-cutoff between them keeps only ep1.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	// ep1 modified 10 seconds ago (after cutoff)
+	recentSecs := float64(time.Now().Add(-10*time.Second).Unix() - coreDataEpoch.Unix())
+	// ep2 modified 2 hours ago (before cutoff)
+	oldSecs := float64(time.Now().Add(-2*time.Hour).Unix() - coreDataEpoch.Unix())
+	_, err = db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATELASTMODIFIEDDATE = ? WHERE Z_PK = 1`, recentSecs)
+	if err != nil {
+		t.Fatalf("set moddate ep1: %v", err)
+	}
+	_, err = db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATELASTMODIFIEDDATE = ? WHERE Z_PK = 2`, oldSecs)
+	if err != nil {
+		t.Fatalf("set moddate ep2: %v", err)
+	}
+	db.Close()
+
+	// Cutoff: 1 hour ago — ep1 (10s ago) passes, ep2 (2h ago) does not.
+	cutoff := time.Now().Add(-1 * time.Hour)
+	r := apple.NewSQLiteReader(path)
+	r.SetSinceTime(cutoff)
+	lib, err := r.Read(context.Background())
+	if err != nil {
+		t.Fatalf("Read with since: %v", err)
+	}
+
+	if findEpisode(lib, "rss-guid-1") == nil {
+		t.Error("ep1 (modified after cutoff) should be included but was not")
+	}
+	if findEpisode(lib, "rss-guid-2") != nil {
+		t.Error("ep2 (modified before cutoff) should be excluded but was included")
+	}
+}

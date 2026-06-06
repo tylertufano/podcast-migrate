@@ -211,22 +211,56 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 		}
 	}
 
-	// Determine which source podcasts are not yet subscribed.
+	// Build the candidate list: source podcasts not yet subscribed, narrowed by
+	// any active podcast filter (--podcast / --podcast-list). The filter is
+	// applied here so that `--podcast "xyz"` only subscribes to matching feeds,
+	// not every feed in the source library.
+	lowerFilters := make([]string, len(opts.PodcastFilter))
+	for i, f := range opts.PodcastFilter {
+		lowerFilters[i] = strings.ToLower(strings.TrimSpace(f))
+	}
+
 	var toSubscribe []model.Podcast
+	skippedByFilter := 0
 	for _, pod := range lib.Podcasts {
 		if pod.FeedURL == "" || subscribedFeeds[normalizeFeedURL(pod.FeedURL)] {
 			continue
+		}
+		// Apply podcast filter when set.
+		if len(lowerFilters) > 0 {
+			title := strings.ToLower(strings.TrimSpace(pod.Title))
+			matched := false
+			for _, f := range lowerFilters {
+				if f != "" && strings.Contains(title, f) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				skippedByFilter++
+				continue
+			}
 		}
 		toSubscribe = append(toSubscribe, pod)
 	}
 
 	if len(toSubscribe) == 0 {
-		fmt.Printf("pocketcasts: all %d podcast(s) already subscribed\n", len(lib.Podcasts))
+		if skippedByFilter > 0 {
+			fmt.Printf("pocketcasts: no unsubscribed podcasts match the podcast filter (%d skipped by filter)\n",
+				skippedByFilter)
+		} else {
+			fmt.Printf("pocketcasts: all %d podcast(s) already subscribed\n", len(lib.Podcasts))
+		}
 		return 0, nil
 	}
 
-	fmt.Printf("pocketcasts: %d/%d podcast(s) to subscribe (%d already subscribed)\n",
-		len(toSubscribe), len(lib.Podcasts), len(existing))
+	if skippedByFilter > 0 {
+		fmt.Printf("pocketcasts: podcast filter active — %d/%d podcast(s) in scope (%d skipped by filter, %d already subscribed)\n",
+			len(toSubscribe), len(lib.Podcasts), skippedByFilter, len(existing)-len(toSubscribe))
+	} else {
+		fmt.Printf("pocketcasts: %d/%d podcast(s) to subscribe (%d already subscribed)\n",
+			len(toSubscribe), len(lib.Podcasts), len(existing))
+	}
 
 	if opts.DryRun {
 		for _, pod := range toSubscribe {

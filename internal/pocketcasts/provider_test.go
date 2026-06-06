@@ -542,6 +542,44 @@ func TestProvider_SetLibrary_SubscribesNewPodcast(t *testing.T) {
 	}
 }
 
+func TestProvider_SetLibrary_PodcastFilter_LimitsSubscriptions(t *testing.T) {
+	// Source has two unsubscribed podcasts (gamma, delta). --podcast "gamma"
+	// should subscribe only to gamma, not delta.
+	var subscribeCalls []string
+	restore := newFullTestServer(t, testServerConfig{
+		feedURLToUUID: map[string]string{
+			"https://feeds.example.com/gamma": "pod3",
+			"https://feeds.example.com/delta": "pod4",
+		},
+		subscribeCalls: &subscribeCalls,
+	})
+	defer restore()
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.example.com/gamma", Title: "Gamma Show"},
+			{FeedURL: "https://feeds.example.com/delta", Title: "Delta Show"},
+		},
+	}
+
+	p := pocketcasts.NewProvider("user@example.com", "pass")
+	opts := provider.WriteOptions{
+		OnlySubscriptions: true,
+		RequestDelay:      time.Millisecond,
+		PodcastFilter:     []string{"gamma"},
+	}
+	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
+		t.Fatalf("SetLibrary with podcast filter: %v", err)
+	}
+
+	if len(subscribeCalls) != 1 {
+		t.Fatalf("subscribe calls: got %d, want 1 (only gamma)", len(subscribeCalls))
+	}
+	if subscribeCalls[0] != "pod3" {
+		t.Errorf("subscribed UUID = %q, want pod3 (gamma)", subscribeCalls[0])
+	}
+}
+
 func TestProvider_SetLibrary_SubscribedOnly_SkipsSubscribeStep(t *testing.T) {
 	// With --subscribed-only, doWriteSubscriptions must not be called even when
 	// the lib contains a podcast that is not yet in the PC account.

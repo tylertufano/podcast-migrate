@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tyler/podcast-migrate/internal/apple"
 	"github.com/tyler/podcast-migrate/internal/overcast"
+	"github.com/tyler/podcast-migrate/internal/pocketcasts"
 	"github.com/tyler/podcast-migrate/internal/provider"
 	"github.com/tyler/podcast-migrate/internal/sync"
 )
@@ -44,6 +45,8 @@ func migrateCmd() *cobra.Command {
 		episodeCacheMaxAge  time.Duration // --episode-cache-max-age
 		clearEpisodeCache   bool          // --clear-episode-cache
 		sinceStr            string        // --since (delta sync cutoff)
+		pocketcastsEmail    string        // --pocketcasts-email / POCKETCASTS_EMAIL
+		pocketcastsPassword string        // --pocketcasts-password / POCKETCASTS_PASSWORD
 	)
 
 	cmd := &cobra.Command{
@@ -99,10 +102,19 @@ func migrateCmd() *cobra.Command {
 				appleMediaUserToken = os.Getenv("APPLE_MEDIA_USER_TOKEN")
 			}
 
+			// Resolve Pocket Casts credentials from flags → env vars.
+			if pocketcastsEmail == "" {
+				pocketcastsEmail = os.Getenv("POCKETCASTS_EMAIL")
+			}
+			if pocketcastsPassword == "" {
+				pocketcastsPassword = os.Getenv("POCKETCASTS_PASSWORD")
+			}
+
 			// Direction-aware validation for --play-state:
 			//   * --from overcast: always requires --overcast-source-opml (the source data)
 			//   * --to overcast:   requires credentials; destination matching OPML is
 			//                      either --overcast-match-opml or auto-fetched after login
+			//   * --from/to pocketcasts: requires Pocket Casts credentials
 			if playState {
 				if from == "overcast" && overcastSourceOPML == "" {
 					return fmt.Errorf("--play-state requires --overcast-source-opml when --from overcast " +
@@ -112,6 +124,14 @@ func migrateCmd() *cobra.Command {
 					return fmt.Errorf("--play-state requires Overcast credentials when --to overcast: " +
 						"set OVERCAST_EMAIL and OVERCAST_PASSWORD, or use --overcast-email / --overcast-password")
 				}
+				if (from == "pocketcasts" || from == "pc") && pocketcastsEmail == "" {
+					return fmt.Errorf("--play-state requires Pocket Casts credentials when --from pocketcasts: " +
+						"set POCKETCASTS_EMAIL and POCKETCASTS_PASSWORD, or use --pocketcasts-email / --pocketcasts-password")
+				}
+				if (to == "pocketcasts" || to == "pc") && pocketcastsEmail == "" {
+					return fmt.Errorf("--play-state requires Pocket Casts credentials when --to pocketcasts: " +
+						"set POCKETCASTS_EMAIL and POCKETCASTS_PASSWORD, or use --pocketcasts-email / --pocketcasts-password")
+				}
 			}
 
 			// Merge podcast filter patterns from --podcast flags and --podcast-list file.
@@ -120,7 +140,7 @@ func migrateCmd() *cobra.Command {
 				return err
 			}
 
-			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", "", "")
+			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", "", "", pocketcastsEmail, pocketcastsPassword)
 			if err != nil {
 				return fmt.Errorf("source: %w", err)
 			}
@@ -140,7 +160,7 @@ func migrateCmd() *cobra.Command {
 			}
 			// Pass sqlitePath and opmlFallback for the destination too — needed when
 			// the destination is Apple Podcasts (reverse sync: overcast → podcasts).
-			dst, err := buildProvider(to, sqlitePath, opmlFallback, overcastSourceOPML, overcastOut, overcastEmail, overcastPassword)
+			dst, err := buildProvider(to, sqlitePath, opmlFallback, overcastSourceOPML, overcastOut, overcastEmail, overcastPassword, pocketcastsEmail, pocketcastsPassword)
 			if err != nil {
 				return fmt.Errorf("destination: %w", err)
 			}
@@ -211,12 +231,15 @@ func migrateCmd() *cobra.Command {
 				fmt.Println("\nPlay state has been written via the Apple Podcasts web API.")
 				fmt.Println("Episodes will sync to iPhone and all Apple devices automatically.")
 			}
+			if !dryRun && (to == "pocketcasts" || to == "pc") && playState {
+				fmt.Println("Play state has been written via the Pocket Casts web API.")
+			}
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&from, "from", "", "source app: podcasts (required)")
-	cmd.Flags().StringVar(&to, "to", "", "destination app: overcast (required)")
+	cmd.Flags().StringVar(&from, "from", "", "source app: podcasts, overcast, pocketcasts (required)")
+	cmd.Flags().StringVar(&to, "to", "", "destination app: overcast, pocketcasts, podcasts (required)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without writing anything")
 	cmd.Flags().BoolVar(&onlySubs, "only-subscriptions", false, "migrate subscriptions only, skip play state")
 	cmd.Flags().BoolVar(&playState, "play-state", false, "also write episode play state (Podcasts→Overcast: uses unofficial web API, requires Overcast credentials; Overcast→Podcasts: uses Apple Podcasts web API when --apple-bearer-token/--apple-media-user-token are set, otherwise writes to local SQLite)")
@@ -251,6 +274,10 @@ func migrateCmd() *cobra.Command {
 		"delta sync: only process Apple Podcasts episodes whose play state changed after\n"+
 			"this cutoff. Accepts a duration (e.g. 24h, 7d) or a date (e.g. 2026-06-01).\n"+
 			"Only effective when --from podcasts.")
+	cmd.Flags().StringVar(&pocketcastsEmail, "pocketcasts-email", "",
+		"Pocket Casts account email (or set POCKETCASTS_EMAIL env var)")
+	cmd.Flags().StringVar(&pocketcastsPassword, "pocketcasts-password", "",
+		"Pocket Casts account password (or set POCKETCASTS_PASSWORD env var)")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")
@@ -294,7 +321,7 @@ func buildPodcastFilter(cliPatterns []string, listFile string) ([]string, error)
 	return out, nil
 }
 
-func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, overcastEmail, overcastPassword string) (provider.Provider, error) {
+func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, overcastEmail, overcastPassword, pcEmail, pcPassword string) (provider.Provider, error) {
 	switch name {
 	case "podcasts", "apple":
 		return apple.NewProvider(sqlitePath, opmlFallback), nil
@@ -306,8 +333,13 @@ func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, 
 			return overcast.NewProviderWithCredentials(overcastImport, overcastOut, overcastEmail, overcastPassword), nil
 		}
 		return overcast.NewProvider(overcastImport, overcastOut), nil
+	case "pocketcasts", "pc":
+		if pcEmail == "" {
+			return nil, fmt.Errorf("pocketcasts requires credentials: set POCKETCASTS_EMAIL and POCKETCASTS_PASSWORD, or use --pocketcasts-email / --pocketcasts-password")
+		}
+		return pocketcasts.NewProvider(pcEmail, pcPassword), nil
 	default:
-		return nil, fmt.Errorf("unknown provider %q (supported: podcasts, overcast)", name)
+		return nil, fmt.Errorf("unknown provider %q (supported: podcasts, apple, overcast, pocketcasts)", name)
 	}
 }
 

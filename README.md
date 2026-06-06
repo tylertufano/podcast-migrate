@@ -1,6 +1,6 @@
 # podcast-migrate
 
-A command-line tool for migrating podcast subscriptions and episode play state between podcast applications. Supports Apple Podcasts ↔ Overcast in both directions.
+A command-line tool for migrating podcast subscriptions and episode play state between podcast applications. Supports Apple Podcasts, Overcast, and Pocket Casts.
 
 ## How it works
 
@@ -25,6 +25,13 @@ podcast-migrate reads your library directly from the source app's local data, me
 - Reads an Overcast OPML export for inspection or two-way merging
 - **Play state write** via the unofficial Overcast web API. See [Apple Podcasts → Overcast](#apple-podcasts--overcast-sync-play-state) for details.
 
+**Pocket Casts (source and destination)**
+
+- Reads subscriptions and in-progress episode play state via the Pocket Casts web API (authenticated with your account credentials)
+- **Play state write** via the same unofficial web API the Pocket Casts web player uses — propagates to iPhone, Android, and all devices through Pocket Casts' own sync
+- Two-phase episode matching: Phase A indexes in-progress episodes (fast); Phase B fetches per-podcast episode pages for any episodes not found in Phase A, handling episodes you've never started in Pocket Casts
+- **Phase 1 limitation:** `--from pocketcasts` returns only episodes currently in-progress. Fully played history requires a future Phase 2 release (see [Future work](#future-work))
+
 **Sync engine**
 
 - Three conflict resolution strategies when both sides have state for the same episode:
@@ -40,6 +47,9 @@ podcast-migrate reads your library directly from the source app's local data, me
 |---|:---:|:---:|:---:|:---:|
 | Apple Podcasts | ✅ | ✅ | — | ✅ (web API → syncs to all devices) |
 | Overcast | ✅ | ✅ | ✅ (OPML) | ✅ (unofficial web API) |
+| Pocket Casts | ✅ | ✅ in-progress¹ | — | ✅ (unofficial web API) |
+
+¹ Fully played history requires Phase 2 (see [Future work](#future-work)).
 
 ## Installation
 
@@ -214,6 +224,85 @@ podcast-migrate migrate --from overcast --to overcast \
   --play-state --force-update --dry-run
 ```
 
+### Apple Podcasts → Pocket Casts (sync play state)
+
+```sh
+export POCKETCASTS_EMAIL="you@example.com"
+export POCKETCASTS_PASSWORD="yourpassword"
+
+# Dry-run first to preview what will be written
+podcast-migrate migrate --from podcasts --to pocketcasts \
+  --play-state --dry-run
+
+# Live run
+podcast-migrate migrate --from podcasts --to pocketcasts \
+  --play-state
+```
+
+**How it works:** Reads your Apple Podcasts play state from `MTLibrary.sqlite`, authenticates with Pocket Casts, and calls the same internal API endpoint the Pocket Casts web player uses to save positions. Changes sync to all your Pocket Casts devices automatically.
+
+Episode matching uses two keys in order: publish date + feed URL (primary), then normalized title + feed URL (fallback). Episodes not found in Pocket Casts are skipped and reported. Episodes already marked played or further ahead in Pocket Casts are left alone.
+
+Use `--since` to limit to recently changed episodes when running incrementally:
+
+```sh
+# Only sync episodes whose play state changed in the last week
+podcast-migrate migrate --from podcasts --to pocketcasts \
+  --play-state --since 7d
+```
+
+> **Disclaimer:** Uses an undocumented Pocket Casts endpoint that Automattic has not publicly supported. It works as of the implementation date but may break without notice.
+
+### Pocket Casts → Apple Podcasts (sync play state to iPhone)
+
+```sh
+export POCKETCASTS_EMAIL="you@example.com"
+export POCKETCASTS_PASSWORD="yourpassword"
+export APPLE_BEARER_TOKEN="eyJhbGci..."
+export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
+
+# Dry-run first
+podcast-migrate migrate --from pocketcasts --to podcasts \
+  --play-state --dry-run
+
+# Live run
+podcast-migrate migrate --from pocketcasts --to podcasts \
+  --play-state
+```
+
+See [Overcast → Apple Podcasts](#overcast--apple-podcasts-sync-play-state-to-iphone) for how to capture the Apple tokens (same one-time DevTools step). The Pocket Casts source provides in-progress episodes only (Phase 1); add fully played history once Phase 2 is available.
+
+### Pocket Casts → Overcast (sync play state)
+
+```sh
+export POCKETCASTS_EMAIL="you@example.com"
+export POCKETCASTS_PASSWORD="yourpassword"
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
+
+podcast-migrate migrate --from pocketcasts --to overcast \
+  --play-state --dry-run
+
+podcast-migrate migrate --from pocketcasts --to overcast \
+  --play-state
+```
+
+### Overcast → Pocket Casts (sync play state)
+
+```sh
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
+export POCKETCASTS_EMAIL="you@example.com"
+export POCKETCASTS_PASSWORD="yourpassword"
+
+# Export your Overcast library first (or let the tool auto-fetch it):
+podcast-migrate migrate --from overcast --to pocketcasts \
+  --play-state --dry-run
+
+podcast-migrate migrate --from overcast --to pocketcasts \
+  --play-state
+```
+
 ### Export your library to JSON
 
 Snapshots your library as a portable JSON file. Useful for inspection, backup, or staging a migration.
@@ -257,6 +346,8 @@ podcast-migrate import --to overcast \
 | `--overcast-match-opml` | Path to Overcast OPML used for destination episode matching when writing play state (optional; if omitted and credentials are set, the live account library is fetched automatically) |
 | `--overcast-email` | Overcast account email (or `OVERCAST_EMAIL` env var) |
 | `--overcast-password` | Overcast account password (or `OVERCAST_PASSWORD` env var) |
+| `--pocketcasts-email` | Pocket Casts account email (or `POCKETCASTS_EMAIL` env var) |
+| `--pocketcasts-password` | Pocket Casts account password (or `POCKETCASTS_PASSWORD` env var) |
 | `--apple-bearer-token` | Apple web API Bearer token (or `APPLE_BEARER_TOKEN` env var) |
 | `--apple-media-user-token` | Apple media-user-token (or `APPLE_MEDIA_USER_TOKEN` env var) |
 | `--strict-feed-match` | Only match episodes using feed-URL-anchored strategies; skips cross-feed title fallbacks |
@@ -264,9 +355,15 @@ podcast-migrate import --to overcast \
 
 ## Future work
 
+### Pocket Casts — Phase 2
+The current Pocket Casts provider (Phase 1) has one known limitation: `--from pocketcasts` only surfaces episodes that are currently **in-progress**. Fully played history requires fetching `/user/history`, which returns the complete played list. Phase 2 will:
+
+- Fetch full play history so `--from pocketcasts` covers all played + in-progress episodes (not just the ones currently in progress)
+- Add `--since` support for the Pocket Casts source (delta sync)
+- Add subscribe/unsubscribe via the API so `--only-subscriptions` works in both directions
+
 ### Additional providers
-The `Provider` interface makes adding new services straightforward. Planned:
-- **Pocket Casts** — has a documented sync API
+The `Provider` interface makes adding new services straightforward. Candidates:
 - **Castro**
 - **RSS readers / generic OPML** — subscription-only, no play state
 
@@ -291,6 +388,7 @@ internal/
   provider/           Provider interface and WriteOptions
   apple/              Apple Podcasts adapter (SQLite read; catalog API + web API write)
   overcast/           Overcast adapter (OPML read/write + web API)
+  pocketcasts/        Pocket Casts adapter (web API read/write)
   sync/               Merge engine and conflict resolution
 main.go
 ```
@@ -301,4 +399,4 @@ main.go
 go test ./...
 ```
 
-Tests: `apple` ~90%, `overcast` 95%, `sync` 99%, `model` 100%.
+Tests: `apple` ~90%, `overcast` 95%, `pocketcasts` ~95%, `sync` 99%, `model` 100%.

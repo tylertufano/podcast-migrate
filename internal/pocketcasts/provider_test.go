@@ -25,17 +25,28 @@ type testServerConfig struct {
 	podcastEpisodes map[string][]map[string]any
 	// updateCalls captures the JSON bodies sent to /sync/update_episode.
 	updateCalls *[]map[string]any
+	// subscribeCalls captures the podcast UUIDs sent to /user/podcast/subscribe.
+	subscribeCalls *[]string
+	// feedURLToUUID maps an RSS feed URL to the Pocket Casts UUID returned by
+	// /author/add_feed_url. If a feed URL is not in this map the handler returns
+	// status "error".
+	feedURLToUUID map[string]string
 }
 
-// newFullTestServer builds an httptest.Server that handles all five endpoints
-// used by the Provider, pointing both pcBaseURL and pcCacheURL at it. It
-// serves two subscribed podcasts and a configurable set of in-progress and
-// per-podcast episodes.
+// newFullTestServer builds an httptest.Server that handles all endpoints
+// used by the Provider, pointing pcBaseURL, pcCacheURL, and pcRefreshURL at it.
+// It serves two subscribed podcasts (alpha, beta) and a configurable set of
+// in-progress episodes, per-podcast episode lists, subscribe calls, and
+// feed-URL-to-UUID resolution.
 func newFullTestServer(t *testing.T, cfg testServerConfig) func() {
 	t.Helper()
 	if cfg.updateCalls == nil {
 		empty := []map[string]any{}
 		cfg.updateCalls = &empty
+	}
+	if cfg.subscribeCalls == nil {
+		empty := []string{}
+		cfg.subscribeCalls = &empty
 	}
 
 	mux := http.NewServeMux()
@@ -96,13 +107,48 @@ func newFullTestServer(t *testing.T, cfg testServerConfig) func() {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// Subscribe to a podcast by PC UUID.
+	mux.HandleFunc("/user/podcast/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			UUID string `json:"uuid"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		*cfg.subscribeCalls = append(*cfg.subscribeCalls, body.UUID)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Resolve RSS feed URL → Pocket Casts UUID (public, no auth).
+	mux.HandleFunc("/author/add_feed_url", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		feedURL, _ := body["url"].(string)
+		uuid := ""
+		if cfg.feedURLToUUID != nil {
+			uuid = cfg.feedURLToUUID[feedURL]
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if uuid == "" {
+			_, _ = w.Write([]byte(`{"status":"error","message":"feed not found"}`))
+			return
+		}
+		resp := map[string]any{
+			"status": "ok",
+			"result": map[string]any{
+				"podcast": map[string]any{"uuid": uuid},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
 	srv := httptest.NewServer(mux)
 	pocketcasts.SetBaseURLForTest(srv.URL)
 	pocketcasts.SetCacheURLForTest(srv.URL)
+	pocketcasts.SetRefreshURLForTest(srv.URL)
 	return func() {
 		srv.Close()
 		pocketcasts.SetBaseURLForTest("https://api.pocketcasts.com")
 		pocketcasts.SetCacheURLForTest("https://cache.pocketcasts.com")
+		pocketcasts.SetRefreshURLForTest("https://refresh.pocketcasts.com")
 	}
 }
 
@@ -449,15 +495,79 @@ func TestProvider_SetLibrary_SkipsFromDestinationEpisodes(t *testing.T) {
 	}
 }
 
-func TestProvider_SetLibrary_OnlySubscriptions_ReturnsError(t *testing.T) {
+func TestProvider_SetLibrary_OnlySubscriptions_Succeeds(t *testing.T) {
+	// With an empty library there are no podcasts to subscribe to — the call
+	// should return immediately with nil (no error).
 	restore := newFullTestServer(t, testServerConfig{})
 	defer restore()
 
 	p := pocketcasts.NewProvider("user@example.com", "pass")
 	opts := provider.WriteOptions{OnlySubscriptions: true}
-	err := p.SetLibrary(context.Background(), &model.Library{}, opts)
-	if err == nil {
-		t.Fatal("expected error for OnlySubscriptions on Pocket Casts provider, got nil")
+	if err := p.SetLibrary(context.Background(), &model.Library{}, opts); err != nil {
+		t.Fatalf("SetLibrary OnlySubscriptions empty library: unexpected error: %v", err)
+	}
+}
+
+func TestProvider_SetLibrary_SubscribesNewPodcast(t *testing.T) {
+	// lib has a podcast (gamma) that is NOT in the server's existing subscriptions
+	// (alpha + beta). The provider should resolve the feed URL to a PC UUID and
+	// call /user/podcast/subscribe with that UUID.
+	var subscribeCalls []string
+	restore := newFullTestServer(t, testServerConfig{
+		feedURLToUUID:  map[string]string{"https://feeds.example.com/gamma": "pod3"},
+		subscribeCalls: &subscribeCalls,
+	})
+	defer restore()
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.example.com/gamma", Title: "Gamma Show"},
+		},
+	}
+
+	p := pocketcasts.NewProvider("user@example.com", "pass")
+	opts := provider.WriteOptions{
+		OnlySubscriptions: true,
+		RequestDelay:      time.Millisecond,
+	}
+	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
+		t.Fatalf("SetLibrary subscribe new: %v", err)
+	}
+
+	if len(subscribeCalls) != 1 {
+		t.Fatalf("subscribe calls: got %d, want 1", len(subscribeCalls))
+	}
+	if subscribeCalls[0] != "pod3" {
+		t.Errorf("subscribed UUID = %q, want pod3", subscribeCalls[0])
+	}
+}
+
+func TestProvider_SetLibrary_SkipsAlreadySubscribed(t *testing.T) {
+	// lib has a podcast (alpha) that IS already in the server's existing
+	// subscriptions. The provider should not call /user/podcast/subscribe.
+	var subscribeCalls []string
+	restore := newFullTestServer(t, testServerConfig{
+		subscribeCalls: &subscribeCalls,
+	})
+	defer restore()
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.example.com/alpha", Title: "Alpha Show"},
+		},
+	}
+
+	p := pocketcasts.NewProvider("user@example.com", "pass")
+	opts := provider.WriteOptions{
+		OnlySubscriptions: true,
+		RequestDelay:      time.Millisecond,
+	}
+	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
+		t.Fatalf("SetLibrary skip already-subscribed: %v", err)
+	}
+
+	if len(subscribeCalls) != 0 {
+		t.Errorf("subscribe calls: got %d, want 0 (alpha already subscribed)", len(subscribeCalls))
 	}
 }
 
@@ -473,8 +583,8 @@ func TestProvider_Capabilities(t *testing.T) {
 	if !caps.WritePlayState {
 		t.Error("WritePlayState should be true")
 	}
-	if caps.WriteSubscriptions {
-		t.Error("WriteSubscriptions should be false (Phase 1 limitation)")
+	if !caps.WriteSubscriptions {
+		t.Error("WriteSubscriptions should be true")
 	}
 }
 

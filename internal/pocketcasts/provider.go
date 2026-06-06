@@ -47,10 +47,9 @@ func (p *Provider) Name() string { return "Pocket Casts" }
 
 func (p *Provider) Capabilities() provider.Capabilities {
 	return provider.Capabilities{
-		ReadSubscriptions: true,
-		ReadPlayState:     true,
-		// Subscription writes are not implemented in Phase 1.
-		WriteSubscriptions: false,
+		ReadSubscriptions:  true,
+		ReadPlayState:      true,
+		WriteSubscriptions: true,
 		WritePlayState:     true,
 	}
 }
@@ -134,28 +133,142 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 	}, nil
 }
 
-// SetLibrary writes episode play state to Pocket Casts.
+// SetLibrary writes subscriptions and/or episode play state to Pocket Casts.
 //
-// Subscription writes are not supported in Phase 1. Only play state is written
-// when opts.OnlySubscriptions is false.
+// Subscriptions are always written first: any podcast in lib that the user is
+// not yet subscribed to in Pocket Casts is resolved via RSS feed URL and
+// subscribed to before the play-state pass begins. This ensures that newly
+// subscribed podcasts are visible during episode matching.
+//
+// With opts.OnlySubscriptions the play-state pass is skipped.
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
-	if opts.OnlySubscriptions {
-		return &provider.ErrCapabilityUnsupported{
-			Provider:  p.Name(),
-			Operation: "write subscriptions (not yet implemented — subscribe manually in the Pocket Casts app)",
-		}
-	}
-
-	n, err := p.doWritePlayState(ctx, lib, opts)
-	if err != nil {
-		return err
-	}
 	prefix := ""
 	if opts.DryRun {
 		prefix = "[dry-run] "
 	}
+
+	// Step 1: subscribe to any missing podcasts.
+	subCount, err := p.doWriteSubscriptions(ctx, lib, opts)
+	if err != nil {
+		return err
+	}
+	if subCount > 0 {
+		fmt.Printf("%ssubscribed to %d podcast(s)\n", prefix, subCount)
+	}
+
+	if opts.OnlySubscriptions {
+		return nil
+	}
+
+	// Step 2: write episode play state. doWritePlayState does its own auth and
+	// subscription fetch, so it will see any podcasts added in Step 1.
+	n, err := p.doWritePlayState(ctx, lib, opts)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("%supdated play state for %d episode(s)\n", prefix, n)
 	return nil
+}
+
+// doWriteSubscriptions subscribes the authenticated user to every podcast in
+// lib that is not already in their Pocket Casts library. Each new podcast is
+// resolved from its RSS feed URL to a Pocket Casts UUID via the public
+// refresh.pocketcasts.com service, then subscribed via the authenticated API.
+// Returns the number of new subscriptions created (or that would be created in
+// a dry-run).
+func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library, opts provider.WriteOptions) (int, error) {
+	if len(lib.Podcasts) == 0 {
+		return 0, nil
+	}
+
+	requestDelay := opts.RequestDelay
+	if requestDelay <= 0 {
+		requestDelay = DefaultRequestDelay
+	}
+
+	fmt.Printf("pocketcasts: authenticating as %s...\n", p.email)
+	client, err := Login(ctx, p.email, p.password)
+	if err != nil {
+		return 0, fmt.Errorf("pocketcasts: authentication failed: %w", err)
+	}
+	time.Sleep(requestDelay)
+
+	fmt.Printf("pocketcasts: fetching existing subscriptions...\n")
+	existing, err := FetchSubscribedPodcasts(ctx, client)
+	if err != nil {
+		return 0, fmt.Errorf("pocketcasts: fetch subscriptions: %w", err)
+	}
+
+	// Build set of already-subscribed feed URLs.
+	subscribedFeeds := make(map[string]bool, len(existing))
+	for _, pod := range existing {
+		if pod.URL != "" {
+			subscribedFeeds[normalizeFeedURL(pod.URL)] = true
+		}
+	}
+
+	// Determine which source podcasts are not yet subscribed.
+	var toSubscribe []model.Podcast
+	for _, pod := range lib.Podcasts {
+		if pod.FeedURL == "" || subscribedFeeds[normalizeFeedURL(pod.FeedURL)] {
+			continue
+		}
+		toSubscribe = append(toSubscribe, pod)
+	}
+
+	if len(toSubscribe) == 0 {
+		fmt.Printf("pocketcasts: all %d podcast(s) already subscribed\n", len(lib.Podcasts))
+		return 0, nil
+	}
+
+	fmt.Printf("pocketcasts: %d/%d podcast(s) to subscribe (%d already subscribed)\n",
+		len(toSubscribe), len(lib.Podcasts), len(existing))
+
+	if opts.DryRun {
+		for _, pod := range toSubscribe {
+			title := pod.Title
+			if title == "" {
+				title = pod.FeedURL
+			}
+			fmt.Printf("  [dry-run] would subscribe: %q\n", title)
+		}
+		return len(toSubscribe), nil
+	}
+
+	subscribed := 0
+	failed := 0
+	for _, pod := range toSubscribe {
+		title := pod.Title
+		if title == "" {
+			title = pod.FeedURL
+		}
+
+		// Resolve RSS feed URL → Pocket Casts podcast UUID.
+		pcUUID, err := ResolveFeedToPodcastUUID(ctx, pod.FeedURL)
+		if err != nil {
+			fmt.Printf("  warning: could not resolve %q: %v\n", title, err)
+			failed++
+			continue
+		}
+
+		// Subscribe.
+		if err := SubscribePodcast(ctx, client, pcUUID); err != nil {
+			fmt.Printf("  warning: could not subscribe to %q: %v\n", title, err)
+			failed++
+			continue
+		}
+
+		subscribed++
+		if subscribed <= 5 || subscribed%20 == 0 {
+			fmt.Printf("  [%d/%d] ✓ subscribed: %q\n", subscribed, len(toSubscribe), title)
+		}
+		time.Sleep(requestDelay)
+	}
+
+	if failed > 0 {
+		fmt.Printf("pocketcasts: %d subscription(s) failed (see warnings above)\n", failed)
+	}
+	return subscribed, nil
 }
 
 // pcIndexEntry holds the Pocket Casts data needed to update an episode.

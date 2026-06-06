@@ -13,18 +13,20 @@ import (
 	"github.com/tyler/podcast-migrate/internal/pocketcasts"
 )
 
-// newTestServer creates an httptest.Server with the given mux, points both
-// pcBaseURL and pcCacheURL at it, and returns a restore func. The caller must
-// defer the restore func to reset the URLs and close the server.
+// newTestServer creates an httptest.Server with the given mux, points
+// pcBaseURL, pcCacheURL, and pcRefreshURL at it, and returns a restore func.
+// The caller must defer the restore func to reset the URLs and close the server.
 func newTestServer(t *testing.T, mux *http.ServeMux) func() {
 	t.Helper()
 	srv := httptest.NewServer(mux)
 	pocketcasts.SetBaseURLForTest(srv.URL)
 	pocketcasts.SetCacheURLForTest(srv.URL)
+	pocketcasts.SetRefreshURLForTest(srv.URL)
 	return func() {
 		srv.Close()
 		pocketcasts.SetBaseURLForTest("https://api.pocketcasts.com")
 		pocketcasts.SetCacheURLForTest("https://cache.pocketcasts.com")
+		pocketcasts.SetRefreshURLForTest("https://refresh.pocketcasts.com")
 	}
 }
 
@@ -509,6 +511,135 @@ func TestAPIEpisode_ParsePublishedAt_Invalid(t *testing.T) {
 	got := ep.ParsePublishedAt()
 	if !got.IsZero() {
 		t.Errorf("ParsePublishedAt() invalid = %v, want zero time", got)
+	}
+}
+
+// ---- ResolveFeedToPodcastUUID ----
+
+func TestResolveFeedToPodcastUUID_ImmediateOK(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/author/add_feed_url", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["url"] != "https://feeds.example.com/mypodcast" {
+			t.Errorf("url = %v, want feed URL", body["url"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","result":{"podcast":{"uuid":"pc-uuid-123","title":"My Podcast"}}}`))
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	uuid, err := pocketcasts.ResolveFeedToPodcastUUID(context.Background(), "https://feeds.example.com/mypodcast")
+	if err != nil {
+		t.Fatalf("ResolveFeedToPodcastUUID: %v", err)
+	}
+	if uuid != "pc-uuid-123" {
+		t.Errorf("uuid = %q, want pc-uuid-123", uuid)
+	}
+}
+
+func TestResolveFeedToPodcastUUID_PollThenOK(t *testing.T) {
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/author/add_feed_url", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			_, _ = w.Write([]byte(`{"status":"poll","poll_uuid":"poll-token-abc"}`))
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["poll_uuid"] != "poll-token-abc" {
+			t.Errorf("call %d: poll_uuid = %v, want poll-token-abc", calls, body["poll_uuid"])
+		}
+		_, _ = w.Write([]byte(`{"status":"ok","result":{"podcast":{"uuid":"pc-uuid-456"}}}`))
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+	// Set poll interval to 0 so the test doesn't sleep 2 seconds between attempts.
+	pocketcasts.SetPollIntervalForTest(0)
+	t.Cleanup(func() { pocketcasts.SetPollIntervalForTest(2 * time.Second) })
+
+	uuid, err := pocketcasts.ResolveFeedToPodcastUUID(context.Background(), "https://feeds.example.com/slow")
+	if err != nil {
+		t.Fatalf("ResolveFeedToPodcastUUID poll: %v", err)
+	}
+	if uuid != "pc-uuid-456" {
+		t.Errorf("uuid = %q, want pc-uuid-456", uuid)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2 (one poll + one ok)", calls)
+	}
+}
+
+func TestResolveFeedToPodcastUUID_ErrorStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/author/add_feed_url", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"error"}`))
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	_, err := pocketcasts.ResolveFeedToPodcastUUID(context.Background(), "https://feeds.example.com/bad")
+	if err == nil {
+		t.Fatal("expected error for status=error, got nil")
+	}
+}
+
+// ---- SubscribePodcast ----
+
+func TestSubscribePodcast_Success(t *testing.T) {
+	var gotUUID string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/podcast/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		var body struct {
+			UUID string `json:"uuid"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotUUID = body.UUID
+		w.WriteHeader(http.StatusOK)
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	client := authedClient(t)
+	err := pocketcasts.SubscribePodcast(context.Background(), client, "pc-uuid-789")
+	if err != nil {
+		t.Fatalf("SubscribePodcast: %v", err)
+	}
+	if gotUUID != "pc-uuid-789" {
+		t.Errorf("uuid = %q, want pc-uuid-789", gotUUID)
+	}
+}
+
+func TestSubscribePodcast_RateLimit(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/podcast/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "45")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	client := authedClient(t)
+	err := pocketcasts.SubscribePodcast(context.Background(), client, "uuid")
+	var rl *pocketcasts.RateLimitError
+	if !isRateLimitError(err, &rl) {
+		t.Fatalf("expected RateLimitError, got: %v", err)
+	}
+	if rl.Wait != 45*time.Second {
+		t.Errorf("Wait = %v, want 45s", rl.Wait)
 	}
 }
 

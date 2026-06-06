@@ -12,11 +12,13 @@ package pocketcasts
 // callers use the returned *http.Client normally without per-call setup.
 //
 // Endpoints used:
-//   POST https://api.pocketcasts.com/user/login                          — authenticate, get Bearer token
-//   POST https://api.pocketcasts.com/user/podcast/list                   — subscribed podcast list
-//   POST https://api.pocketcasts.com/user/in_progress                    — in-progress episodes
-//   GET  https://cache.pocketcasts.com/podcast/full/{uuid}/{page}/3/1000 — paginated episode metadata
-//   POST https://api.pocketcasts.com/sync/update_episode                 — set play position/status
+//   POST https://api.pocketcasts.com/user/login                              — authenticate, get Bearer token
+//   POST https://api.pocketcasts.com/user/podcast/list                       — subscribed podcast list
+//   POST https://api.pocketcasts.com/user/in_progress                        — in-progress episodes
+//   GET  https://cache.pocketcasts.com/podcast/full/{uuid}/{page}/3/1000     — paginated episode metadata
+//   POST https://api.pocketcasts.com/sync/update_episode                     — set play position/status
+//   POST https://api.pocketcasts.com/user/podcast/subscribe                  — subscribe to a podcast by UUID
+//   POST https://refresh.pocketcasts.com/author/add_feed_url                 — resolve RSS feed URL → podcast UUID (public, no auth)
 
 import (
 	"bytes"
@@ -30,8 +32,10 @@ import (
 	"time"
 )
 
-var pcBaseURL  = "https://api.pocketcasts.com"
-var pcCacheURL = "https://cache.pocketcasts.com"
+var pcBaseURL     = "https://api.pocketcasts.com"
+var pcCacheURL    = "https://cache.pocketcasts.com"
+var pcRefreshURL  = "https://refresh.pocketcasts.com"
+var pcPollInterval = 2 * time.Second
 
 // SetBaseURLForTest overrides the Pocket Casts API base URL for unit tests
 // that spin up an httptest.Server. Must be reset after each test.
@@ -40,6 +44,14 @@ func SetBaseURLForTest(u string) { pcBaseURL = u }
 // SetCacheURLForTest overrides the Pocket Casts cache CDN base URL for unit
 // tests. Must be reset after each test.
 func SetCacheURLForTest(u string) { pcCacheURL = u }
+
+// SetRefreshURLForTest overrides the Pocket Casts feed-resolution service URL
+// for unit tests. Must be reset after each test.
+func SetRefreshURLForTest(u string) { pcRefreshURL = u }
+
+// SetPollIntervalForTest overrides the polling delay used by
+// ResolveFeedToPodcastUUID so tests complete without sleeping.
+func SetPollIntervalForTest(d time.Duration) { pcPollInterval = d }
 
 const (
 	pcUA = "podcast-migrate/1.0 (github.com/tyler/podcast-migrate)"
@@ -386,6 +398,128 @@ func UpdateEpisodeProgress(ctx context.Context, client *http.Client,
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("pocketcasts/web: /sync/update_episode returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(body))
+	}
+	return nil
+}
+
+// ResolveFeedToPodcastUUID resolves a podcast RSS feed URL to the Pocket Casts
+// internal podcast UUID using the feed submission service at
+// refresh.pocketcasts.com. This endpoint is public and does not require
+// authentication.
+//
+// The service may respond with status "poll" and a poll_uuid on the first
+// request, requiring the caller to retry with that token until status "ok"
+// is returned. Up to maxResolvePollAttempts attempts are made with a 2s pause.
+func ResolveFeedToPodcastUUID(ctx context.Context, feedURL string) (string, error) {
+	const maxAttempts = 10
+
+	type resolveResponse struct {
+		Status   string `json:"status"`
+		PollUUID string `json:"poll_uuid"`
+		Result   struct {
+			Podcast struct {
+				UUID string `json:"uuid"`
+			} `json:"podcast"`
+		} `json:"result"`
+	}
+
+	var pollUUID string
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(pcPollInterval):
+			}
+		}
+
+		reqMap := map[string]any{
+			"url":           feedURL,
+			"public_option": "no",
+		}
+		if pollUUID != "" {
+			reqMap["poll_uuid"] = pollUUID
+		}
+		data, err := json.Marshal(reqMap)
+		if err != nil {
+			return "", fmt.Errorf("pocketcasts/web: marshal feed-resolve request: %w", err)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			pcRefreshURL+"/author/add_feed_url", bytes.NewReader(data))
+		if err != nil {
+			return "", fmt.Errorf("pocketcasts/web: build feed-resolve request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", pcUA)
+		req.Header.Set("Origin", "https://pocketcasts.com")
+		req.Header.Set("Referer", "https://pocketcasts.com/")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("pocketcasts/web: feed-resolve POST: %w", err)
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("pocketcasts/web: feed-resolve returned HTTP %d: %s",
+				resp.StatusCode, bodyExcerpt(body))
+		}
+
+		var result resolveResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", fmt.Errorf("pocketcasts/web: parse feed-resolve response: %w", err)
+		}
+
+		switch result.Status {
+		case "ok":
+			if result.Result.Podcast.UUID == "" {
+				return "", fmt.Errorf("pocketcasts/web: feed-resolve succeeded but returned no UUID for %s", feedURL)
+			}
+			return result.Result.Podcast.UUID, nil
+		case "poll":
+			pollUUID = result.PollUUID
+		default:
+			return "", fmt.Errorf("pocketcasts/web: feed-resolve returned status %q for %s", result.Status, feedURL)
+		}
+	}
+	return "", fmt.Errorf("pocketcasts/web: feed-resolve timed out after %d attempts for %s", maxAttempts, feedURL)
+}
+
+// SubscribePodcast subscribes the authenticated user to a podcast by its
+// Pocket Casts internal UUID. Use ResolveFeedToPodcastUUID first to obtain
+// the UUID from an RSS feed URL.
+func SubscribePodcast(ctx context.Context, client *http.Client, podcastUUID string) error {
+	data, err := json.Marshal(map[string]string{"uuid": podcastUUID})
+	if err != nil {
+		return fmt.Errorf("pocketcasts/web: marshal subscribe request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		pcBaseURL+"/user/podcast/subscribe", bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("pocketcasts/web: build subscribe request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/podcast/subscribe: %w", err)}
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
+	if resp.StatusCode >= 500 {
+		return &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/podcast/subscribe returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(body))}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("pocketcasts/web: /user/podcast/subscribe returned HTTP %d: %s",
 			resp.StatusCode, bodyExcerpt(body))
 	}
 	return nil

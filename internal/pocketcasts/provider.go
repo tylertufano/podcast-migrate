@@ -564,7 +564,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 								}
 								if podUUID == "" && len(srcFuzzy) >= 5 {
 									for pcFuzzy, uuid := range fuzzyTitleToPodUUID {
-										if strings.Contains(pcFuzzy, srcFuzzy) || strings.Contains(srcFuzzy, pcFuzzy) {
+										if titleHasWordPrefix(pcFuzzy, srcFuzzy) || titleHasWordPrefix(srcFuzzy, pcFuzzy) {
 											podUUID = uuid
 											break
 										}
@@ -965,4 +965,17 @@ func fuzzyPCTitle(title string) string {
 		norm = title
 	}
 	return migrate.FuzzyNormalizeTitle(norm)
+}
+
+// titleHasWordPrefix mirrors the helper in sync/engine.go.  See that function
+// for the full rationale; in short, it prevents false positives like
+// "pod save america" matching "breaking news from pod save america".
+func titleHasWordPrefix(longer, shorter string) bool {
+	if !strings.HasPrefix(longer, shorter) {
+		return false
+	}
+	if len(longer) == len(shorter) {
+		return true
+	}
+	return longer[len(shorter)] == ' '
 }

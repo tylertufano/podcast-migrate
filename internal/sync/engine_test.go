@@ -1129,7 +1129,8 @@ func TestApplyFeedMap_NormalisesHTTPKey(t *testing.T) {
 
 func TestBuildAutoFeedMap_SubtitleContainsMatch_Remaps(t *testing.T) {
 	// Apple stores "Crooked City" but PC/Overcast imported it as "Crooked City: Dixon, IL".
-	// The fuzzy contains-match pass should still find the destination feed.
+	// The fuzzy prefix-match pass should still find the destination feed — "crooked city"
+	// is a word-aligned prefix of "crooked city dixon il".
 	srcLib := &model.Library{
 		Podcasts: []model.Podcast{
 			{FeedURL: "https://feeds.megaphone.fm/crookedcity", Title: "Crooked City"},
@@ -1169,8 +1170,8 @@ func TestBuildAutoFeedMap_SubtitleContainsMatch_DstShorter(t *testing.T) {
 }
 
 func TestBuildAutoFeedMap_ShortTitleContains_NoFalsePositive(t *testing.T) {
-	// A very short normalised title like "news" must not accidentally match
-	// "the news hour" or similar via contains. The 5-char minimum guards this.
+	// A very short normalised title like "go" must not accidentally match
+	// "goto podcast" via the prefix pass (it fails the 5-char minimum).
 	srcLib := &model.Library{
 		Podcasts: []model.Podcast{
 			{FeedURL: "https://apple.feed/abc", Title: "Go"}, // fuzzyPodcastTitle → "go" (2 chars < 5)
@@ -1183,6 +1184,29 @@ func TestBuildAutoFeedMap_ShortTitleContains_NoFalsePositive(t *testing.T) {
 	}
 	got := buildAutoFeedMap(srcLib, dstLib)
 	if len(got) != 0 {
-		t.Errorf("short title should not trigger contains-match, got: %v", got)
+		t.Errorf("short title should not trigger prefix-match, got: %v", got)
+	}
+}
+
+func TestBuildAutoFeedMap_SuffixTitle_NoFalsePositive(t *testing.T) {
+	// "Pod Save America" must NOT match "Breaking News from Pod Save America":
+	// the former appears as a suffix of the latter's fuzzy title, not a prefix.
+	// This guards against the regression where contains-match incorrectly
+	// attributed Pod Save America episodes to the Breaking News companion feed.
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.simplecast.com/podsaveamerica", Title: "Pod Save America"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			// Pod Save America itself is absent (simulating the incomplete
+			// FetchSubscribedPodcasts response), leaving only the companion feed.
+			{FeedURL: "https://feeds.simplecast.com/breakingnews", Title: "Breaking News from Pod Save America"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 0 {
+		t.Errorf("suffix title must not trigger prefix-match; got false mapping: %v", got)
 	}
 }

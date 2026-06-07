@@ -324,10 +324,16 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 			feedMap[pod.FeedURL] = dstFeed
 			continue
 		}
-		// Pass 2: contains-match — handles subtitle additions.
+		// Pass 2: prefix-match — handles subtitle additions such as
+		// "Crooked City" ↔ "Crooked City: Dixon, IL".
+		//
+		// One title must be a word-aligned prefix of the other.  A plain
+		// contains-match would create false positives like
+		// "Pod Save America" matching "Breaking News from Pod Save America"
+		// (the former appears as a suffix of the latter's fuzzy title).
 		if len(t) >= 5 {
 			for dstT, dstFeed := range dstTitleToFeed {
-				if strings.Contains(dstT, t) || strings.Contains(t, dstT) {
+				if titleHasWordPrefix(dstT, t) || titleHasWordPrefix(t, dstT) {
 					if feedMap == nil {
 						feedMap = make(map[string]string)
 					}
@@ -338,6 +344,26 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		}
 	}
 	return feedMap
+}
+
+// titleHasWordPrefix reports whether shorter is a word-aligned prefix of longer.
+// Both strings are expected to be the output of fuzzyPodcastTitle (lowercase,
+// space-separated words, no punctuation).
+//
+// "Word-aligned" means that if shorter is strictly shorter than longer, the
+// character in longer immediately after the prefix must be a space — so the
+// match does not land mid-word.  This prevents "pod save america" from matching
+// "breaking news from pod save america" (suffix, not prefix) while still
+// allowing "crooked city" to match "crooked city dixon il" (true prefix with a
+// word boundary after "city").
+func titleHasWordPrefix(longer, shorter string) bool {
+	if !strings.HasPrefix(longer, shorter) {
+		return false
+	}
+	if len(longer) == len(shorter) {
+		return true // exact match
+	}
+	return longer[len(shorter)] == ' '
 }
 
 // fuzzyPodcastTitle normalises a podcast title for cross-library matching.

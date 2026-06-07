@@ -1128,9 +1128,13 @@ func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 				index[key] = entry
 			}
 		}
-		// Fallback key: normalized title + feedURL.
+		// Fallback key: fuzzy-normalised title + feedURL.
+		// FuzzyNormalizeTitle strips season markers (S01, Season 1, …) and
+		// punctuation so that title variants across subscriber and public feeds
+		// ("The Retrievals - Ep. 4" vs "The Retrievals S01 - Ep. 4") resolve to
+		// the same key and are recognised as the same episode.
 		if ep.FeedURL != "" && ep.Title != "" {
-			key := "feedtitle:" + normalizeFeedURL(ep.FeedURL) + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
+			key := "feedtitle:" + normalizeFeedURL(ep.FeedURL) + "|" + migrate.FuzzyNormalizeTitle(ep.Title)
 			if _, exists := index[key]; !exists {
 				index[key] = entry
 			}
@@ -1222,8 +1226,10 @@ func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeSt
 	}
 	// Title-based fallback: same feed URL, different pub date.  Skipped when
 	// strictFeedMatch is true (caller wants only exact date+URL matches).
+	// Uses FuzzyNormalizeTitle to match across season-marker variants
+	// ("The Retrievals - Ep. 4" ↔ "The Retrievals S01 - Ep. 4").
 	if !strictFeedMatch && ep.FeedURL != "" && ep.Title != "" {
-		key := "feedtitle:" + normFeed + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
+		key := "feedtitle:" + normFeed + "|" + migrate.FuzzyNormalizeTitle(ep.Title)
 		if entry, ok := index[key]; ok {
 			return entry, true
 		}

@@ -773,9 +773,13 @@ func addToIndex(index map[string]pcIndexEntry, ep *APIEpisode, feedURL string) {
 			index[key] = entry
 		}
 	}
-	// Fallback: feed URL + normalised title.
+	// Fallback: feed URL + fuzzy-normalised title.
+	// FuzzyNormalizeTitle strips season markers (S01, Season 1, …) and
+	// punctuation so that title variants across subscriber and public feeds
+	// ("The Retrievals - Ep. 4" vs "The Retrievals S01 - Ep. 4") resolve to
+	// the same key and are recognised as the same episode.
 	if normFeed != "" && ep.Title != "" {
-		key := "feedtitle:" + normFeed + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
+		key := "feedtitle:" + normFeed + "|" + migrate.FuzzyNormalizeTitle(ep.Title)
 		if _, exists := index[key]; !exists {
 			index[key] = entry
 		}
@@ -792,8 +796,10 @@ func findInIndex(index map[string]pcIndexEntry, ep model.EpisodeState) (pcIndexE
 			return entry, true
 		}
 	}
+	// Uses FuzzyNormalizeTitle to match across season-marker variants
+	// ("The Retrievals - Ep. 4" ↔ "The Retrievals S01 - Ep. 4").
 	if ep.FeedURL != "" && ep.Title != "" {
-		key := "feedtitle:" + normFeed + "|" + strings.ToLower(strings.TrimSpace(ep.Title))
+		key := "feedtitle:" + normFeed + "|" + migrate.FuzzyNormalizeTitle(ep.Title)
 		if entry, ok := index[key]; ok {
 			return entry, true
 		}

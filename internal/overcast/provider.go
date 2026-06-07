@@ -211,6 +211,10 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		}
 		fmt.Printf("overcast: fetched %d podcast(s), %d episode(s) from live account\n",
 			len(matchLib.Podcasts), len(matchLib.Episodes))
+		// Pause after OPML fetch so that the /podcasts request inside
+		// augmentIndexFromPodcastPages (step 6) doesn't immediately follow
+		// a live-OPML request back-to-back (login → OPML → /podcasts).
+		time.Sleep(requestDelay)
 	}
 
 	// 4. Build the episode-ID index from the resolved matching library.

@@ -260,7 +260,7 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&overcastEmail, "overcast-email", "", "Overcast account email (or set OVERCAST_EMAIL env var)")
 	cmd.Flags().StringVar(&overcastPassword, "overcast-password", "", "Overcast account password (or set OVERCAST_PASSWORD env var)")
 	cmd.Flags().StringVar(&conflictStrategy, "conflict", "furthest", "conflict resolution: furthest | source | target")
-	cmd.Flags().DurationVar(&requestDelay, "request-delay", 0, "delay between consecutive API requests to Overcast or Apple (default 500ms for both; increase if you hit 429 rate limits)")
+	cmd.Flags().DurationVar(&requestDelay, "request-delay", 0, "delay between consecutive API requests to Overcast or Apple (default 1s; increase if you hit 429 rate limits)")
 	cmd.Flags().DurationVar(&titleMatchTolerance, "title-match-tolerance", 72*time.Hour,
 		"max pub-date gap allowed when matching episodes by title (strategies 2 & 4 fallback);\n"+
 			"prevents false matches between same-named episodes published years apart;\n"+

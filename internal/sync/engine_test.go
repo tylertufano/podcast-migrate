@@ -911,6 +911,137 @@ func keys[K comparable, V any](m map[K]V) []K {
 	return ks
 }
 
+// ---- buildAutoFeedMap ----
+
+func TestBuildAutoFeedMap_NilInputs_ReturnsNil(t *testing.T) {
+	if got := buildAutoFeedMap(nil, nil); got != nil {
+		t.Errorf("nil inputs: got %v, want nil", got)
+	}
+	if got := buildAutoFeedMap(&model.Library{}, nil); got != nil {
+		t.Errorf("nil dst: got %v, want nil", got)
+	}
+}
+
+func TestBuildAutoFeedMap_TitleMatch_Remaps(t *testing.T) {
+	// Source has a subscriber feed URL not in the destination; destination has the
+	// same show under a different (public) URL. Auto-map should link them.
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://subscriber.apple.com/pod-save-america", Title: "Pod Save America"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.megaphone.fm/pod-save-america", Title: "Pod Save America"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 mapping, got %d: %v", len(got), got)
+	}
+	want := "https://feeds.megaphone.fm/pod-save-america"
+	if v := got["https://subscriber.apple.com/pod-save-america"]; v != want {
+		t.Errorf("remapped URL: got %q, want %q", v, want)
+	}
+}
+
+func TestBuildAutoFeedMap_PlusTierVariant_Remaps(t *testing.T) {
+	// "Pod Save America+" in source should match "Pod Save America" in destination
+	// after NormalizePlusTitle strips the "+".
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://subscriber.apple.com/psa-plus", Title: "Pod Save America+"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.megaphone.fm/psa", Title: "Pod Save America"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 mapping, got %d: %v", len(got), got)
+	}
+	if v := got["https://subscriber.apple.com/psa-plus"]; v != "https://feeds.megaphone.fm/psa" {
+		t.Errorf("Plus-tier mapping: got %q, want https://feeds.megaphone.fm/psa", v)
+	}
+}
+
+func TestBuildAutoFeedMap_DirectMatchSkipped(t *testing.T) {
+	// When source and destination share the same (normalised) feed URL, no
+	// remapping should be generated for that podcast.
+	sharedFeed := "https://feeds.megaphone.fm/shared-show"
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: sharedFeed, Title: "Shared Show"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: sharedFeed, Title: "Shared Show"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 0 {
+		t.Errorf("direct match should produce no mapping; got %v", got)
+	}
+}
+
+func TestBuildAutoFeedMap_NoTitleMatch_ReturnsNil(t *testing.T) {
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://src.example.com/showA", Title: "Show A"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://dst.example.com/showB", Title: "Show B"},
+		},
+	}
+	if got := buildAutoFeedMap(srcLib, dstLib); got != nil {
+		t.Errorf("no title match: expected nil, got %v", got)
+	}
+}
+
+func TestBuildAutoFeedMap_FuzzyPunctuation_Remaps(t *testing.T) {
+	// Punctuation differences in the podcast title should still match via
+	// fuzzyPodcastTitle (e.g. O'Brien vs OBrien after apostrophe strip).
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://apple.sub/conan", Title: "Conan O'Brien Needs a Friend"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://target.feed/conan", Title: "Conan OBrien Needs a Friend"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 fuzzy-punctuation mapping, got %d: %v", len(got), got)
+	}
+}
+
+// ---- fuzzyPodcastTitle ----
+
+func TestFuzzyPodcastTitle_PlusSuffix(t *testing.T) {
+	if a, b := fuzzyPodcastTitle("Fresh Air+"), fuzzyPodcastTitle("Fresh Air"); a != b {
+		t.Errorf("Plus suffix: %q vs %q should be equal after normalisation", a, b)
+	}
+}
+
+func TestFuzzyPodcastTitle_PlusTierWordSuffix(t *testing.T) {
+	if a, b := fuzzyPodcastTitle("The Daily Plus"), fuzzyPodcastTitle("The Daily"); a != b {
+		t.Errorf("Plus word: %q vs %q should be equal after normalisation", a, b)
+	}
+}
+
+func TestFuzzyPodcastTitle_Punctuation(t *testing.T) {
+	if a, b := fuzzyPodcastTitle("Conan O'Brien"), fuzzyPodcastTitle("Conan OBrien"); a != b {
+		t.Errorf("apostrophe: %q vs %q should be equal after normalisation", a, b)
+	}
+}
+
 // ---- applyFeedMap ----
 
 func TestApplyFeedMap_NilLib_ReturnsNil(t *testing.T) {

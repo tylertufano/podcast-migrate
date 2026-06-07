@@ -16,10 +16,19 @@ import (
 	"github.com/tyler/podcast-migrate/internal/model"
 )
 
-// fuzzySeasonRe matches common season-marker patterns: "S01", "S1", "S001",
-// "Season 1", "Season 01", etc. Used by FuzzyNormalizeTitle.
+// Regexes used by FuzzyNormalizeTitle.
 var (
-	fuzzySeasonRe  = regexp.MustCompile(`(?i)(?:season\s+\d+|\bs\d{1,3}\b)`)
+	// fuzzySeasonRe matches season markers: "S01", "S1", "Season 1", "Season 01", etc.
+	fuzzySeasonRe = regexp.MustCompile(`(?i)(?:season\s+\d+|\bs\d{1,3}\b)`)
+	// fuzzyApostropheRe matches apostrophes and typographic equivalents.
+	// These are removed (not replaced with a space) so "O'Brien" and "OBrien"
+	// normalise to the same string "obrien", enabling podcast title matching
+	// across databases that may or may not include apostrophes.
+	// Note: Unicode escapes inside [...] require the \x{NNNN} form in RE2.
+	fuzzyApostropheRe = regexp.MustCompile(`['\x60\x{2018}\x{2019}]`)
+	// fuzzyNonAlnumRe matches any remaining non-alphanumeric, non-space character
+	// after the apostrophe pass. These are replaced with a space (e.g. hyphens
+	// in "Self-Help" become a word boundary rather than nothing).
 	fuzzyNonAlnumRe = regexp.MustCompile(`[^a-z0-9 ]`)
 )
 
@@ -112,7 +121,8 @@ func FilterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[stri
 func FuzzyNormalizeTitle(s string) string {
 	s = strings.ToLower(s)
 	s = fuzzySeasonRe.ReplaceAllString(s, " ")
-	s = fuzzyNonAlnumRe.ReplaceAllString(s, " ")
+	s = fuzzyApostropheRe.ReplaceAllString(s, "") // remove apostrophes (no gap)
+	s = fuzzyNonAlnumRe.ReplaceAllString(s, " ")  // other punctuation → word gap
 	s = strings.Join(strings.Fields(s), " ")
 	return s
 }

@@ -72,11 +72,25 @@ func (e *Engine) Run(ctx context.Context, opts provider.WriteOptions) (*Result, 
 		}
 	}
 
-	// Remap subscriber feed URLs to their analog destination feed URLs before
-	// merging. This lets users pre-subscribe to private feeds on the target
-	// (e.g. an Overcast or Pocket Casts exclusive subscriber feed) and have
-	// their Apple Podcasts play state migrate to those feeds rather than to the
-	// public equivalent. See provider.WriteOptions.FeedMap for details.
+	// Auto-derive feed URL remapping from title matching between source and
+	// destination subscription lists. For any source podcast whose feed URL is
+	// not already a direct subscription on the destination (e.g. Apple internal
+	// or subscriber feeds), find a destination podcast with a matching title and
+	// remap the source feed URL to the destination's. This runs unconditionally
+	// so users do not need --feed-map or --subscribed-only for the common case
+	// of pre-subscribing to the analog feed on the target platform.
+	if dstLib != nil {
+		if autoMap := buildAutoFeedMap(srcLib, dstLib); len(autoMap) > 0 {
+			for src, dst := range autoMap {
+				fmt.Printf("feed-map (auto): %s → %s\n", src, dst)
+			}
+			srcLib = applyFeedMap(srcLib, autoMap)
+		}
+	}
+
+	// Apply any explicit --feed-map overrides on top of auto-derived mapping.
+	// Explicit entries take precedence: applyFeedMap is called again so they
+	// overwrite any auto-derived remapping for the same source feed URL.
 	if len(opts.FeedMap) > 0 {
 		srcLib = applyFeedMap(srcLib, opts.FeedMap)
 	}
@@ -235,6 +249,89 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 	}
 
 	return out
+}
+
+// buildAutoFeedMap derives a feed URL remapping by matching source podcast
+// titles against already-subscribed destination podcast titles. It is called
+// automatically before merging so that Apple internal/subscriber feeds (which
+// have no public RSS URL) are silently mapped to the user's pre-subscribed
+// analog on the target platform without requiring --feed-map.
+//
+// Only source podcasts whose feed URL is not already a direct subscription on
+// the destination are considered (to avoid double-remapping shows that share
+// the same RSS feed on both sides).
+//
+// Matching uses fuzzyPodcastTitle: Plus-tier suffix stripping
+// (model.NormalizePlusTitle) followed by fuzzy normalisation
+// (migrate.FuzzyNormalizeTitle). This ensures "Pod Save America+",
+// "Pod Save America Plus", and "Pod Save America" all compare equal, and that
+// punctuation differences ("Conan O'Brien" vs "Conan OBrien") don't prevent a
+// match.
+//
+// Returns nil if no remapping is needed.
+func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
+	if srcLib == nil || dstLib == nil {
+		return nil
+	}
+
+	// Build normalised destination feed URL set for quick "already subscribed" check.
+	dstFeedNorms := make(map[string]bool, len(dstLib.Podcasts))
+	for _, pod := range dstLib.Podcasts {
+		if norm := migrate.NormalizeFeedURL(pod.FeedURL); norm != "" {
+			dstFeedNorms[norm] = true
+		}
+	}
+
+	// Build normalised podcast title → destination feed URL lookup.
+	// First occurrence of a given normalised title wins.
+	dstTitleToFeed := make(map[string]string, len(dstLib.Podcasts))
+	for _, pod := range dstLib.Podcasts {
+		if pod.FeedURL == "" {
+			continue
+		}
+		if t := fuzzyPodcastTitle(pod.Title); t != "" {
+			if _, exists := dstTitleToFeed[t]; !exists {
+				dstTitleToFeed[t] = pod.FeedURL
+			}
+		}
+	}
+
+	// For each source podcast that is not already subscribed at the destination
+	// by feed URL, attempt a title-based match.
+	var feedMap map[string]string
+	for _, pod := range srcLib.Podcasts {
+		if pod.FeedURL == "" {
+			continue
+		}
+		if dstFeedNorms[migrate.NormalizeFeedURL(pod.FeedURL)] {
+			continue // direct subscription — no remapping needed
+		}
+		t := fuzzyPodcastTitle(pod.Title)
+		if t == "" {
+			continue
+		}
+		if dstFeed, ok := dstTitleToFeed[t]; ok {
+			if feedMap == nil {
+				feedMap = make(map[string]string)
+			}
+			feedMap[pod.FeedURL] = dstFeed
+		}
+	}
+	return feedMap
+}
+
+// fuzzyPodcastTitle normalises a podcast title for cross-library matching.
+// It first strips paid-tier suffixes ("Plus", "+", "Premium", etc.) via
+// model.NormalizePlusTitle, then applies migrate.FuzzyNormalizeTitle (lowercase,
+// strip punctuation, collapse whitespace). The two-step approach handles both
+// "Pod Save America+" ↔ "Pod Save America" and "O'Brien" ↔ "OBrien" style
+// differences.
+func fuzzyPodcastTitle(title string) string {
+	norm := model.NormalizePlusTitle(title)
+	if norm == "" {
+		norm = title
+	}
+	return migrate.FuzzyNormalizeTitle(norm)
 }
 
 // applyFeedMap returns a shallow copy of lib with feed URLs remapped according

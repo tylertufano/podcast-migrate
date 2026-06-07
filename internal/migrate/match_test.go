@@ -196,6 +196,25 @@ func TestFuzzyNormalizeTitle_DifferentTitlesDontMatch(t *testing.T) {
 	}
 }
 
+func TestFuzzyNormalizeTitle_ApostropheRemoved(t *testing.T) {
+	// Apostrophes are removed rather than replaced with a space so that
+	// "O'Brien" and "OBrien" normalise to the same string.
+	a := migrate.FuzzyNormalizeTitle("Conan O'Brien Needs a Friend")
+	b := migrate.FuzzyNormalizeTitle("Conan OBrien Needs a Friend")
+	if a != b {
+		t.Errorf("apostrophe variant: %q vs %q — should be equal after normalisation", a, b)
+	}
+}
+
+func TestFuzzyNormalizeTitle_HyphenBecomesSpace(t *testing.T) {
+	// Hyphens are word separators, not contractions — they should become a space.
+	got := migrate.FuzzyNormalizeTitle("Self-Help Podcast")
+	want := "self help podcast"
+	if got != want {
+		t.Errorf("hyphen: got %q, want %q", got, want)
+	}
+}
+
 func TestFuzzyNormalizeTitle_SerialNotStripped(t *testing.T) {
 	// "serial" contains 's' but is not a season marker.
 	got := migrate.FuzzyNormalizeTitle("Serial: Season 1")

@@ -203,11 +203,18 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 		return 0, fmt.Errorf("pocketcasts: fetch subscriptions: %w", err)
 	}
 
-	// Build set of already-subscribed feed URLs.
+	// Build lookup structures for the existing subscription list.
+	// subscribedFeeds: normalised URL → true (fast URL-based check).
+	// subscribedUUIDs: PC UUID → true (fallback for URL-mismatch detection — same
+	//   podcast can appear with different RSS feed URLs across apps).
 	subscribedFeeds := make(map[string]bool, len(existing))
+	subscribedUUIDs := make(map[string]bool, len(existing))
 	for _, pod := range existing {
 		if pod.URL != "" {
 			subscribedFeeds[normalizeFeedURL(pod.URL)] = true
+		}
+		if pod.UUID != "" {
+			subscribedUUIDs[pod.UUID] = true
 		}
 	}
 
@@ -222,8 +229,9 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 
 	var toSubscribe []model.Podcast
 	skippedByFilter := 0
+	alreadySubscribedByURL := 0
 	for _, pod := range lib.Podcasts {
-		if pod.FeedURL == "" || subscribedFeeds[normalizeFeedURL(pod.FeedURL)] {
+		if pod.FeedURL == "" {
 			continue
 		}
 		// Apply podcast filter when set.
@@ -241,6 +249,10 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 				continue
 			}
 		}
+		if subscribedFeeds[normalizeFeedURL(pod.FeedURL)] {
+			alreadySubscribedByURL++
+			continue
+		}
 		toSubscribe = append(toSubscribe, pod)
 	}
 
@@ -249,17 +261,18 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 			fmt.Printf("pocketcasts: no unsubscribed podcasts match the podcast filter (%d skipped by filter)\n",
 				skippedByFilter)
 		} else {
-			fmt.Printf("pocketcasts: all %d podcast(s) already subscribed\n", len(lib.Podcasts))
+			fmt.Printf("pocketcasts: all %d in-scope podcast(s) already subscribed\n",
+				alreadySubscribedByURL)
 		}
 		return 0, nil
 	}
 
 	if skippedByFilter > 0 {
-		fmt.Printf("pocketcasts: podcast filter active — %d/%d podcast(s) in scope (%d skipped by filter, %d already subscribed)\n",
-			len(toSubscribe), len(lib.Podcasts), skippedByFilter, len(existing)-len(toSubscribe))
+		fmt.Printf("pocketcasts: podcast filter active — %d/%d podcast(s) to check (%d skipped by filter, %d already subscribed by URL)\n",
+			len(toSubscribe), len(lib.Podcasts), skippedByFilter, alreadySubscribedByURL)
 	} else {
-		fmt.Printf("pocketcasts: %d/%d podcast(s) to subscribe (%d already subscribed)\n",
-			len(toSubscribe), len(lib.Podcasts), len(existing))
+		fmt.Printf("pocketcasts: %d/%d podcast(s) to check (%d already subscribed by URL)\n",
+			len(toSubscribe), len(lib.Podcasts), alreadySubscribedByURL)
 	}
 
 	if opts.DryRun {
@@ -286,6 +299,14 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 		if err != nil {
 			fmt.Printf("  warning: could not resolve %q: %v\n", title, err)
 			failed++
+			continue
+		}
+
+		// Check by UUID: the same podcast may be subscribed under a different RSS
+		// feed URL (different CDN, http vs https, etc.). If the resolved UUID is
+		// already in the subscription list, skip without re-subscribing.
+		if subscribedUUIDs[pcUUID] {
+			fmt.Printf("  already subscribed: %q (feed URL differs from PC but same podcast)\n", title)
 			continue
 		}
 
@@ -400,30 +421,64 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	// podcast UUID and page through the full episode list, adding every episode
 	// to the index. This handles episodes played in Apple that have never been
 	// opened in Pocket Casts (and therefore don't appear in the in-progress list).
-	unmatchedByNormFeed := make(map[string]struct{})
+	// unmatchedFeeds maps normalised source feed URL → original (Apple) feed URL.
+	// The original URL is preserved so Phase B can pass it to ResolveFeedToPodcastUUID
+	// when the normalised form doesn't match any PC subscription URL.
+	unmatchedFeeds := make(map[string]string)
 	for _, ep := range episodes {
 		if ep.FromDestination || ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
 		}
 		if _, found := findInIndex(index, ep); !found {
-			unmatchedByNormFeed[normalizeFeedURL(ep.FeedURL)] = struct{}{}
+			normFeed := normalizeFeedURL(ep.FeedURL)
+			if _, exists := unmatchedFeeds[normFeed]; !exists {
+				unmatchedFeeds[normFeed] = ep.FeedURL
+			}
 		}
 	}
 
-	if len(unmatchedByNormFeed) > 0 {
+	if len(unmatchedFeeds) > 0 {
 		fmt.Printf("pocketcasts: Phase B: %d feed(s) have unmatched episodes — fetching per-podcast episode lists...\n",
-			len(unmatchedByNormFeed))
+			len(unmatchedFeeds))
 
 		added := 0
 		skipped := 0
-		for normFeed := range unmatchedByNormFeed {
+		for normFeed, originalFeedURL := range unmatchedFeeds {
 			podUUID := normFeedToPodUUID[normFeed]
-			if podUUID == "" {
-				// Podcast not subscribed in Pocket Casts.
-				skipped++
-				continue
-			}
 			podTitle := normFeedToPodTitle[normFeed]
+			if podTitle == "" {
+				podTitle = originalFeedURL
+			}
+
+			// indexFeedURL is the URL used as the key when building the index.
+			// It must match what findInIndex expects — which keys on the Apple
+			// episode's FeedURL. In the normal case (URLs match after normalisation)
+			// using the PC URL is fine; they normalise identically. In the mismatch
+			// case we fall back to the original Apple URL so keys line up.
+			indexFeedURL := podUUIDToFeedURL[podUUID]
+
+			if podUUID == "" {
+				// The source feed URL doesn't match any PC subscription URL — the
+				// same podcast may be subscribed in PC under a different RSS URL
+				// (different CDN host, http vs https, etc.). Resolve via the PC
+				// refresh API to get the canonical UUID, then verify it's subscribed.
+				resolvedUUID, resolveErr := ResolveFeedToPodcastUUID(ctx, originalFeedURL)
+				if resolveErr != nil {
+					fmt.Printf("  skipping %q: could not resolve feed URL to PC UUID (%v)\n", podTitle, resolveErr)
+					skipped++
+					continue
+				}
+				if _, isSubscribed := podUUIDToFeedURL[resolvedUUID]; !isSubscribed {
+					fmt.Printf("  skipping %q: resolved PC UUID not found in subscription list\n", podTitle)
+					skipped++
+					continue
+				}
+				podUUID = resolvedUUID
+				// Use the Apple URL for index keys: findInIndex always uses the
+				// Apple episode's FeedURL, so addToIndex must use the same URL.
+				indexFeedURL = originalFeedURL
+				fmt.Printf("  resolved feed URL mismatch for %q — PC UUID matched via refresh API\n", podTitle)
+			}
 
 			for page := 0; page < maxPhaseBPagesPerPodcast; page++ {
 				pageEps, hasMore, err := fetchPodcastEpisodesWithRetry(ctx, client, podUUID, page, requestDelay)
@@ -433,12 +488,11 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				}
 
 				beforeAdd := len(index)
-				feedURL := podUUIDToFeedURL[podUUID]
 				for _, ep := range pageEps {
-					if feedURL == "" || ep.IsDeleted {
+					if indexFeedURL == "" || ep.IsDeleted {
 						continue
 					}
-					addToIndex(index, &ep, feedURL)
+					addToIndex(index, &ep, indexFeedURL)
 				}
 				added += len(index) - beforeAdd
 

@@ -31,6 +31,9 @@ type testServerConfig struct {
 	// /author/add_feed_url. If a feed URL is not in this map the handler returns
 	// status "error".
 	feedURLToUUID map[string]string
+	// subscribedPodcasts overrides the default two-podcast subscription list
+	// returned by /user/podcast/list. If nil the default alpha+beta list is used.
+	subscribedPodcasts []map[string]any
 }
 
 // newFullTestServer builds an httptest.Server that handles all endpoints
@@ -57,16 +60,18 @@ func newFullTestServer(t *testing.T, cfg testServerConfig) func() {
 		_, _ = w.Write([]byte(`{"token":"test-token","uuid":"test-uuid"}`))
 	})
 
-	// Subscribed podcasts.
+	// Subscribed podcasts — use override if provided, otherwise default alpha+beta.
 	mux.HandleFunc("/user/podcast/list", func(w http.ResponseWriter, r *http.Request) {
-		payload := map[string]any{
-			"podcasts": []map[string]any{
+		pods := cfg.subscribedPodcasts
+		if pods == nil {
+			pods = []map[string]any{
 				{"uuid": "pod1", "title": "Alpha Show", "author": "AuthorA",
 					"url": "https://feeds.example.com/alpha"},
 				{"uuid": "pod2", "title": "Beta Show", "author": "AuthorB",
 					"url": "https://feeds.example.com/beta"},
-			},
+			}
 		}
+		payload := map[string]any{"podcasts": pods}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(payload)
 	})
@@ -144,11 +149,13 @@ func newFullTestServer(t *testing.T, cfg testServerConfig) func() {
 	pocketcasts.SetBaseURLForTest(srv.URL)
 	pocketcasts.SetCacheURLForTest(srv.URL)
 	pocketcasts.SetRefreshURLForTest(srv.URL)
+	pocketcasts.SetPollIntervalForTest(0) // no sleep between feed-resolve poll attempts
 	return func() {
 		srv.Close()
 		pocketcasts.SetBaseURLForTest("https://api.pocketcasts.com")
 		pocketcasts.SetCacheURLForTest("https://cache.pocketcasts.com")
 		pocketcasts.SetRefreshURLForTest("https://refresh.pocketcasts.com")
+		pocketcasts.SetPollIntervalForTest(2 * time.Second)
 	}
 }
 
@@ -539,6 +546,96 @@ func TestProvider_SetLibrary_SubscribesNewPodcast(t *testing.T) {
 	}
 	if subscribeCalls[0] != "pod3" {
 		t.Errorf("subscribed UUID = %q, want pod3", subscribeCalls[0])
+	}
+}
+
+func TestProvider_SetLibrary_AlreadySubscribedURLMismatch_SkipsSubscribe(t *testing.T) {
+	// PC has "Gamma Show" subscribed under a DIFFERENT URL than the Apple source.
+	// The resolve endpoint maps the Apple URL to the same PC UUID → already subscribed.
+	// Expected: 0 /user/podcast/subscribe calls.
+	var subscribeCalls []string
+	restore := newFullTestServer(t, testServerConfig{
+		subscribedPodcasts: []map[string]any{
+			// PC stores the podcast under "gamma-pc" URL, not the Apple "gamma" URL.
+			{"uuid": "pod3", "title": "Gamma Show", "author": "AuthorG",
+				"url": "https://feeds.example.com/gamma-pc"},
+		},
+		// The refresh API resolves the Apple URL to the same UUID.
+		feedURLToUUID:  map[string]string{"https://feeds.example.com/gamma": "pod3"},
+		subscribeCalls: &subscribeCalls,
+	})
+	defer restore()
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.example.com/gamma", Title: "Gamma Show"},
+		},
+	}
+	p := pocketcasts.NewProvider("user@example.com", "pass")
+	opts := provider.WriteOptions{
+		OnlySubscriptions: true,
+		RequestDelay:      time.Millisecond,
+	}
+	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
+		t.Fatalf("SetLibrary URL-mismatch skip: %v", err)
+	}
+	if len(subscribeCalls) != 0 {
+		t.Errorf("expected 0 subscribe calls (UUID already subscribed); got %d: %v", len(subscribeCalls), subscribeCalls)
+	}
+}
+
+func TestProvider_SetLibrary_PhaseBURLMismatch_FindsEpisodes(t *testing.T) {
+	// Apple source episode uses FeedURL "https://feeds.example.com/gamma".
+	// PC subscription stores the same podcast under "https://feeds.example.com/gamma-pc".
+	// Phase B must resolve the Apple URL to PC UUID and index the episode correctly.
+	var updateCalls []map[string]any
+	restore := newFullTestServer(t, testServerConfig{
+		subscribedPodcasts: []map[string]any{
+			{"uuid": "pod3", "title": "Gamma Show", "author": "AuthorG",
+				"url": "https://feeds.example.com/gamma-pc"}, // PC's URL differs
+		},
+		// The cache CDN has episodes for pod3.
+		podcastEpisodes: map[string][]map[string]any{
+			"pod3": {
+				{
+					"uuid":      "ep-gamma-1",
+					"title":     "Gamma Episode One",
+					"url":       "https://cdn.example.com/gamma-ep1.mp3",
+					"duration":  3000,
+					"published": "2024-03-10T09:00:00Z",
+				},
+			},
+		},
+		// Refresh API resolves the Apple URL to the PC UUID.
+		feedURLToUUID: map[string]string{"https://feeds.example.com/gamma": "pod3"},
+		updateCalls:   &updateCalls,
+	})
+	defer restore()
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.example.com/gamma", Title: "Gamma Show"},
+		},
+		Episodes: []model.EpisodeState{
+			{
+				FeedURL:   "https://feeds.example.com/gamma", // Apple URL
+				Title:     "Gamma Episode One",
+				PubDate:   time.Date(2024, 3, 10, 9, 0, 0, 0, time.UTC),
+				Duration:  3000 * time.Second,
+				PlayState: model.PlayStatePlayed,
+			},
+		},
+	}
+	p := pocketcasts.NewProvider("user@example.com", "pass")
+	opts := provider.WriteOptions{RequestDelay: time.Millisecond}
+	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
+		t.Fatalf("SetLibrary Phase B URL mismatch: %v", err)
+	}
+	if len(updateCalls) != 1 {
+		t.Fatalf("expected 1 update call; got %d", len(updateCalls))
+	}
+	if updateCalls[0]["uuid"] != "ep-gamma-1" {
+		t.Errorf("update uuid = %v, want ep-gamma-1", updateCalls[0]["uuid"])
 	}
 }
 

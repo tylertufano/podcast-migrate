@@ -875,6 +875,34 @@ func TestBuildCrossFeedIndex(t *testing.T) {
 	}
 }
 
+func TestEngine_Run_SubscriptionsAdded_RespectsFilter(t *testing.T) {
+	// Source has 3 podcasts; only "gamma" matches --podcast "gamma". Dst has none.
+	// SubscriptionsAdded must be 1, not 3.
+	src := &mockProvider{
+		name: "src", caps: fullCaps,
+		lib: &model.Library{
+			Podcasts: []model.Podcast{
+				{FeedURL: "https://feeds.example.com/alpha", Title: "Alpha Show"},
+				{FeedURL: "https://feeds.example.com/beta", Title: "Beta Show"},
+				{FeedURL: "https://feeds.example.com/gamma", Title: "Gamma Show"},
+			},
+		},
+	}
+	dst := &mockProvider{name: "dst", caps: fullCaps, lib: &model.Library{}}
+
+	opts := provider.WriteOptions{
+		ConflictStrategy: provider.FurthestWins,
+		PodcastFilter:    []string{"gamma"},
+	}
+	result, err := New(src, dst).Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.SubscriptionsAdded != 1 {
+		t.Errorf("SubscriptionsAdded with podcast filter: got %d, want 1", result.SubscriptionsAdded)
+	}
+}
+
 func keys[K comparable, V any](m map[K]V) []K {
 	ks := make([]K, 0, len(m))
 	for k := range m {

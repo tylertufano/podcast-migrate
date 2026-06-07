@@ -493,15 +493,47 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				// The source feed URL doesn't match any PC subscription URL.
 				//
 				// Strategy 1: resolve via the PC refresh API (handles CDN changes,
-				// http→https, etc.).
+				// http→https, feed URL migration, etc.).
+				//
+				// Three outcomes when the refresh API succeeds:
+				//  a) UUID is in our subscription map  → URL mismatch resolved, proceed.
+				//  b) UUID not in map, !SubscribedOnly → podcast found in catalog but not
+				//     yet subscribed; auto-subscribe so play state can be applied.
+				//  c) UUID not in map, SubscribedOnly  → the subscription list API may
+				//     have returned incomplete data (PC's /user/podcast/list endpoint
+				//     occasionally omits subscriptions). Trust the refresh API result and
+				//     proceed; this flag only prevents subscribing to genuinely new
+				//     podcasts, not updating existing ones the API failed to return.
 				resolvedUUID, resolveErr := ResolveFeedToPodcastUUID(ctx, originalFeedURL)
 				if resolveErr == nil {
 					if _, isSubscribed := podUUIDToFeedURL[resolvedUUID]; isSubscribed {
+						// (a) Normal URL-mismatch case: UUID already in our list.
 						podUUID = resolvedUUID
 						// Use the Apple URL for index keys: findInIndex always uses
 						// the Apple episode's FeedURL, so addToIndex must match.
 						indexFeedURL = originalFeedURL
 						fmt.Printf("  resolved feed URL mismatch for %q — PC UUID matched via refresh API\n", podTitle)
+					} else if !opts.SubscribedOnly {
+						// (b) Found in catalog but not yet subscribed — auto-subscribe.
+						if subErr := SubscribePodcast(ctx, client, resolvedUUID); subErr != nil {
+							fmt.Printf("  warning: could not auto-subscribe to %q: %v\n", podTitle, subErr)
+						} else {
+							podUUID = resolvedUUID
+							indexFeedURL = originalFeedURL
+							// Register in the local map so any later lookup for the
+							// same podcast doesn't try to subscribe a second time.
+							podUUIDToFeedURL[resolvedUUID] = originalFeedURL
+							fmt.Printf("  auto-subscribed %q (found in PC catalog, not in subscription list)\n", podTitle)
+							time.Sleep(requestDelay) // allow PC to process the subscription
+						}
+					} else {
+						// (c) --subscribed-only and UUID missing from local map.
+						// Proceed anyway: the subscription list API returned incomplete
+						// data and this podcast is almost certainly already subscribed
+						// (the refresh API only knows about podcasts in PC's catalog).
+						podUUID = resolvedUUID
+						indexFeedURL = originalFeedURL
+						fmt.Printf("  resolved %q via refresh API (not in subscription list — subscription API may be incomplete)\n", podTitle)
 					}
 				}
 
@@ -548,7 +580,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				}
 
 				if podUUID == "" {
-					fmt.Printf("  skipping %q: could not resolve to a subscribed PC podcast\n", podTitle)
+					fmt.Printf("  skipping %q: could not resolve to a PC podcast (feed URL not in PC catalog)\n", podTitle)
 					skipped++
 					continue
 				}

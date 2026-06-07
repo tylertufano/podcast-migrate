@@ -296,11 +296,25 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		}
 	}
 
+	// Build the set of normalised source feed URLs.  Used below as a collision
+	// guard: if the destination URL we'd remap a source podcast to is already
+	// the direct feed URL of a *different* source podcast, skip the remapping.
+	// Without this guard, a destination that has erroneously stored two distinct
+	// podcasts at the same URL (e.g. because the RSS host migrated one feed to
+	// the other's URL) would cause buildAutoFeedMap to collapse both source
+	// podcasts onto a single destination URL, mis-attributing episodes.
+	srcFeedNorms := make(map[string]bool, len(srcLib.Podcasts))
+	for _, pod := range srcLib.Podcasts {
+		if norm := migrate.NormalizeFeedURL(pod.FeedURL); norm != "" {
+			srcFeedNorms[norm] = true
+		}
+	}
+
 	// For each source podcast that is not already subscribed at the destination
 	// by feed URL, attempt a title-based match.
 	//
 	// Pass 1: exact fuzzy-normalised title equality.
-	// Pass 2: contains-match for podcasts whose titles differ by a subtitle
+	// Pass 2: prefix-match for podcasts whose titles differ by a subtitle
 	// (e.g. Apple "Crooked City" vs PC "Crooked City: Dixon, IL").
 	// A minimum normalised length of 5 characters guards against trivial matches
 	// on short words like "news" accidentally matching "the news hour".
@@ -318,6 +332,15 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		}
 		// Pass 1: exact match.
 		if dstFeed, ok := dstTitleToFeed[t]; ok {
+			// Collision guard: if this destination URL is already the direct
+			// feed URL of another source podcast, remapping would conflate two
+			// distinct podcasts.  Skip and let Phase B's title-fallback handle
+			// it via the refresh API instead.
+			if srcFeedNorms[migrate.NormalizeFeedURL(dstFeed)] {
+				fmt.Printf("feed-map (auto): skipping remap of %q → %s (destination URL already claimed by another source podcast)\n",
+					pod.Title, dstFeed)
+				continue
+			}
 			if feedMap == nil {
 				feedMap = make(map[string]string)
 			}
@@ -334,6 +357,12 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		if len(t) >= 5 {
 			for dstT, dstFeed := range dstTitleToFeed {
 				if titleHasWordPrefix(dstT, t) || titleHasWordPrefix(t, dstT) {
+					// Same collision guard as Pass 1.
+					if srcFeedNorms[migrate.NormalizeFeedURL(dstFeed)] {
+						fmt.Printf("feed-map (auto): skipping remap of %q → %s (destination URL already claimed by another source podcast)\n",
+							pod.Title, dstFeed)
+						break
+					}
 					if feedMap == nil {
 						feedMap = make(map[string]string)
 					}

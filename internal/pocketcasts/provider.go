@@ -627,9 +627,12 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			podTitle := feedToTitle[ep.FeedURL]
 			entry, ok := findInIndex(index, ep)
 			if !ok {
+				dryRunNote := "no match found in Pocket Casts account"
+				if ep.FeedURL != "" {
+					dryRunNote += " [feed: " + ep.FeedURL + "]"
+				}
 				writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
-					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-					"no match found in Pocket Casts account")
+					playStateLabel(ep.PlayState, ep.PlayPosition), "—", dryRunNote)
 				continue
 			}
 			if !opts.ForceUpdate {
@@ -695,9 +698,12 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		entry, ok := findInIndex(index, ep)
 		if !ok {
 			notFound++
+			notFoundNote := "episode not matched in Pocket Casts (not subscribed or not found in episode list)"
+			if ep.FeedURL != "" {
+				notFoundNote += " [feed: " + ep.FeedURL + "]"
+			}
 			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-				"episode not matched in Pocket Casts (not subscribed or not found in episode list)")
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—", notFoundNote)
 			continue
 		}
 

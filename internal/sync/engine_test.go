@@ -1210,3 +1210,40 @@ func TestBuildAutoFeedMap_SuffixTitle_NoFalsePositive(t *testing.T) {
 		t.Errorf("suffix title must not trigger prefix-match; got false mapping: %v", got)
 	}
 }
+
+func TestBuildAutoFeedMap_CollisionGuard_SkipsWhenDstURLClaimedBySrcPodcast(t *testing.T) {
+	// Regression test: if the destination has two distinct podcasts stored at
+	// the same feed URL (e.g. audioboom migrated one feed's URL to another's
+	// channel URL and the destination app resolved it incorrectly), the auto
+	// feed-map must NOT remap a source podcast to a URL that is already the
+	// direct feed URL of a different source podcast.
+	//
+	// Concrete case: Apple has "#SistersInLaw" at audioboom/5043432 and
+	// "Justice By Design" at audioboom/5137121.  If PC's catalog has erroneously
+	// stored "Justice By Design" at audioboom/5043432 (same URL as SL), a naive
+	// title match would remap JbD→5043432, conflating both podcasts and causing
+	// all JbD episodes to be looked up in the SL feed (where they don't exist).
+	//
+	// The collision guard must fire and produce an empty map so Phase B's
+	// refresh-API fallback can locate JbD by its actual PC UUID instead.
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://audioboom.com/channels/5043432.rss", Title: "#SistersInLaw"},
+			{FeedURL: "https://audioboom.com/channels/5137121.rss", Title: "Justice By Design"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			// Destination has SL at the correct URL.
+			{FeedURL: "https://audioboom.com/channels/5043432.rss", Title: "#SistersInLaw"},
+			// Destination erroneously has JbD at SL's URL (URL collision in PC catalog).
+			{FeedURL: "https://audioboom.com/channels/5043432.rss", Title: "Justice By Design"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	// Neither podcast should be remapped: SL is a direct match (same URL), and
+	// JbD's title-match target (5043432) is already claimed by SL in src.
+	if len(got) != 0 {
+		t.Errorf("collision guard must suppress remapping when dst URL is already a src feed URL; got: %v", got)
+	}
+}

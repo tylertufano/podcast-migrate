@@ -426,12 +426,25 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	}
 	fmt.Printf("pocketcasts: %d subscribed podcast(s) loaded\n", len(apiPods))
 
-	// --- Phase A: build index from in-progress episodes ---
+	// --- Phase A: build index from in-progress and recently-played episodes ---
+	//
+	// Phase A is split into two fetches that both carry real user play state:
+	//
+	//   A1 — /user/in_progress : episodes currently being listened to.
+	//   A2 — /user/history     : recently played (completed) episodes.
+	//
+	// Both are indexed before Phase B runs. This is critical because Phase B
+	// uses the public cache CDN (podcast/full) which has NO play state — every
+	// episode it returns gets PlayingStatus = PlayingUnplayed. Without A2, an
+	// episode already played to completion in Pocket Casts would appear as
+	// "unplayed" to the skip-reason check and be needlessly re-written, and
+	// worse, an in-progress Apple episode would overwrite a "played" Pocket
+	// Casts state that is ahead of the Apple position.
 	fmt.Printf("pocketcasts: fetching in-progress episodes for matching...\n")
 	inProgress, err := FetchInProgressEpisodes(ctx, client)
 	if err != nil {
 		// Non-fatal: continue without in-progress data; Phase B may still match.
-		fmt.Printf("pocketcasts: warning: could not fetch in-progress episodes (%v) — Phase A skipped\n", err)
+		fmt.Printf("pocketcasts: warning: could not fetch in-progress episodes (%v) — Phase A1 skipped\n", err)
 		inProgress = nil
 	}
 	time.Sleep(requestDelay)
@@ -444,7 +457,36 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		}
 		addToIndex(index, &ep, feedURL)
 	}
-	fmt.Printf("pocketcasts: Phase A: indexed %d in-progress episode(s)\n", len(inProgress))
+	fmt.Printf("pocketcasts: Phase A1: indexed %d in-progress episode(s)\n", len(inProgress))
+
+	// Phase A2: recently-played history.  Non-fatal if the endpoint is
+	// unavailable — Phase B will still find the episode UUID; the only
+	// downside is that already-played episodes may be written again
+	// (idempotent for played state, but potentially harmful for in-progress
+	// episodes that have since been played to completion in Pocket Casts).
+	fmt.Printf("pocketcasts: fetching recently-played episodes for matching...\n")
+	played, err := FetchPlayedEpisodes(ctx, client)
+	if err != nil {
+		fmt.Printf("pocketcasts: warning: could not fetch play history (%v) — Phase A2 skipped\n", err)
+		played = nil
+	}
+	time.Sleep(requestDelay)
+
+	phaseA2Added := 0
+	for _, ep := range played {
+		feedURL := podUUIDToFeedURL[ep.PodcastUUID]
+		if feedURL == "" || ep.IsDeleted {
+			continue
+		}
+		// addToIndex uses "first entry wins" so in-progress entries from A1
+		// are never overwritten by played entries from A2.
+		beforeLen := len(index)
+		addToIndex(index, &ep, feedURL)
+		if len(index) > beforeLen {
+			phaseA2Added++
+		}
+	}
+	fmt.Printf("pocketcasts: Phase A2: indexed %d additional episode(s) from play history\n", phaseA2Added)
 
 	// --- Phase B: per-podcast episode fetch for unmatched source episodes ---
 	//

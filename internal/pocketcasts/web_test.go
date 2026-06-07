@@ -259,6 +259,57 @@ func TestFetchInProgressEpisodes_ReturnsEpisodes(t *testing.T) {
 	}
 }
 
+// ---- FetchPlayedEpisodes ----
+
+func TestFetchPlayedEpisodes_ReturnsEpisodes(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/history", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("FetchPlayedEpisodes: expected POST, got %s", r.Method)
+		}
+		payload := map[string]any{
+			"episodes": []map[string]any{
+				{
+					"uuid":           "ep-played-1",
+					"podcast_uuid":   "pod1",
+					"title":          "Episode Played",
+					"url":            "https://cdn.example.com/ep_played.mp3",
+					"published_at":   "2024-04-10T10:00:00Z",
+					"duration":       1800,
+					"playing_status": 3,
+					"played_up_to":   1800,
+					"starred":        false,
+					"is_deleted":     false,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(payload)
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	client := authedClient(t)
+	eps, err := pocketcasts.FetchPlayedEpisodes(context.Background(), client)
+	if err != nil {
+		t.Fatalf("FetchPlayedEpisodes: %v", err)
+	}
+	if len(eps) != 1 {
+		t.Fatalf("got %d episodes, want 1", len(eps))
+	}
+	ep := eps[0]
+	if ep.UUID != "ep-played-1" {
+		t.Errorf("UUID = %q, want ep-played-1", ep.UUID)
+	}
+	if ep.PlayingStatus != 3 {
+		t.Errorf("PlayingStatus = %d, want 3 (played)", ep.PlayingStatus)
+	}
+	if ep.PlayedUpTo != 1800 {
+		t.Errorf("PlayedUpTo = %d, want 1800", ep.PlayedUpTo)
+	}
+}
+
 // ---- FetchPodcastEpisodes ----
 
 func TestFetchPodcastEpisodes_SinglePage(t *testing.T) {

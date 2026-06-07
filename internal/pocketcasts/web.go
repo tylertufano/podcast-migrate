@@ -14,8 +14,9 @@ package pocketcasts
 // Endpoints used:
 //   POST https://api.pocketcasts.com/user/login                              — authenticate, get Bearer token
 //   POST https://api.pocketcasts.com/user/podcast/list                       — subscribed podcast list
-//   POST https://api.pocketcasts.com/user/in_progress                        — in-progress episodes
-//   GET  https://cache.pocketcasts.com/podcast/full/{uuid}/{page}/3/1000     — paginated episode metadata
+//   POST https://api.pocketcasts.com/user/in_progress                        — in-progress episodes (with play state)
+//   POST https://api.pocketcasts.com/user/history                            — recently-played episodes (with play state)
+//   GET  https://cache.pocketcasts.com/podcast/full/{uuid}/{page}/3/1000     — paginated episode metadata (no play state)
 //   POST https://api.pocketcasts.com/sync/update_episode                     — set play position/status
 //   POST https://api.pocketcasts.com/user/podcast/subscribe                  — subscribe to a podcast by UUID
 //   POST https://refresh.pocketcasts.com/author/add_feed_url                 — resolve RSS feed URL → podcast UUID (public, no auth)
@@ -245,7 +246,7 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]APIPod
 
 // FetchInProgressEpisodes returns all episodes the authenticated user currently
 // has in progress (partially listened to). This does not include episodes that
-// have been played to completion — use FetchPodcastEpisodes for a full picture.
+// have been played to completion — use FetchPlayedEpisodes for those.
 func FetchInProgressEpisodes(ctx context.Context, client *http.Client) ([]APIEpisode, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		pcBaseURL+"/user/in_progress", bytes.NewReader([]byte("{}")))
@@ -277,6 +278,50 @@ func FetchInProgressEpisodes(ctx context.Context, client *http.Client) ([]APIEpi
 	}
 	if err := json.Unmarshal(respBody, &payload); err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: parse in-progress response: %w", err)
+	}
+	return payload.Episodes, nil
+}
+
+// FetchPlayedEpisodes returns the episodes from the authenticated user's
+// listening history that have been played to completion. The endpoint returns
+// the most-recently-played episodes; older entries may not be included if the
+// history exceeds the server's maximum page size.
+//
+// The returned episodes have PlayingStatus = PlayingPlayed and PlayedUpTo set
+// to the full episode duration. This is used to supplement the Phase A
+// in-progress index so that episodes previously migrated and fully played in
+// Pocket Casts are not needlessly re-written.
+func FetchPlayedEpisodes(ctx context.Context, client *http.Client) ([]APIEpisode, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		pcBaseURL+"/user/history", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: build history request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: POST /user/history: %w", err)
+	}
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
+	if resp.StatusCode >= 500 {
+		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/history returned HTTP %d", resp.StatusCode)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("pocketcasts/web: /user/history returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(respBody))
+	}
+
+	var payload struct {
+		Episodes []APIEpisode `json:"episodes"`
+	}
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: parse history response: %w", err)
 	}
 	return payload.Episodes, nil
 }

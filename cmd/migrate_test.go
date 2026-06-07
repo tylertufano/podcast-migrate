@@ -167,6 +167,85 @@ func TestBuildPodcastFilter_ListFile_NotFound_ReturnsError(t *testing.T) {
 	}
 }
 
+// ---- buildFeedMap ----
+
+func TestBuildFeedMap_NilInput_ReturnsNil(t *testing.T) {
+	got, err := buildFeedMap(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("nil input: got %v, want nil", got)
+	}
+}
+
+func TestBuildFeedMap_ParsesPairs(t *testing.T) {
+	got, err := buildFeedMap([]string{
+		"https://sub.apple.com/abc=https://priv.target.com/xyz",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(got))
+	}
+	// Both URLs are normalised; verify the canonical key exists and maps correctly.
+	want := "https://priv.target.com/xyz"
+	if v := got["https://sub.apple.com/abc"]; v != want {
+		t.Errorf("got %q, want %q", v, want)
+	}
+}
+
+func TestBuildFeedMap_NormalisesHTTPToHTTPS(t *testing.T) {
+	got, err := buildFeedMap([]string{
+		"http://sub.apple.com/abc=http://priv.target.com/xyz",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// http is promoted to https during normalisation.
+	if _, ok := got["https://sub.apple.com/abc"]; !ok {
+		t.Errorf("expected key https://sub.apple.com/abc (http promoted); got keys: %v", got)
+	}
+	if v := got["https://sub.apple.com/abc"]; v != "https://priv.target.com/xyz" {
+		t.Errorf("dst not normalised: got %q, want https://priv.target.com/xyz", v)
+	}
+}
+
+func TestBuildFeedMap_MultipleEntries(t *testing.T) {
+	got, err := buildFeedMap([]string{
+		"https://a.example.com/feed1=https://a.target.com/feed1",
+		"https://b.example.com/feed2=https://b.target.com/feed2",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("expected 2 entries, got %d", len(got))
+	}
+}
+
+func TestBuildFeedMap_MissingEquals_ReturnsError(t *testing.T) {
+	_, err := buildFeedMap([]string{"https://no-equals.example.com"})
+	if err == nil {
+		t.Error("expected error for missing '=', got nil")
+	}
+}
+
+func TestBuildFeedMap_EmptySrc_ReturnsError(t *testing.T) {
+	_, err := buildFeedMap([]string{"=https://dst.example.com"})
+	if err == nil {
+		t.Error("expected error for empty src URL, got nil")
+	}
+}
+
+func TestBuildFeedMap_EmptyDst_ReturnsError(t *testing.T) {
+	_, err := buildFeedMap([]string{"https://src.example.com="})
+	if err == nil {
+		t.Error("expected error for empty dst URL, got nil")
+	}
+}
+
 // ---- buildProvider ----
 
 func TestBuildProvider_Apple_Podcasts(t *testing.T) {

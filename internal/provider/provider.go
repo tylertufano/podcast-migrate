@@ -96,6 +96,19 @@ type WriteOptions struct {
 	// the sync and re-fetches them from Overcast. The cache is repopulated with
 	// fresh data during the run. Takes precedence over EpisodeCacheMaxAge.
 	ClearEpisodeCache bool
+
+	// FeedMap, when non-nil, remaps source podcast feed URLs to destination
+	// analog feed URLs before episode matching begins. Use this when the source
+	// uses a private/subscriber RSS feed (e.g. an Apple Podcasts Subscription)
+	// and the user has already subscribed to the equivalent private feed on the
+	// destination platform. The migration replaces the source feed URL with the
+	// mapped destination URL so that feeddate/feedtitle/cross-feed matching all
+	// resolve against the correct destination subscription.
+	//
+	// Keys and values are feed URLs (http and https are treated as equivalent;
+	// both are normalised before comparison). Repeatable via --feed-map on the
+	// CLI using "SRC_URL=DST_URL" pairs.
+	FeedMap map[string]string
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

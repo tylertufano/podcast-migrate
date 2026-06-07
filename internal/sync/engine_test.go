@@ -910,3 +910,86 @@ func keys[K comparable, V any](m map[K]V) []K {
 	}
 	return ks
 }
+
+// ---- applyFeedMap ----
+
+func TestApplyFeedMap_NilLib_ReturnsNil(t *testing.T) {
+	if got := applyFeedMap(nil, map[string]string{"https://a.com/": "https://b.com/"}); got != nil {
+		t.Errorf("nil lib: got %v, want nil", got)
+	}
+}
+
+func TestApplyFeedMap_EmptyMap_ReturnsSameLib(t *testing.T) {
+	lib := &model.Library{Podcasts: []model.Podcast{{FeedURL: "https://a.com/feed"}}}
+	got := applyFeedMap(lib, nil)
+	if got != lib {
+		t.Error("empty feed map: should return the same library pointer")
+	}
+}
+
+func TestApplyFeedMap_RemapsEpisodes(t *testing.T) {
+	src := "https://subscriber.example.com/feed"
+	dst := "https://target.example.com/feed"
+	lib := &model.Library{
+		Episodes: []model.EpisodeState{
+			{FeedURL: src, Title: "Ep 1"},
+			{FeedURL: "https://other.example.com/feed", Title: "Ep 2"},
+		},
+	}
+	got := applyFeedMap(lib, map[string]string{src: dst})
+	if got.Episodes[0].FeedURL != dst {
+		t.Errorf("remapped episode: got %q, want %q", got.Episodes[0].FeedURL, dst)
+	}
+	if got.Episodes[1].FeedURL != "https://other.example.com/feed" {
+		t.Errorf("non-mapped episode changed: got %q", got.Episodes[1].FeedURL)
+	}
+}
+
+func TestApplyFeedMap_RemapsPodcasts(t *testing.T) {
+	src := "https://subscriber.example.com/feed"
+	dst := "https://target.example.com/feed"
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: src, Title: "My Show"},
+			{FeedURL: "https://other.example.com/feed", Title: "Other Show"},
+		},
+	}
+	got := applyFeedMap(lib, map[string]string{src: dst})
+	if got.Podcasts[0].FeedURL != dst {
+		t.Errorf("remapped podcast: got %q, want %q", got.Podcasts[0].FeedURL, dst)
+	}
+	if got.Podcasts[1].FeedURL != "https://other.example.com/feed" {
+		t.Errorf("non-mapped podcast changed: got %q", got.Podcasts[1].FeedURL)
+	}
+}
+
+func TestApplyFeedMap_DoesNotMutateOriginal(t *testing.T) {
+	src := "https://subscriber.example.com/feed"
+	dst := "https://target.example.com/feed"
+	lib := &model.Library{
+		Podcasts: []model.Podcast{{FeedURL: src, Title: "My Show"}},
+		Episodes: []model.EpisodeState{{FeedURL: src, Title: "Ep 1"}},
+	}
+	_ = applyFeedMap(lib, map[string]string{src: dst})
+	if lib.Podcasts[0].FeedURL != src {
+		t.Errorf("original podcast mutated: got %q, want %q", lib.Podcasts[0].FeedURL, src)
+	}
+	if lib.Episodes[0].FeedURL != src {
+		t.Errorf("original episode mutated: got %q, want %q", lib.Episodes[0].FeedURL, src)
+	}
+}
+
+func TestApplyFeedMap_NormalisesHTTPKey(t *testing.T) {
+	// Map key uses http; episode uses https — NormalizeFeedURL makes them equivalent.
+	lib := &model.Library{
+		Episodes: []model.EpisodeState{
+			{FeedURL: "https://subscriber.example.com/feed", Title: "Ep 1"},
+		},
+	}
+	got := applyFeedMap(lib, map[string]string{
+		"http://subscriber.example.com/feed": "https://target.example.com/feed",
+	})
+	if got.Episodes[0].FeedURL != "https://target.example.com/feed" {
+		t.Errorf("http→https normalisation: got %q, want https://target.example.com/feed", got.Episodes[0].FeedURL)
+	}
+}

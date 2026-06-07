@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/tyler/podcast-migrate/internal/apple"
+	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/overcast"
 	"github.com/tyler/podcast-migrate/internal/pocketcasts"
 	"github.com/tyler/podcast-migrate/internal/provider"
@@ -47,6 +48,7 @@ func migrateCmd() *cobra.Command {
 		sinceStr            string        // --since (delta sync cutoff)
 		pocketcastsEmail    string        // --pocketcasts-email / POCKETCASTS_EMAIL
 		pocketcastsPassword string        // --pocketcasts-password / POCKETCASTS_PASSWORD
+		feedMapPairs        []string      // --feed-map (repeatable, "SRC_URL=DST_URL")
 	)
 
 	cmd := &cobra.Command{
@@ -140,6 +142,12 @@ func migrateCmd() *cobra.Command {
 				return err
 			}
 
+			// Parse feed URL mappings from --feed-map flags.
+			feedMap, err := buildFeedMap(feedMapPairs)
+			if err != nil {
+				return err
+			}
+
 			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", "", "", pocketcastsEmail, pocketcastsPassword)
 			if err != nil {
 				return fmt.Errorf("source: %w", err)
@@ -200,6 +208,7 @@ func migrateCmd() *cobra.Command {
 				SubscribedOnly:          subscribedOnly,
 				EpisodeCacheMaxAge:      episodeCacheMaxAge,
 				ClearEpisodeCache:       clearEpisodeCache,
+				FeedMap:                 feedMap,
 			}
 
 			if logFile != "" {
@@ -278,6 +287,14 @@ func migrateCmd() *cobra.Command {
 		"Pocket Casts account email (or set POCKETCASTS_EMAIL env var)")
 	cmd.Flags().StringVar(&pocketcastsPassword, "pocketcasts-password", "",
 		"Pocket Casts account password (or set POCKETCASTS_PASSWORD env var)")
+	cmd.Flags().StringArrayVar(&feedMapPairs, "feed-map", nil,
+		"map a source subscriber feed URL to a destination analog feed URL\n"+
+			"(format: SRC_URL=DST_URL; repeatable). Use when you have already\n"+
+			"subscribed to a private/subscriber feed on the destination platform\n"+
+			"that corresponds to an Apple subscriber feed in the source. Episodes\n"+
+			"from SRC_URL are matched against DST_URL instead of the public feed,\n"+
+			"without requiring --subscribed-only.\n"+
+			"Example: --feed-map 'https://private.apple.feed/abc=https://private.target.feed/xyz'")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")
@@ -319,6 +336,31 @@ func buildPodcastFilter(cliPatterns []string, listFile string) ([]string, error)
 	}
 
 	return out, nil
+}
+
+// buildFeedMap parses a slice of "SRC_URL=DST_URL" strings into the map
+// expected by provider.WriteOptions.FeedMap. Both URLs are normalised via
+// NormalizeFeedURL so that http/https differences and trailing-slash
+// variations are treated as equivalent. Returns an error if any pair is
+// malformed.
+func buildFeedMap(pairs []string) (map[string]string, error) {
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	m := make(map[string]string, len(pairs))
+	for _, pair := range pairs {
+		idx := strings.Index(pair, "=")
+		if idx <= 0 {
+			return nil, fmt.Errorf("--feed-map %q: expected format SRC_URL=DST_URL (missing '=')", pair)
+		}
+		src := strings.TrimSpace(pair[:idx])
+		dst := strings.TrimSpace(pair[idx+1:])
+		if src == "" || dst == "" {
+			return nil, fmt.Errorf("--feed-map %q: both source and destination URLs must be non-empty", pair)
+		}
+		m[migrate.NormalizeFeedURL(src)] = migrate.NormalizeFeedURL(dst)
+	}
+	return m, nil
 }
 
 func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, overcastEmail, overcastPassword, pcEmail, pcPassword string) (provider.Provider, error) {

@@ -72,6 +72,15 @@ func (e *Engine) Run(ctx context.Context, opts provider.WriteOptions) (*Result, 
 		}
 	}
 
+	// Remap subscriber feed URLs to their analog destination feed URLs before
+	// merging. This lets users pre-subscribe to private feeds on the target
+	// (e.g. an Overcast or Pocket Casts exclusive subscriber feed) and have
+	// their Apple Podcasts play state migrate to those feeds rather than to the
+	// public equivalent. See provider.WriteOptions.FeedMap for details.
+	if len(opts.FeedMap) > 0 {
+		srcLib = applyFeedMap(srcLib, opts.FeedMap)
+	}
+
 	merged := merge(srcLib, dstLib, opts)
 
 	res := &Result{
@@ -226,6 +235,66 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 	}
 
 	return out
+}
+
+// applyFeedMap returns a shallow copy of lib with feed URLs remapped according
+// to feedMap. Both Podcasts and Episodes are remapped so that all downstream
+// matching (feeddate, feedtitle, cross-feed title+date) operates against the
+// destination analog feed rather than the original subscriber feed URL.
+//
+// feedMap keys are normalised via NormalizeFeedURL before comparison, so
+// http/https and trailing-slash differences are treated as equivalent.
+// The library itself is not mutated; new Podcasts and Episodes slices are
+// allocated only when at least one entry is remapped.
+func applyFeedMap(lib *model.Library, feedMap map[string]string) *model.Library {
+	if lib == nil || len(feedMap) == 0 {
+		return lib
+	}
+	// Build a normalised key → dst lookup so lookups are URL-canonical.
+	normMap := make(map[string]string, len(feedMap))
+	for src, dst := range feedMap {
+		normMap[migrate.NormalizeFeedURL(src)] = dst
+	}
+
+	out := *lib // shallow struct copy — slices are replaced below as needed
+
+	// Remap podcast feed URLs.
+	podMapped := false
+	for _, pod := range lib.Podcasts {
+		if _, ok := normMap[migrate.NormalizeFeedURL(pod.FeedURL)]; ok {
+			podMapped = true
+			break
+		}
+	}
+	if podMapped {
+		out.Podcasts = make([]model.Podcast, len(lib.Podcasts))
+		copy(out.Podcasts, lib.Podcasts)
+		for i, pod := range out.Podcasts {
+			if mapped, ok := normMap[migrate.NormalizeFeedURL(pod.FeedURL)]; ok {
+				out.Podcasts[i].FeedURL = mapped
+			}
+		}
+	}
+
+	// Remap episode feed URLs.
+	epMapped := false
+	for _, ep := range lib.Episodes {
+		if _, ok := normMap[migrate.NormalizeFeedURL(ep.FeedURL)]; ok {
+			epMapped = true
+			break
+		}
+	}
+	if epMapped {
+		out.Episodes = make([]model.EpisodeState, len(lib.Episodes))
+		copy(out.Episodes, lib.Episodes)
+		for i, ep := range out.Episodes {
+			if mapped, ok := normMap[migrate.NormalizeFeedURL(ep.FeedURL)]; ok {
+				out.Episodes[i].FeedURL = mapped
+			}
+		}
+	}
+
+	return &out
 }
 
 // buildFeedToTitle returns a map from each podcast's feed URL to its lowercased

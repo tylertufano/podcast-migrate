@@ -16,8 +16,8 @@ podcast-migrate reads your library directly from the source app's local data, me
 - Falls back to a manually exported OPML file if the database isn't accessible
 - **Play state write** via the Apple Podcasts web API (`amp-api.podcasts.apple.com`) — syncs both fully played and in-progress episodes to Apple's backend, which propagates automatically to iPhone, iPad, Mac, and the web player. Episode IDs are resolved through the Apple catalog API (iTunes Search + amp-api catalog with full pagination), so no local database or Full Disk Access is required for the write path. Before each write the server's current position is checked and the episode is skipped if Apple is already at or ahead of the source. See [Overcast → Apple Podcasts](#overcast--apple-podcasts-sync-play-state-to-iphone) for setup.
 - Detects and reports two categories of content that can't be migrated:
-  - **`internal://` feeds** — Apple-exclusive shows with no public RSS feed
-  - **PSUB / PLUS episodes** — paywalled Apple Podcasts Subscriptions episodes; the parent podcast subscription is still migrated
+  - **`internal://` feeds** — Apple-exclusive shows with no public RSS feed (skipped)
+  - **PSUB / PLUS episodes** — paywalled Apple Podcasts Subscriptions; episodes are matched against the destination by podcast title + pub date, so if you have the equivalent feed subscribed on the destination they will be picked up automatically
 
 **Overcast (source and destination)**
 
@@ -39,6 +39,8 @@ podcast-migrate reads your library directly from the source app's local data, me
   - `source` — source data always wins
   - `target` — existing destination data is never overwritten
 - Episode matching across providers uses a four-strategy cascade: feed URL + pub date → feed URL + title → podcast title + pub date → podcast title + title (the last two handle feeds that differ between apps)
+- **Fuzzy title matching** — season markers (`S01`, `S1`, `Season 1`, …) and punctuation are stripped before comparing episode titles, so "The Retrievals - Ep. 4" and "The Retrievals S01 - Ep. 4" are recognised as the same episode. Applied in all matching paths (Overcast, Pocket Casts, cross-feed).
+- **Automatic subscriber feed remapping** — before merging, each source podcast that isn't directly subscribed at the destination is matched against the destination's subscription list by fuzzy-normalised title (Plus/tier-suffix stripping + punctuation normalization). If a match is found, the source feed URL is silently remapped to the destination's feed URL so all matching strategies work correctly. This handles Apple `internal://` and PSUB subscriber feeds without any flags — subscribe to the analog feed on the destination first and the migration handles the rest.
 - `--dry-run` previews what would change without writing anything
 
 ### Supported providers
@@ -112,6 +114,8 @@ podcast-migrate migrate --from podcasts --to overcast \
 **Subscription handling:** Any podcast in your Apple Podcasts library that is not yet subscribed in Overcast is automatically subscribed before its episodes are updated. Overcast silently drops play-state updates for unsubscribed podcasts, so this step is required for a complete migration. To skip it and only update episodes for podcasts you're already subscribed to in Overcast, add `--subscribed-only`.
 
 `--overcast-out` is optional — omit it to sync play state without generating an OPML file.
+
+**Subscriber / private feeds:** If you have Apple Podcasts Subscriptions (PSUB) or other subscriber-feed episodes, subscribe to the equivalent private feed in Overcast first. The tool will automatically detect that the destination has a podcast with a matching title and route those episodes there — no extra flags needed. To override the auto-match explicitly (e.g. when titles differ between platforms), use `--feed-map`.
 
 If you prefer to match against a specific snapshot instead of auto-fetching the live account (e.g. for reproducible dry-run previews), provide one explicitly:
 
@@ -244,7 +248,9 @@ podcast-migrate migrate --from podcasts --to pocketcasts \
 
 **How it works:** Reads your Apple Podcasts play state from `MTLibrary.sqlite`, authenticates with Pocket Casts, and calls the same internal API endpoint the Pocket Casts web player uses to save positions. Any podcast in your Apple Podcasts library not yet subscribed in Pocket Casts is automatically subscribed first. Changes sync to all your Pocket Casts devices automatically. Add `--subscribed-only` to only update already-subscribed feeds without subscribing to new ones.
 
-Episode matching uses two keys in order: publish date + feed URL (primary), then normalized title + feed URL (fallback). Episodes not found in Pocket Casts are skipped and reported. Episodes already marked played or further ahead in Pocket Casts are left alone.
+**Subscriber / private feeds:** If you have Apple Podcasts Subscriptions (PSUB) or other subscriber-feed episodes, subscribe to the equivalent private feed in Pocket Casts first. The tool automatically matches source podcasts to destination subscriptions by fuzzy-normalised title — no `--subscribed-only` or `--feed-map` needed in the common case.
+
+Episode matching uses a cascade: publish date + feed URL (primary), then fuzzy-normalised title + feed URL (fallback — handles season-marker variants like "S01"), then cross-feed pub date and title matching by podcast title for subscriber/private feeds. Episodes not found in Pocket Casts are skipped and reported. Episodes already marked played or further ahead in Pocket Casts are left alone.
 
 Use `--since` to limit to recently changed episodes when running incrementally:
 
@@ -358,6 +364,8 @@ podcast-migrate import --to overcast \
 | `--apple-media-user-token` | Apple media-user-token (or `APPLE_MEDIA_USER_TOKEN` env var) |
 | `--strict-feed-match` | Only match episodes using feed-URL-anchored strategies; skips cross-feed title fallbacks |
 | `--force-update` | Write source play state even if the destination already shows the episode as played or further along |
+| `--feed-map` | Explicitly map a source feed URL to a destination feed URL (`SRC_URL=DST_URL`, repeatable). Use when title-based auto-matching isn't sufficient — for example when the podcast has a different title on each platform. Auto-matching handles the common case without this flag. |
+| `--since` | Delta sync: only process Apple Podcasts episodes whose play state changed after this cutoff. Accepts a duration (`24h`, `7d`) or a date (`2026-06-01`). Only effective when `--from podcasts`. |
 
 ## Future work
 
@@ -375,9 +383,6 @@ The `Provider` interface makes adding new services straightforward. Candidates:
 ### Automated / scheduled sync
 A `sync` subcommand that runs on a schedule (cron or a background agent) and incrementally syncs only changes since the last run, using a state file to track what was last seen.
 
-### Richer episode matching
-The current cascade can fail when the same episode has different titles or pub dates across providers (common with older feeds that changed hosting). A fuzzy-match fallback using edit distance on titles would reduce unmatched episodes.
-
 ### Token management
 Automatic extraction of the Apple Bearer token from the macOS Keychain (where the native Podcasts app caches it), and automatic renewal when it expires, to avoid the manual DevTools capture step. The `media-user-token` is harder to extract automatically since it lives in a browser cookie rather than the system Keychain.
 
@@ -391,10 +396,11 @@ cmd/                  CLI entry points (migrate, export, import, mark-played, ob
 internal/
   model/              Shared types: Library, Podcast, EpisodeState
   provider/           Provider interface and WriteOptions
+  migrate/            Shared utilities: log helpers, feed URL normalisation, fuzzy title matching, skip-reason logic
   apple/              Apple Podcasts adapter (SQLite read; catalog API + web API write)
   overcast/           Overcast adapter (OPML read/write + web API)
   pocketcasts/        Pocket Casts adapter (web API read/write)
-  sync/               Merge engine and conflict resolution
+  sync/               Merge engine, conflict resolution, and automatic subscriber feed remapping
 main.go
 ```
 

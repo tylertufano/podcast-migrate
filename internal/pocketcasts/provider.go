@@ -852,10 +852,27 @@ func addToIndex(index map[string]pcIndexEntry, ep *APIEpisode, feedURL string) {
 			index[key] = entry
 		}
 	}
+	// Cross-podcast fallback: fuzzy title + calendar date (no feed URL).
+	// Used when a podcast network cross-posts an episode to multiple feeds
+	// and Apple attributes it to a different show than PC does.  Day-level
+	// precision is intentional: it tolerates timezone differences between
+	// Apple's CoreData timestamps and PC's published_at field while still
+	// being specific enough to avoid false positives across different shows.
+	// findInIndex only uses this key as a last resort.
+	if !pubTime.IsZero() && ep.Title != "" {
+		key := "titledate:" + migrate.FuzzyNormalizeTitle(ep.Title) + "|" + pubTime.UTC().Format("2006-01-02")
+		if _, exists := index[key]; !exists {
+			index[key] = entry
+		}
+	}
 }
 
-// findInIndex looks up an episode in the PC index using the same key priority
-// as addToIndex: pub date + feed URL first, then title + feed URL.
+// findInIndex looks up an episode in the PC index.  Key priority:
+//  1. feed URL + pub date  — exact match including podcast identity.
+//  2. feed URL + fuzzy title — tolerates season-marker variants.
+//  3. fuzzy title + calendar date (no feed URL) — cross-podcast fallback for
+//     episodes that a podcast network cross-posts to multiple feeds and that
+//     Apple and PC attribute to different shows.
 func findInIndex(index map[string]pcIndexEntry, ep model.EpisodeState) (pcIndexEntry, bool) {
 	normFeed := normalizeFeedURL(ep.FeedURL)
 	if !ep.PubDate.IsZero() && ep.FeedURL != "" {
@@ -868,6 +885,15 @@ func findInIndex(index map[string]pcIndexEntry, ep model.EpisodeState) (pcIndexE
 	// ("The Retrievals - Ep. 4" ↔ "The Retrievals S01 - Ep. 4").
 	if ep.FeedURL != "" && ep.Title != "" {
 		key := "feedtitle:" + normFeed + "|" + migrate.FuzzyNormalizeTitle(ep.Title)
+		if entry, ok := index[key]; ok {
+			return entry, true
+		}
+	}
+	// Cross-podcast fallback: title + date without feed URL.  Only reached
+	// when both feed-URL-based lookups fail, meaning the episode may have
+	// been attributed to a different podcast in Apple than in PC.
+	if !ep.PubDate.IsZero() && ep.Title != "" {
+		key := "titledate:" + migrate.FuzzyNormalizeTitle(ep.Title) + "|" + ep.PubDate.UTC().Format("2006-01-02")
 		if entry, ok := index[key]; ok {
 			return entry, true
 		}

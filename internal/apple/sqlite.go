@@ -238,8 +238,13 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		}
 
 		ep := model.EpisodeState{
-			GUID:    guid.String, // empty string when NULL; matching falls back to title+date
-			FeedURL: feedURL,
+			GUID: guid.String, // empty string when NULL; matching falls back to title+date
+			// Apply the same cleanFeedURL that readPodcasts uses so that episode
+			// FeedURLs are consistent with their parent podcast's FeedURL.  Without
+			// this, Apple's ?t=<timestamp> cache-buster stays in the episode URL
+			// while the Podcast entry has the clean form, breaking feedToTitle
+			// lookups and the applyFeedMap remapping in the sync engine.
+			FeedURL: cleanFeedURL(feedURL),
 			Title:   title,
 		}
 

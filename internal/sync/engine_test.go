@@ -1124,3 +1124,65 @@ func TestApplyFeedMap_NormalisesHTTPKey(t *testing.T) {
 		t.Errorf("http→https normalisation: got %q, want https://target.example.com/feed", got.Episodes[0].FeedURL)
 	}
 }
+
+// ---- buildAutoFeedMap subtitle contains-match ----
+
+func TestBuildAutoFeedMap_SubtitleContainsMatch_Remaps(t *testing.T) {
+	// Apple stores "Crooked City" but PC/Overcast imported it as "Crooked City: Dixon, IL".
+	// The fuzzy contains-match pass should still find the destination feed.
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.megaphone.fm/crookedcity", Title: "Crooked City"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://rss.pdrl.fm/7f8056/feeds.megaphone.fm/crookedcity", Title: "Crooked City: Dixon, IL"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 subtitle contains-match mapping, got %d: %v", len(got), got)
+	}
+	want := "https://rss.pdrl.fm/7f8056/feeds.megaphone.fm/crookedcity"
+	if got["https://feeds.megaphone.fm/crookedcity"] != want {
+		t.Errorf("dst feed: got %q, want %q", got["https://feeds.megaphone.fm/crookedcity"], want)
+	}
+}
+
+func TestBuildAutoFeedMap_SubtitleContainsMatch_DstShorter(t *testing.T) {
+	// Reverse: destination has the shorter title, source has the longer one.
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://apple.feed/crookedcity", Title: "Crooked City: Dixon, IL"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://target.feed/crookedcity", Title: "Crooked City"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 reverse-subtitle mapping, got %d: %v", len(got), got)
+	}
+}
+
+func TestBuildAutoFeedMap_ShortTitleContains_NoFalsePositive(t *testing.T) {
+	// A very short normalised title like "news" must not accidentally match
+	// "the news hour" or similar via contains. The 5-char minimum guards this.
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://apple.feed/abc", Title: "Go"}, // fuzzyPodcastTitle → "go" (2 chars < 5)
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://target.feed/xyz", Title: "GoTo Podcast"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 0 {
+		t.Errorf("short title should not trigger contains-match, got: %v", got)
+	}
+}

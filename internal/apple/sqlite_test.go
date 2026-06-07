@@ -601,6 +601,50 @@ func TestSQLiteReader_FeedURLSetOnEpisodes(t *testing.T) {
 	}
 }
 
+func TestSQLiteReader_EpisodeFeedURL_CacheBusterStripped(t *testing.T) {
+	// Apple Podcasts adds ?t=<timestamp> cache-buster parameters to ZFEEDURL.
+	// readPodcasts strips them via cleanFeedURL; readEpisodes must do the same
+	// so that episode FeedURLs are consistent with their parent podcast FeedURL.
+	// Without this fix, feedToTitle lookups and applyFeedMap remapping fail for
+	// any podcast whose DB entry has a cache-buster in its URL.
+	path := filepath.Join(t.TempDir(), "MTLibrary.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	_, _ = db.Exec(`CREATE TABLE ZMTPODCAST (Z_PK INTEGER PRIMARY KEY, ZSUBSCRIBED INTEGER, ZFEEDURL TEXT, ZTITLE TEXT, ZAUTHOR TEXT, ZIMAGEURL TEXT)`)
+	_, _ = db.Exec(`CREATE TABLE ZMTEPISODE (Z_PK INTEGER PRIMARY KEY, Z_OPT INTEGER NOT NULL DEFAULT 1, ZPODCAST INTEGER, ZGUID TEXT, ZTITLE TEXT, ZPUBDATE REAL, ZDURATION REAL, ZPLAYSTATE INTEGER DEFAULT 0, ZPLAYCOUNT INTEGER DEFAULT 0, ZPLAYHEAD REAL DEFAULT 0.0, ZLASTDATEPLAYED REAL, ZPRICETYPE TEXT, ZUNPLAYEDTAB INTEGER DEFAULT 0, ZPLAYSTATESOURCE INTEGER DEFAULT 0, ZPLAYSTATEMANUALLYSET INTEGER DEFAULT 0, ZLASTUSERMARKEDASPLAYEDDATE REAL, ZPLAYSTATELASTMODIFIEDDATE REAL, ZSTORETRACKID INTEGER)`)
+	// Insert podcast with a ?t= cache-buster in the feed URL.
+	_, _ = db.Exec(`INSERT INTO ZMTPODCAST VALUES (1, 1, 'https://podcast.example.com/feed.xml?t=1749316800000', 'Cache Buster Show', 'Author', NULL)`)
+	// Insert an in-progress episode linked to that podcast.
+	_, _ = db.Exec(`INSERT INTO ZMTEPISODE (Z_PK, Z_OPT, ZPODCAST, ZGUID, ZTITLE, ZPUBDATE, ZDURATION, ZPLAYSTATE, ZPLAYCOUNT, ZPLAYHEAD, ZLASTDATEPLAYED, ZPRICETYPE, ZPLAYSTATESOURCE) VALUES (1, 1, 1, 'cache-guid-1', 'Cache Episode', 700000000.0, 3600.0, 1, 0, 600.0, NULL, 'STDQ', 0)`)
+	db.Close()
+
+	lib, err := apple.NewSQLiteReader(path).Read(context.Background())
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	// The Podcast entry should have the cleaned URL (no ?t=).
+	wantClean := "https://podcast.example.com/feed.xml"
+	if len(lib.Podcasts) != 1 {
+		t.Fatalf("podcasts: got %d, want 1", len(lib.Podcasts))
+	}
+	if lib.Podcasts[0].FeedURL != wantClean {
+		t.Errorf("podcast FeedURL: got %q, want %q", lib.Podcasts[0].FeedURL, wantClean)
+	}
+
+	// The episode FeedURL must also be the cleaned URL so that feedToTitle lookups
+	// and applyFeedMap episode remapping work correctly.
+	ep := findEpisode(lib, "cache-guid-1")
+	if ep == nil {
+		t.Fatal("cache-guid-1 not found in episodes")
+	}
+	if ep.FeedURL != wantClean {
+		t.Errorf("episode FeedURL: got %q, want %q (cache-buster not stripped)", ep.FeedURL, wantClean)
+	}
+}
+
 func TestSQLiteReader_FileNotFound(t *testing.T) {
 	_, err := apple.NewSQLiteReader("/nonexistent/path/MTLibrary.sqlite").Read(context.Background())
 	if err == nil {

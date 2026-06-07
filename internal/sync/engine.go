@@ -298,6 +298,12 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 
 	// For each source podcast that is not already subscribed at the destination
 	// by feed URL, attempt a title-based match.
+	//
+	// Pass 1: exact fuzzy-normalised title equality.
+	// Pass 2: contains-match for podcasts whose titles differ by a subtitle
+	// (e.g. Apple "Crooked City" vs PC "Crooked City: Dixon, IL").
+	// A minimum normalised length of 5 characters guards against trivial matches
+	// on short words like "news" accidentally matching "the news hour".
 	var feedMap map[string]string
 	for _, pod := range srcLib.Podcasts {
 		if pod.FeedURL == "" {
@@ -310,11 +316,25 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		if t == "" {
 			continue
 		}
+		// Pass 1: exact match.
 		if dstFeed, ok := dstTitleToFeed[t]; ok {
 			if feedMap == nil {
 				feedMap = make(map[string]string)
 			}
 			feedMap[pod.FeedURL] = dstFeed
+			continue
+		}
+		// Pass 2: contains-match — handles subtitle additions.
+		if len(t) >= 5 {
+			for dstT, dstFeed := range dstTitleToFeed {
+				if strings.Contains(dstT, t) || strings.Contains(t, dstT) {
+					if feedMap == nil {
+						feedMap = make(map[string]string)
+					}
+					feedMap[pod.FeedURL] = dstFeed
+					break
+				}
+			}
 		}
 	}
 	return feedMap

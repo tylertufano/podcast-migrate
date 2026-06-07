@@ -395,10 +395,14 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	podUUIDToFeedURL := make(map[string]string, len(apiPods))
 	normFeedToPodUUID := make(map[string]string, len(apiPods))
 	normFeedToPodTitle := make(map[string]string, len(apiPods))
-	// normTitleToPodUUID: normalised PC podcast title → PC UUID.
+	// normTitleToPodUUID: NormalizePlusTitle(pc.Title) → PC UUID.
 	// Fallback for private/subscriber feeds whose URLs the refresh API doesn't
 	// know (e.g. NYT "The Daily - Subscriber Feed (🔓 for you@…)").
 	normTitleToPodUUID := make(map[string]string, len(apiPods))
+	// fuzzyTitleToPodUUID: fuzzyPodcastTitle(pc.Title) → PC UUID.
+	// Broader fallback that also strips season markers and punctuation, enabling
+	// contains-match for subtitle differences ("Crooked City" ↔ "Crooked City: Dixon, IL").
+	fuzzyTitleToPodUUID := make(map[string]string, len(apiPods))
 	for _, ap := range apiPods {
 		if ap.UUID == "" || ap.URL == "" {
 			continue
@@ -412,6 +416,11 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		if normTitle := model.NormalizePlusTitle(ap.Title); normTitle != "" {
 			if _, exists := normTitleToPodUUID[normTitle]; !exists {
 				normTitleToPodUUID[normTitle] = ap.UUID
+			}
+		}
+		if ft := fuzzyPCTitle(ap.Title); ft != "" {
+			if _, exists := fuzzyTitleToPodUUID[ft]; !exists {
+				fuzzyTitleToPodUUID[ft] = ap.UUID
 			}
 		}
 	}
@@ -500,13 +509,40 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				// NYT "The Daily - Subscriber Feed (🔓 for you@…)") have
 				// personalised URLs the refresh API doesn't know. Normalise the
 				// source podcast title and look it up in the PC subscription list.
+				//
+				// Two passes:
+				//  a) NormalizePlusTitle exact match — fast path for subscriber feeds.
+				//  b) fuzzyPCTitle exact match, then contains-match — handles subtitle
+				//     differences (e.g. Apple "Crooked City" ↔ PC "Crooked City: Dixon, IL").
 				if podUUID == "" {
 					srcTitle := feedToTitle[originalFeedURL]
-					if normTitle := model.NormalizePlusTitle(srcTitle); normTitle != "" {
-						if uuid := normTitleToPodUUID[normTitle]; uuid != "" {
-							podUUID = uuid
+					if srcTitle != "" {
+						// Pass (a): NormalizePlusTitle exact match.
+						if normTitle := model.NormalizePlusTitle(srcTitle); normTitle != "" {
+							if uuid := normTitleToPodUUID[normTitle]; uuid != "" {
+								podUUID = uuid
+							}
+						}
+						// Pass (b): fuzzy exact, then contains.
+						if podUUID == "" {
+							srcFuzzy := fuzzyPCTitle(srcTitle)
+							if srcFuzzy != "" {
+								if uuid := fuzzyTitleToPodUUID[srcFuzzy]; uuid != "" {
+									podUUID = uuid
+								}
+								if podUUID == "" && len(srcFuzzy) >= 5 {
+									for pcFuzzy, uuid := range fuzzyTitleToPodUUID {
+										if strings.Contains(pcFuzzy, srcFuzzy) || strings.Contains(srcFuzzy, pcFuzzy) {
+											podUUID = uuid
+											break
+										}
+									}
+								}
+							}
+						}
+						if podUUID != "" {
 							indexFeedURL = originalFeedURL
-							fmt.Printf("  matched %q to PC podcast by title (private/subscriber feed)\n", podTitle)
+							fmt.Printf("  matched %q to PC podcast by title\n", podTitle)
 						}
 					}
 				}
@@ -886,3 +922,15 @@ func filterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[stri
 // normalizeFeedURL returns a canonical form of a podcast feed URL for matching.
 // See migrate.NormalizeFeedURL for full documentation.
 func normalizeFeedURL(raw string) string { return migrate.NormalizeFeedURL(raw) }
+
+// fuzzyPCTitle normalises a PC podcast title for cross-library matching.
+// It chains model.NormalizePlusTitle (strips paid-tier/subscriber suffixes) then
+// migrate.FuzzyNormalizeTitle (lowercase, strip season markers and punctuation).
+// Matches the fuzzyPodcastTitle logic in internal/sync/engine.go.
+func fuzzyPCTitle(title string) string {
+	norm := model.NormalizePlusTitle(title)
+	if norm == "" {
+		norm = title
+	}
+	return migrate.FuzzyNormalizeTitle(norm)
+}

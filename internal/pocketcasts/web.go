@@ -352,8 +352,9 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastUUID 
 //   - podcastUUID: Pocket Casts internal podcast UUID
 //   - status: PlayingUnplayed, PlayingInProgress, or PlayingPlayed
 //   - positionSec: playback position in seconds (0 for played/unplayed)
-//   - durationSec: episode duration in seconds (currently unused by the API but
-//     kept for call-site compatibility)
+//   - durationSec: episode duration in seconds; included in the request when
+//     non-zero so that Pocket Casts can correctly record progress percentage
+//     for in-progress episodes
 func UpdateEpisodeProgress(ctx context.Context, client *http.Client,
 	episodeUUID, podcastUUID string, status, positionSec, durationSec int) error {
 
@@ -362,12 +363,14 @@ func UpdateEpisodeProgress(ctx context.Context, client *http.Client,
 		Podcast  string `json:"podcast"`
 		Status   int    `json:"status"`
 		Position int    `json:"position"`
+		Duration int    `json:"duration,omitempty"`
 	}
 	payload := updateBody{
 		UUID:     episodeUUID,
 		Podcast:  podcastUUID,
 		Status:   status,
 		Position: positionSec,
+		Duration: durationSec,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {

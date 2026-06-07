@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
@@ -204,17 +204,24 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 	}
 
 	// Build lookup structures for the existing subscription list.
-	// subscribedFeeds: normalised URL → true (fast URL-based check).
-	// subscribedUUIDs: PC UUID → true (fallback for URL-mismatch detection — same
-	//   podcast can appear with different RSS feed URLs across apps).
+	// subscribedFeeds:  normalised URL → true (fast URL-based check).
+	// subscribedUUIDs:  PC UUID → true (fallback for URL-mismatch — same podcast
+	//   can have different RSS URLs across apps).
+	// subscribedTitles: normalised title → true (fallback for private/subscriber
+	//   feeds whose URLs are personalised and never match the public PC URL, e.g.
+	//   NYT "The Daily - Subscriber Feed (🔓 for you@…)").
 	subscribedFeeds := make(map[string]bool, len(existing))
 	subscribedUUIDs := make(map[string]bool, len(existing))
+	subscribedTitles := make(map[string]bool, len(existing))
 	for _, pod := range existing {
 		if pod.URL != "" {
 			subscribedFeeds[normalizeFeedURL(pod.URL)] = true
 		}
 		if pod.UUID != "" {
 			subscribedUUIDs[pod.UUID] = true
+		}
+		if normTitle := model.NormalizePlusTitle(pod.Title); normTitle != "" {
+			subscribedTitles[normTitle] = true
 		}
 	}
 
@@ -250,6 +257,13 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 			}
 		}
 		if subscribedFeeds[normalizeFeedURL(pod.FeedURL)] {
+			alreadySubscribedByURL++
+			continue
+		}
+		// Title-based check: private/subscriber feeds (e.g. NYT subscriber
+		// feeds) have personalised URLs that won't URL-match any PC subscription,
+		// but their normalised title ("the daily") does.
+		if normTitle := model.NormalizePlusTitle(pod.Title); normTitle != "" && subscribedTitles[normTitle] {
 			alreadySubscribedByURL++
 			continue
 		}
@@ -381,6 +395,10 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	podUUIDToFeedURL := make(map[string]string, len(apiPods))
 	normFeedToPodUUID := make(map[string]string, len(apiPods))
 	normFeedToPodTitle := make(map[string]string, len(apiPods))
+	// normTitleToPodUUID: normalised PC podcast title → PC UUID.
+	// Fallback for private/subscriber feeds whose URLs the refresh API doesn't
+	// know (e.g. NYT "The Daily - Subscriber Feed (🔓 for you@…)").
+	normTitleToPodUUID := make(map[string]string, len(apiPods))
 	for _, ap := range apiPods {
 		if ap.UUID == "" || ap.URL == "" {
 			continue
@@ -390,6 +408,11 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		if _, exists := normFeedToPodUUID[norm]; !exists {
 			normFeedToPodUUID[norm] = ap.UUID
 			normFeedToPodTitle[norm] = ap.Title
+		}
+		if normTitle := model.NormalizePlusTitle(ap.Title); normTitle != "" {
+			if _, exists := normTitleToPodUUID[normTitle]; !exists {
+				normTitleToPodUUID[normTitle] = ap.UUID
+			}
 		}
 	}
 	fmt.Printf("pocketcasts: %d subscribed podcast(s) loaded\n", len(apiPods))
@@ -458,26 +481,41 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			indexFeedURL := podUUIDToFeedURL[podUUID]
 
 			if podUUID == "" {
-				// The source feed URL doesn't match any PC subscription URL — the
-				// same podcast may be subscribed in PC under a different RSS URL
-				// (different CDN host, http vs https, etc.). Resolve via the PC
-				// refresh API to get the canonical UUID, then verify it's subscribed.
+				// The source feed URL doesn't match any PC subscription URL.
+				//
+				// Strategy 1: resolve via the PC refresh API (handles CDN changes,
+				// http→https, etc.).
 				resolvedUUID, resolveErr := ResolveFeedToPodcastUUID(ctx, originalFeedURL)
-				if resolveErr != nil {
-					fmt.Printf("  skipping %q: could not resolve feed URL to PC UUID (%v)\n", podTitle, resolveErr)
+				if resolveErr == nil {
+					if _, isSubscribed := podUUIDToFeedURL[resolvedUUID]; isSubscribed {
+						podUUID = resolvedUUID
+						// Use the Apple URL for index keys: findInIndex always uses
+						// the Apple episode's FeedURL, so addToIndex must match.
+						indexFeedURL = originalFeedURL
+						fmt.Printf("  resolved feed URL mismatch for %q — PC UUID matched via refresh API\n", podTitle)
+					}
+				}
+
+				// Strategy 2: title-based match.  Private/subscriber feeds (e.g.
+				// NYT "The Daily - Subscriber Feed (🔓 for you@…)") have
+				// personalised URLs the refresh API doesn't know. Normalise the
+				// source podcast title and look it up in the PC subscription list.
+				if podUUID == "" {
+					srcTitle := feedToTitle[originalFeedURL]
+					if normTitle := model.NormalizePlusTitle(srcTitle); normTitle != "" {
+						if uuid := normTitleToPodUUID[normTitle]; uuid != "" {
+							podUUID = uuid
+							indexFeedURL = originalFeedURL
+							fmt.Printf("  matched %q to PC podcast by title (private/subscriber feed)\n", podTitle)
+						}
+					}
+				}
+
+				if podUUID == "" {
+					fmt.Printf("  skipping %q: could not resolve to a subscribed PC podcast\n", podTitle)
 					skipped++
 					continue
 				}
-				if _, isSubscribed := podUUIDToFeedURL[resolvedUUID]; !isSubscribed {
-					fmt.Printf("  skipping %q: resolved PC UUID not found in subscription list\n", podTitle)
-					skipped++
-					continue
-				}
-				podUUID = resolvedUUID
-				// Use the Apple URL for index keys: findInIndex always uses the
-				// Apple episode's FeedURL, so addToIndex must use the same URL.
-				indexFeedURL = originalFeedURL
-				fmt.Printf("  resolved feed URL mismatch for %q — PC UUID matched via refresh API\n", podTitle)
 			}
 
 			for page := 0; page < maxPhaseBPagesPerPodcast; page++ {
@@ -680,9 +718,9 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			continue
 		}
 
-		targetLabel := playStateLabel(ep.PlayState, ep.PlayPosition)
 		writeLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
-			playStateLabel(ep.PlayState, ep.PlayPosition), targetLabel, "")
+			playStateLabel(ep.PlayState, ep.PlayPosition),
+			playStateLabel(entry.currentState, entry.currentPos), "")
 		updated++
 
 		if updated <= 5 || updated%50 == 0 {
@@ -763,24 +801,10 @@ func findInIndex(index map[string]pcIndexEntry, ep model.EpisodeState) (pcIndexE
 	return pcIndexEntry{}, false
 }
 
-// pcSkipReason returns the log status string when the Pocket Casts current state
-// already matches or exceeds what we want to write. Returns "" to proceed.
+// pcSkipReason returns "already_played", "already_ahead", or "" based on
+// whether Pocket Casts' current state already satisfies the desired state.
 func pcSkipReason(desired model.EpisodeState, current pcIndexEntry) string {
-	switch desired.PlayState {
-	case model.PlayStatePlayed:
-		if current.currentState == model.PlayStatePlayed {
-			return "already_played"
-		}
-	case model.PlayStateInProgress:
-		if current.currentState == model.PlayStatePlayed {
-			return "already_played"
-		}
-		if current.currentState == model.PlayStateInProgress &&
-			current.currentPos >= desired.PlayPosition {
-			return "already_ahead"
-		}
-	}
-	return ""
+	return migrate.SkipReason(desired.PlayState, desired.PlayPosition, current.currentState, current.currentPos)
 }
 
 // pcPlayingStatusToModel converts a Pocket Casts playing_status integer to the
@@ -839,62 +863,20 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client,
 	return nil, false, lastErr
 }
 
-// ---- Helpers shared with the write path ----
+// The following helpers delegate to internal/migrate for shared behaviour
+// across providers. Package-local names are preserved so call sites throughout
+// this file don't need to change.
 
 // buildFeedToTitle returns a map from feed URL to lowercased podcast title.
 func buildFeedToTitle(lib *model.Library) map[string]string {
-	m := make(map[string]string, len(lib.Podcasts))
-	for _, pod := range lib.Podcasts {
-		if pod.FeedURL != "" {
-			m[pod.FeedURL] = strings.ToLower(strings.TrimSpace(pod.Title))
-		}
-	}
-	return m
+	return migrate.BuildFeedToTitle(lib)
 }
 
-// filterEpisodesByPodcast returns the subset of episodes whose podcast title
-// contains at least one of the filter strings (case-insensitive). If filters
-// is empty, all episodes are returned unchanged.
+// filterEpisodesByPodcast returns episodes matching any of the filter strings.
 func filterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[string]string, filters []string) []model.EpisodeState {
-	if len(filters) == 0 {
-		return episodes
-	}
-	lower := make([]string, len(filters))
-	for i, f := range filters {
-		lower[i] = strings.ToLower(strings.TrimSpace(f))
-	}
-	var out []model.EpisodeState
-	for _, ep := range episodes {
-		title := feedToTitle[ep.FeedURL]
-		for _, f := range lower {
-			if f != "" && strings.Contains(title, f) {
-				out = append(out, ep)
-				break
-			}
-		}
-	}
-	return out
+	return migrate.FilterEpisodesByPodcast(episodes, feedToTitle, filters)
 }
 
-// normalizeFeedURL returns a canonical form of a podcast feed URL for use as a
-// matching key. It lowercases scheme and host, promotes http to https, strips
-// a trailing path slash, and drops the fragment.
-//
-// This is intentionally duplicated from the overcast package to keep the two
-// providers self-contained. A future refactor can move it to a shared package.
-func normalizeFeedURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return strings.ToLower(strings.TrimRight(raw, "/"))
-	}
-	u.Scheme = strings.ToLower(u.Scheme)
-	u.Host = strings.ToLower(u.Host)
-	if u.Scheme == "http" {
-		u.Scheme = "https"
-	}
-	if len(u.Path) > 1 {
-		u.Path = strings.TrimRight(u.Path, "/")
-	}
-	u.Fragment = ""
-	return u.String()
-}
+// normalizeFeedURL returns a canonical form of a podcast feed URL for matching.
+// See migrate.NormalizeFeedURL for full documentation.
+func normalizeFeedURL(raw string) string { return migrate.NormalizeFeedURL(raw) }

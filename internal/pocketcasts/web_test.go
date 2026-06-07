@@ -349,7 +349,7 @@ func TestFetchPodcastEpisodes_HasMore(t *testing.T) {
 
 func TestUpdateEpisodeProgress_Played(t *testing.T) {
 	var gotUUID, gotPodcast string
-	var gotStatus, gotPosition int
+	var gotStatus, gotPosition, gotDuration int
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/user/login", loginHandler)
@@ -362,6 +362,7 @@ func TestUpdateEpisodeProgress_Played(t *testing.T) {
 			Podcast  string `json:"podcast"`
 			Status   int    `json:"status"`
 			Position int    `json:"position"`
+			Duration int    `json:"duration"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode body: %v", err)
@@ -370,6 +371,7 @@ func TestUpdateEpisodeProgress_Played(t *testing.T) {
 		gotPodcast = body.Podcast
 		gotStatus = body.Status
 		gotPosition = body.Position
+		gotDuration = body.Duration
 		w.WriteHeader(http.StatusOK)
 	})
 	restore := newTestServer(t, mux)
@@ -393,10 +395,13 @@ func TestUpdateEpisodeProgress_Played(t *testing.T) {
 	if gotPosition != 3600 {
 		t.Errorf("position = %d, want 3600", gotPosition)
 	}
+	if gotDuration != 3600 {
+		t.Errorf("duration = %d, want 3600", gotDuration)
+	}
 }
 
 func TestUpdateEpisodeProgress_InProgress(t *testing.T) {
-	var gotStatus, gotPosition int
+	var gotStatus, gotPosition, gotDuration int
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/user/login", loginHandler)
@@ -404,10 +409,12 @@ func TestUpdateEpisodeProgress_InProgress(t *testing.T) {
 		var body struct {
 			Status   int `json:"status"`
 			Position int `json:"position"`
+			Duration int `json:"duration"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		gotStatus = body.Status
 		gotPosition = body.Position
+		gotDuration = body.Duration
 		w.WriteHeader(http.StatusOK)
 	})
 	restore := newTestServer(t, mux)
@@ -424,6 +431,9 @@ func TestUpdateEpisodeProgress_InProgress(t *testing.T) {
 	}
 	if gotPosition != 450 {
 		t.Errorf("position = %d, want 450", gotPosition)
+	}
+	if gotDuration != 1800 {
+		t.Errorf("duration = %d, want 1800", gotDuration)
 	}
 }
 

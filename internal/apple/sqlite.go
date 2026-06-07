@@ -181,10 +181,9 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 	// prior listening, regardless of ZPLAYSTATE. Relying on ZPLAYSTATE alone misses
 	// episodes played on other devices or via iCloud sync.
 	//
-	// PSUB (Apple Podcasts Subscription) and PLUS episodes are excluded:
-	// their GUIDs are Apple-internal hex IDs (not RSS <guid> values) and their
-	// enclosure URLs are Apple DRM streams — neither will match or play in any
-	// other app. The parent podcast subscription is still exported.
+	// ZGUID is selected as nullable: some podcast RSS feeds omit <guid> for
+	// individual episodes and Apple stores NULL in that case. Episodes without a
+	// GUID are matched downstream by feed URL + pub date or feed URL + title.
 	q := `
 		SELECT
 			e.ZGUID,
@@ -200,7 +199,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
-		  AND e.ZGUID IS NOT NULL
+		  AND (e.ZGUID IS NOT NULL OR (e.ZTITLE IS NOT NULL AND e.ZPUBDATE IS NOT NULL))
 		  AND p.ZSUBSCRIBED = 1
 		  AND p.ZFEEDURL IS NOT NULL
 		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
@@ -217,7 +216,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 	var out []model.EpisodeState
 	for rows.Next() {
 		var (
-			guid            string
+			guid            sql.NullString
 			feedURL         string
 			title           string
 			pubDateRaw      sql.NullFloat64
@@ -239,7 +238,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		}
 
 		ep := model.EpisodeState{
-			GUID:    guid,
+			GUID:    guid.String, // empty string when NULL; matching falls back to title+date
 			FeedURL: feedURL,
 			Title:   title,
 		}
@@ -254,20 +253,25 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		// listening rather than Apple's automatic "mark as played" behaviour.
 		//
 		// Apple sets ZPLAYSTATESOURCE to indicate why an episode was marked played:
-		//   3 — listened to completion on this device
-		//   4 — synced from another device that had it as played
 		//   1 — manually marked by the user in the UI
 		//   2 — auto-marked when a newer episode arrived (daily/news shows, not listened)
+		//   3 — listened to completion on this device
+		//   4 — synced from another device that had it as played
 		//   6 — default/initial state; also used for auto-marks with no play record
 		//
-		// ZPLAYSTATESOURCE=2 and =6 rows always have ZLASTDATEPLAYED=NULL and
-		// ZPLAYHEAD=0, confirming they were never actually listened to. We treat
-		// them as unplayed rather than migrating them as played.
+		// We exclude only the two known auto-mark sources (2 and 6) when they lack
+		// a ZLASTDATEPLAYED timestamp — those rows were never actually listened to.
+		// All other ZPLAYSTATE=2 rows are trusted, including:
+		//   ZPLAYSTATESOURCE=1 (user-initiated "Mark as Played")
+		//   ZPLAYSTATESOURCE=3 (listened to completion)
+		//   ZPLAYSTATESOURCE=4 (synced from another device)
+		//   Any unknown/future source value
 		//
-		// Fallback: any row with ZLASTDATEPLAYED set is trusted regardless of
-		// ZPLAYSTATESOURCE — a recorded play timestamp is independent evidence.
-		trustedPlayed := playState.Valid && playState.Int64 == 2 &&
-			(playStateSource.Int64 == 3 || playStateSource.Int64 == 4 || lastPlayedRaw.Valid)
+		// A ZLASTDATEPLAYED timestamp is also accepted as corroborating evidence for
+		// auto-marked rows (2/6) — it indicates the episode was actually played at
+		// some point even if the source was auto.
+		autoMarked := (playStateSource.Int64 == 2 || playStateSource.Int64 == 6) && !lastPlayedRaw.Valid
+		trustedPlayed := playState.Valid && playState.Int64 == 2 && !autoMarked
 
 		switch {
 		case playHeadSec.Valid && playHeadSec.Float64 > 0:
@@ -283,6 +287,19 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		case playCount.Valid && playCount.Int64 > 0:
 			// Played at least once (possibly on another device before iCloud sync
 			// back-filled ZPLAYSTATE). Rare with modern sync but kept as a fallback.
+			ep.PlayState = model.PlayStatePlayed
+		case lastPlayedRaw.Valid &&
+			playStateSource.Int64 != 0 &&
+			playStateSource.Int64 != 2 &&
+			playStateSource.Int64 != 6:
+			// ZLASTDATEPLAYED is set and ZPLAYSTATESOURCE carries a non-auto value
+			// (1=manual, 3=completion, 4=device-sync, or similar).
+			// This pattern occurs when an episode was played on another device (e.g.
+			// iPhone) and iCloud synced the play timestamp and source, but not
+			// ZPLAYSTATE or ZPLAYCOUNT.
+			// ZPLAYSTATESOURCE=0 (unset/default) is excluded: Apple also sets
+			// ZLASTDATEPLAYED for non-user events such as background downloads and
+			// iCloud metadata refreshes, leaving ZPLAYSTATESOURCE at 0.
 			ep.PlayState = model.PlayStatePlayed
 		default:
 			// No reliable evidence of genuine playback; skip this episode.

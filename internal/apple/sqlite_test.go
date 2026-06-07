@@ -120,8 +120,8 @@ func setupSQLiteDB(t *testing.T) string {
 	insertEpisode(3, 1, "rss-guid-3", "Has Position Only", 698000000.0, 2400.0, 0, 0, 300.0, nil, "STDQ")
 	// ep4: no user interaction at all → excluded
 	insertEpisode(4, 1, "rss-guid-4", "Untouched", 697000000.0, 1200.0, 0, 0, 0.0, nil, "STDQ")
-	// ep5: null GUID → excluded
-	insertEpisode(5, 1, nil, "No GUID Episode", 696000000.0, 0, 1, 0, 0.0, nil, "STDQ")
+	// ep5: null GUID + no play evidence → excluded (play-evidence WHERE clause, not GUID guard)
+	insertEpisode(5, 1, nil, "No GUID Episode", 696000000.0, 0, 0, 0, 0.0, nil, "STDQ")
 	// ep6: PSUB on public feed → INCLUDED for fuzzy matching, counted in PaywalledEpisodesIncluded
 	insertEpisode(6, 2, "psub-guid-1", "PSUB Episode", 695000000.0, 2000.0, 1, 0, 0.0, nil, "PSUB")
 	// ep7: PLUS on public feed → INCLUDED for fuzzy matching, counted in PaywalledEpisodesIncluded
@@ -152,6 +152,33 @@ func setupSQLiteDB(t *testing.T) string {
 	insertEpisode(12, 4, "rss-guid-12", "Unsubscribed Podcast Episode", 689000000.0, 1800.0, 2, 0, 0.0, 689100000.0, "STDQ")
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 12`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep12: %v", err)
+	}
+	// ep13: manually marked as played — ZPLAYSTATE=2, ZPLAYSTATESOURCE=1, ZPLAYHEAD=0,
+	//       ZLASTDATEPLAYED=NULL. Occurs when the user taps "Mark as Played" in the
+	//       Apple Podcasts UI (e.g. episodes of a limited series played in a different
+	//       app and marked done in Apple). Must be INCLUDED.
+	insertEpisode(13, 1, "rss-guid-13", "Manually Marked Played", 688000000.0, 2400.0, 2, 0, 0.0, nil, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 1 WHERE Z_PK = 13`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep13: %v", err)
+	}
+	// ep14: played episode with NULL GUID — some RSS feeds omit <guid> for individual
+	//       episodes; Apple stores NULL in ZGUID. Must be INCLUDED and matched by
+	//       title+date downstream. Pub date and title are non-NULL so a match key exists.
+	insertEpisode(14, 1, nil, "No GUID But Played", 687000000.0, 1800.0, 2, 0, 0.0, nil, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 14`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep14: %v", err)
+	}
+	// ep15: iCloud-sync played — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0,
+	//       ZLASTDATEPLAYED set, ZPLAYSTATESOURCE=1 (user/manual action).
+	//       Pattern observed in real Apple Podcasts data for episodes played on an iPhone:
+	//       iCloud synced ZLASTDATEPLAYED and ZPLAYSTATESOURCE to the Mac but not
+	//       ZPLAYSTATE or ZPLAYCOUNT. The non-zero, non-auto ZPLAYSTATESOURCE is the
+	//       discriminator that distinguishes genuine playback from background sync events
+	//       (which leave ZPLAYSTATESOURCE at its default 0).
+	//       Must be INCLUDED as PlayStatePlayed.
+	insertEpisode(15, 1, "rss-guid-15", "iCloud Sync Played", 686000000.0, 3600.0, 0, 0, 0.0, 686100000.0, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 1 WHERE Z_PK = 15`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep15: %v", err)
 	}
 
 	return path
@@ -307,12 +334,37 @@ func TestSQLiteReader_ExcludesUntouchedEpisodes(t *testing.T) {
 	}
 }
 
-func TestSQLiteReader_ExcludesNullGUIDEpisodes(t *testing.T) {
+func TestSQLiteReader_NullGUIDExcludedWithoutPlayEvidence(t *testing.T) {
+	// ep5: null GUID, ZPLAYSTATE=0, no playhead/count/lastplayed → no play evidence.
+	// The play-evidence WHERE clause already excludes it; the GUID check is moot.
 	lib := readLibrary(t, setupSQLiteDB(t))
 	for _, ep := range lib.Episodes {
-		if ep.GUID == "" {
-			t.Errorf("episode with null GUID should be excluded, got title=%q", ep.Title)
+		if ep.Title == "No GUID Episode" {
+			t.Errorf("null-GUID episode with no play evidence should be excluded, got GUID=%q", ep.GUID)
 		}
+	}
+}
+
+func TestSQLiteReader_NullGUIDIncludedWithPlayEvidence(t *testing.T) {
+	// ep14: ZGUID=NULL, ZPLAYSTATE=2 (played), ZTITLE and ZPUBDATE set.
+	// Episodes with no RSS <guid> are now included when they have play evidence
+	// and title+date so they can be matched downstream without a GUID.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	found := false
+	for _, ep := range lib.Episodes {
+		if ep.Title == "No GUID But Played" {
+			found = true
+			if ep.GUID != "" {
+				t.Errorf("null-GUID episode should have empty GUID string, got %q", ep.GUID)
+			}
+			if ep.PlayState != model.PlayStatePlayed {
+				t.Errorf("null-GUID played episode: PlayState got %d, want Played", ep.PlayState)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("null-GUID played episode (ep14) not found in library — should be included")
 	}
 }
 
@@ -351,20 +403,32 @@ func TestSQLiteReader_CountsIncludedPaywalledEpisodes(t *testing.T) {
 
 func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
-	// ep1 (played) + ep2 (in-progress) + ep3 (has position) + ep6 (PSUB) + ep7 (PLUS) + ep9 (shadow played) = 6
-	// ep10 (ZLASTDATEPLAYED-only, no ZPLAYSTATE/ZPLAYCOUNT) is excluded — not genuine playback.
-	if len(lib.Episodes) != 6 {
-		t.Errorf("got %d episodes, want 6 (played + in-progress + has-position + PSUB + PLUS + shadow-played)", len(lib.Episodes))
+	// ep1  (played, ZPLAYSTATESOURCE=3)                          → included
+	// ep2  (in-progress, ZPLAYHEAD=900)                          → included
+	// ep3  (ZPLAYHEAD=300, ZPLAYSTATE=0)                         → included (in-progress)
+	// ep6  (PSUB on public feed)                                 → included
+	// ep7  (PLUS on public feed)                                 → included
+	// ep9  (shadow played, ZPLAYCOUNT=1)                         → included
+	// ep13 (manually marked, ZPLAYSTATESOURCE=1)                 → included
+	// ep14 (null GUID, ZPLAYSTATE=2/played)                      → included (title+date matching)
+	// ep15 (iCloud-sync, ZLASTDATEPLAYED+ZPLAYSTATESOURCE=1)     → included
+	// ep5  (null GUID, no play evidence)                         → excluded (play evidence filter)
+	// ep10 (ZLASTDATEPLAYED only, ZPLAYSTATESOURCE=0/unset)      → excluded
+	if len(lib.Episodes) != 9 {
+		t.Errorf("got %d episodes, want 9", len(lib.Episodes))
 	}
 }
 
 func TestSQLiteReader_ZLastDatePlayedAloneExcludesEpisode(t *testing.T) {
-	// ep10: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0, ZLASTDATEPLAYED set.
-	// Apple sets ZLASTDATEPLAYED for non-playback events; without ZPLAYSTATE or
-	// ZPLAYCOUNT this is not evidence of genuine listening and must be excluded.
+	// ep10: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0, ZLASTDATEPLAYED set,
+	//       ZPLAYSTATESOURCE=0 (the default/unset value).
+	// Apple sets ZLASTDATEPLAYED for non-playback events (downloads, background metadata
+	// refreshes, iCloud syncs of non-play data) without setting ZPLAYSTATESOURCE.
+	// ZPLAYSTATESOURCE=0 is the discriminator: it means no genuine user action was recorded.
+	// Compare ep15 which has ZPLAYSTATESOURCE=1 and IS included.
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if ep := findEpisode(lib, "rss-guid-10"); ep != nil {
-		t.Errorf("episode with only ZLASTDATEPLAYED set should be excluded from library, got PlayState=%d", ep.PlayState)
+		t.Errorf("episode with ZLASTDATEPLAYED+ZPLAYSTATESOURCE=0 should be excluded, got PlayState=%d", ep.PlayState)
 	}
 }
 
@@ -376,6 +440,37 @@ func TestSQLiteReader_AutoMarkedEpisodeExcluded(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if ep := findEpisode(lib, "rss-guid-11"); ep != nil {
 		t.Errorf("auto-marked episode (ZPLAYSTATESOURCE=2, no ZLASTDATEPLAYED) should be excluded, got PlayState=%d", ep.PlayState)
+	}
+}
+
+func TestSQLiteReader_ManuallyMarkedPlayedIncluded(t *testing.T) {
+	// ep13: ZPLAYSTATE=2, ZPLAYSTATESOURCE=1, ZPLAYHEAD=0, ZLASTDATEPLAYED=NULL.
+	// User tapped "Mark as Played" in the UI (common for limited-series episodes played
+	// in a different app). Must be included as PlayStatePlayed.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	ep := findEpisode(lib, "rss-guid-13")
+	if ep == nil {
+		t.Fatal("manually-marked-played episode (rss-guid-13) not found in library")
+	}
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("rss-guid-13 PlayState: got %d, want %d (Played)", ep.PlayState, model.PlayStatePlayed)
+	}
+}
+
+func TestSQLiteReader_iCloudSyncPlayedIncluded(t *testing.T) {
+	// ep15: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0, ZLASTDATEPLAYED set,
+	//       ZPLAYSTATESOURCE=1 (user/manual action, not the unset default 0).
+	// Matches the real-world pattern for "Serial – Nice White Parents" Ep. 2-4:
+	// played on iPhone, iCloud synced ZLASTDATEPLAYED and ZPLAYSTATESOURCE to Mac
+	// but ZPLAYSTATE and ZPLAYCOUNT were not updated. The non-auto ZPLAYSTATESOURCE
+	// distinguishes this from background-sync false-positives (ep10, ZPLAYSTATESOURCE=0).
+	lib := readLibrary(t, setupSQLiteDB(t))
+	ep := findEpisode(lib, "rss-guid-15")
+	if ep == nil {
+		t.Fatal("iCloud-sync played episode (rss-guid-15) not found — should be included")
+	}
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("rss-guid-15 PlayState: got %d, want %d (Played)", ep.PlayState, model.PlayStatePlayed)
 	}
 }
 

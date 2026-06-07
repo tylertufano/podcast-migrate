@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
@@ -414,9 +414,9 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			continue
 		}
 
-		targetLabel := playStateLabel(ep.PlayState, ep.PlayPosition)
 		writeLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
-			playStateLabel(ep.PlayState, ep.PlayPosition), targetLabel, "")
+			playStateLabel(ep.PlayState, ep.PlayPosition),
+			playStateLabel(entry.currentState, entry.currentPos), "")
 		updated++
 
 		// Log the first 5 successes and then every 50th so the user can verify
@@ -773,7 +773,7 @@ func augmentIndexFromPodcastPages(
 			urlToListing[l.OvercastURL] = l
 			if l.Title != "" {
 				titleEntries = append(titleEntries, titleEntry{
-					normTitle: strings.ToLower(l.Title),
+					normTitle: migrate.FuzzyNormalizeTitle(l.Title),
 					url:       l.OvercastURL,
 				})
 			}
@@ -794,14 +794,36 @@ func augmentIndexFromPodcastPages(
 			} else if l, ok := dateToListing[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]; ok {
 				matched = l
 			}
+			// Guard against ±1-day false positives: when the date didn't match
+			// exactly, verify the titles are compatible before accepting the match.
+			//
+			// The ±1-day tolerance exists for timezone edge cases where the same
+			// episode's pubDate in one RSS feed resolves to a different UTC calendar
+			// day than the other feed's copy. For the same episode the titles must
+			// be identical (or one contained in the other, since Overcast sometimes
+			// prefixes cell text with the podcast name).
+			//
+			// Without this guard, a subscriber-exclusive episode published one day
+			// before a completely different public-feed episode would be falsely
+			// matched via the ±1-day window — e.g. a Crooked Media membership
+			// episode on 2026-04-02 silently maps to the public episode from
+			// 2026-04-03 and marks the wrong episode as played in Overcast.
+			if matched.OvercastURL != "" && matched.DateStr != apDate &&
+				ap.Title != "" && matched.Title != "" {
+				normApple := migrate.FuzzyNormalizeTitle(ap.Title)
+				normOvercast := migrate.FuzzyNormalizeTitle(matched.Title)
+				if !strings.Contains(normApple, normOvercast) && !strings.Contains(normOvercast, normApple) {
+					matched = PodcastEpisodeListing{} // different episode — reject
+				}
+			}
 			// Fallback: title-based matching when date matching fails.
 			// This handles episodes where the pubDate stored in Apple Podcasts doesn't
 			// align with the date Overcast shows on the podcast page (e.g. timezone
 			// differences in the RSS feed's pubDate field).
 			// Skipped when strictFeedMatch is true: only date-anchored results allowed.
 			if matched.OvercastURL == "" && !strictFeedMatch && ap.Title != "" {
-				normAppleTitle := strings.ToLower(strings.TrimSpace(ap.Title))
-				// Exact match first (cell text == episode title).
+				normAppleTitle := migrate.FuzzyNormalizeTitle(ap.Title)
+				// Exact fuzzy match first (handles season-marker variants like "S01").
 				for _, te := range titleEntries {
 					if te.normTitle == normAppleTitle {
 						matched = urlToListing[te.url]
@@ -1209,106 +1231,32 @@ func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeSt
 	return overcastIndexEntry{}, false
 }
 
-// buildFeedToTitle returns a map from feed URL to lowercased podcast title, built
-// from lib.Podcasts. Used to resolve which podcast an episode belongs to for filtering.
+// The following helpers delegate to internal/migrate for shared behaviour
+// across providers. Package-local names are preserved so call sites throughout
+// this file don't need to change.
+
+// buildFeedToTitle returns a map from feed URL to lowercased podcast title.
 func buildFeedToTitle(lib *model.Library) map[string]string {
-	m := make(map[string]string, len(lib.Podcasts))
-	for _, pod := range lib.Podcasts {
-		if pod.FeedURL != "" {
-			m[pod.FeedURL] = strings.ToLower(strings.TrimSpace(pod.Title))
-		}
-	}
-	return m
+	return migrate.BuildFeedToTitle(lib)
 }
 
-// filterEpisodesByPodcast returns the subset of episodes whose podcast title
-// (looked up via feedToTitle) contains at least one of the filter strings
-// (case-insensitive). If filters is empty, all episodes are returned unchanged.
+// filterEpisodesByPodcast returns episodes matching any of the filter strings.
 func filterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[string]string, filters []string) []model.EpisodeState {
-	if len(filters) == 0 {
-		return episodes
-	}
-	// Normalise filter patterns once.
-	lower := make([]string, len(filters))
-	for i, f := range filters {
-		lower[i] = strings.ToLower(strings.TrimSpace(f))
-	}
-
-	var out []model.EpisodeState
-	for _, ep := range episodes {
-		title := feedToTitle[ep.FeedURL] // already lowercased
-		for _, f := range lower {
-			if f != "" && strings.Contains(title, f) {
-				out = append(out, ep)
-				break
-			}
-		}
-	}
-	return out
+	return migrate.FilterEpisodesByPodcast(episodes, feedToTitle, filters)
 }
 
-// normalizeFeedURL returns a canonical form of a podcast feed URL used as a
-// matching key when comparing Apple Podcasts and Overcast feed URLs. It:
-//   - lowercases scheme and host (RFC 3986 requires these to be case-insensitive)
-//   - promotes http to https (treating the two schemes as equivalent for matching)
-//   - strips a trailing slash from the path for canonical form
-//   - drops the fragment (never meaningful for feed identity)
-//
-// Query parameters are preserved because some feeds use them as part of their
-// identity (e.g. ?feed=rss2). Apple's cache-buster params (?t=...) are already
-// stripped by cleanFeedURL before an Apple URL reaches this function.
-//
-// This function is used only for matching keys, never for making HTTP requests.
-func normalizeFeedURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		// Not a parseable URL — fall back to simple lowercasing.
-		return strings.ToLower(strings.TrimRight(raw, "/"))
-	}
-	u.Scheme = strings.ToLower(u.Scheme)
-	u.Host = strings.ToLower(u.Host)
-	// Treat http and https as equivalent — use https as canonical form.
-	if u.Scheme == "http" {
-		u.Scheme = "https"
-	}
-	// Strip trailing slash from the path for a canonical form.
-	// A bare root path "/" is left intact.
-	if len(u.Path) > 1 {
-		u.Path = strings.TrimRight(u.Path, "/")
-	}
-	u.Fragment = ""
-	return u.String()
-}
+// normalizeFeedURL returns a canonical form of a podcast feed URL for matching.
+// See migrate.NormalizeFeedURL for full documentation.
+func normalizeFeedURL(raw string) string { return migrate.NormalizeFeedURL(raw) }
 
-// overcastSkipReason returns the log status string when Overcast's current state
-// for an episode already matches or exceeds what we want to write — either
-// "already_played" (Overcast has it as completed) or "already_ahead" (in-progress
-// position is at or beyond the desired position). Returns "" when we should write.
-//
-// These map directly to the statuses used by the Apple target writer so that
-// --log-file produces consistent output regardless of direction.
+// overcastSkipReason returns "already_played", "already_ahead", or "" based on
+// whether Overcast's current state already satisfies the desired state.
 func overcastSkipReason(desired model.EpisodeState, current overcastIndexEntry) string {
-	switch desired.PlayState {
-	case model.PlayStatePlayed:
-		if current.currentState == model.PlayStatePlayed {
-			return "already_played"
-		}
-	case model.PlayStateInProgress:
-		if current.currentState == model.PlayStatePlayed {
-			return "already_played" // Overcast is ahead
-		}
-		if current.currentState == model.PlayStateInProgress && current.currentPos >= desired.PlayPosition {
-			return "already_ahead"
-		}
-	}
-	return ""
+	return migrate.SkipReason(desired.PlayState, desired.PlayPosition, current.currentState, current.currentPos)
 }
 
-// overcastAlreadySatisfied reports whether Overcast's current state for an episode
-// already matches or exceeds what we want to write, making the set_progress call a no-op.
-//
-// Played beats everything. For in-progress, we skip if Overcast is already at
-// or ahead of the desired position.
+// overcastAlreadySatisfied reports whether Overcast already satisfies the
+// desired state (convenience wrapper used by tests).
 func overcastAlreadySatisfied(desired model.EpisodeState, current overcastIndexEntry) bool {
 	return overcastSkipReason(desired, current) != ""
 }

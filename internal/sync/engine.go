@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
@@ -174,22 +175,40 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 		// Handles paid-tier feed variants (e.g. "Fresh Air Plus" ↔ "Fresh Air") where
 		// the feed URL differs between apps but the podcast title normalises to the same
 		// base. Both sides are normalised via NormalizePlusTitle before comparison.
+		//
+		// Try the exact UTC pub date first, then ±1 day. Off-day matches require
+		// fuzzy title agreement to prevent false positives (a subscriber-exclusive
+		// episode on day N must not silently match a different public episode on day N±1).
+		// When multiple destination episodes share the same podcast+date bucket (e.g. a
+		// batch release), fuzzy title matching selects the closest match.
 		dstCrossIndex := buildCrossFeedIndex(dst)
 		srcFeedToTitle := buildFeedToTitle(src)
 		for _, ep := range unmatched {
 			if !ep.PubDate.IsZero() && ep.FeedURL != "" && len(dstCrossIndex) > 0 {
 				if podTitle := srcFeedToTitle[ep.FeedURL]; podTitle != "" {
-					xKey := "xfeed:" + model.NormalizePlusTitle(podTitle) + "|" + ep.PubDate.UTC().Format("2006-01-02")
-					if existing, ok := dstCrossIndex[xKey]; ok {
-						// Guard: only match if the dst episode wasn't already claimed in
-						// the first pass (possible when primary and cross-feed keys collide).
-						existingKey := episodeKey(existing)
-						if _, stillAvail := dstIndex[existingKey]; stillAvail {
-							out.Episodes = append(out.Episodes, resolveConflictCrossFeed(ep, existing, opts.ConflictStrategy))
-							delete(dstIndex, existingKey)
-							delete(dstCrossIndex, xKey)
+					normPodTitle := model.NormalizePlusTitle(podTitle)
+					matched := false
+					for _, dayOffset := range []int{0, -1, 1} {
+						offsetDate := ep.PubDate.UTC().AddDate(0, 0, dayOffset).Format("2006-01-02")
+						xKey := "xfeed:" + normPodTitle + "|" + offsetDate
+						candidates, ok := dstCrossIndex[xKey]
+						if !ok {
 							continue
 						}
+						requireTitle := dayOffset != 0
+						existing, found := pickBestCrossFeedCandidate(ep, candidates, dstIndex, requireTitle)
+						if !found {
+							continue
+						}
+						existingKey := episodeKey(existing)
+						out.Episodes = append(out.Episodes, resolveConflictCrossFeed(ep, existing, opts.ConflictStrategy))
+						delete(dstIndex, existingKey)
+						removeCrossFeedEntry(dstCrossIndex, xKey, existingKey)
+						matched = true
+						break
+					}
+					if matched {
+						continue
 					}
 				}
 			}
@@ -210,18 +229,10 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 }
 
 // buildFeedToTitle returns a map from each podcast's feed URL to its lowercased
-// podcast title, built from lib.Podcasts. Used for cross-feed episode matching.
+// podcast title. Delegates to migrate.BuildFeedToTitle for consistent behaviour
+// across providers.
 func buildFeedToTitle(lib *model.Library) map[string]string {
-	if lib == nil {
-		return nil
-	}
-	m := make(map[string]string, len(lib.Podcasts))
-	for _, pod := range lib.Podcasts {
-		if pod.FeedURL != "" {
-			m[pod.FeedURL] = strings.ToLower(strings.TrimSpace(pod.Title))
-		}
-	}
-	return m
+	return migrate.BuildFeedToTitle(lib)
 }
 
 // buildCrossFeedIndex indexes lib's episodes by Plus-normalised podcast title +
@@ -236,12 +247,16 @@ func buildFeedToTitle(lib *model.Library) map[string]string {
 // the UTC calendar date as the key tolerates those timing differences while
 // keeping the podcast title in the key to avoid false-positive matches between
 // unrelated shows that happen to publish on the same day.
-func buildCrossFeedIndex(lib *model.Library) map[string]model.EpisodeState {
+//
+// Each key maps to a slice of candidates because a podcast may release multiple
+// episodes on the same UTC day (batch releases). Callers use
+// pickBestCrossFeedCandidate to select among them.
+func buildCrossFeedIndex(lib *model.Library) map[string][]model.EpisodeState {
 	if lib == nil {
 		return nil
 	}
 	feedToTitle := buildFeedToTitle(lib)
-	idx := make(map[string]model.EpisodeState)
+	idx := make(map[string][]model.EpisodeState)
 	for _, ep := range lib.Episodes {
 		if ep.PubDate.IsZero() || ep.FeedURL == "" {
 			continue
@@ -251,11 +266,58 @@ func buildCrossFeedIndex(lib *model.Library) map[string]model.EpisodeState {
 			continue
 		}
 		key := "xfeed:" + model.NormalizePlusTitle(podTitle) + "|" + ep.PubDate.UTC().Format("2006-01-02")
-		if _, exists := idx[key]; !exists {
-			idx[key] = ep
-		}
+		idx[key] = append(idx[key], ep)
 	}
 	return idx
+}
+
+// pickBestCrossFeedCandidate selects the best destination episode from a bucket
+// of candidates sharing the same cross-feed key (same normalised podcast title
+// + UTC pub date). Candidates already claimed by primary matching are skipped.
+//
+// When requireTitle is true (used for ±1-day date fallback) the
+// fuzzy-normalised source title must match at least one candidate's title;
+// this prevents subscriber-exclusive episodes from being falsely matched to a
+// different public episode published on an adjacent day.
+//
+// When requireTitle is false, an exact fuzzy-title match is preferred but the
+// first available candidate is accepted as a fallback. Returns (episode, true)
+// on success or (zero, false) when no suitable candidate is available.
+func pickBestCrossFeedCandidate(src model.EpisodeState, candidates []model.EpisodeState, dstIndex map[string]model.EpisodeState, requireTitle bool) (model.EpisodeState, bool) {
+	srcFuzzy := migrate.FuzzyNormalizeTitle(src.Title)
+	var firstAvail *model.EpisodeState
+	for i := range candidates {
+		c := candidates[i]
+		if _, ok := dstIndex[episodeKey(c)]; !ok {
+			continue // already claimed by an earlier match
+		}
+		if migrate.FuzzyNormalizeTitle(c.Title) == srcFuzzy {
+			return c, true // exact fuzzy match — best result
+		}
+		if firstAvail == nil {
+			firstAvail = &candidates[i]
+		}
+	}
+	if requireTitle {
+		return model.EpisodeState{}, false
+	}
+	if firstAvail != nil {
+		return *firstAvail, true
+	}
+	return model.EpisodeState{}, false
+}
+
+// removeCrossFeedEntry removes the episode identified by epKey from the
+// candidate slice stored at idx[dateKey], shrinking it in-place. No-op if the
+// key or episode is not present.
+func removeCrossFeedEntry(idx map[string][]model.EpisodeState, dateKey, epKey string) {
+	candidates := idx[dateKey]
+	for i, c := range candidates {
+		if episodeKey(c) == epKey {
+			idx[dateKey] = append(candidates[:i], candidates[i+1:]...)
+			return
+		}
+	}
 }
 
 func buildEpisodeIndex(lib *model.Library) map[string]model.EpisodeState {

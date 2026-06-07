@@ -32,18 +32,25 @@ func TestNormalizePlusTitle(t *testing.T) {
 		{"Surplus", "surplus"},
 		// Multiple suffix occurrences — only the outermost is stripped
 		{"Fresh Air Plus Plus", "fresh air plus"},
-		// NYT subscriber feed pattern
+		// NYT subscriber feed — static suffix
 		{"The Daily - Subscriber Feed (🔓)", "the daily"},
 		{"The Daily - Subscriber Feed", "the daily"},
-		// Member / private / premium variants
+		// NYT subscriber feed — dynamic trailing content ("🔓 for <name/email>")
+		{"The Daily - Subscriber Feed (🔓 for you@example.com)", "the daily"},
+		{"The Daily - Subscriber Feed (🔓 for John Smith)", "the daily"},
+		// Member / private / premium variants (static)
 		{"Some Show - Member Feed (🔓)", "some show"},
 		{"Some Show - Member Feed", "some show"},
 		{"Some Show - Private Feed", "some show"},
 		{"Some Show - Premium Feed", "some show"},
+		// Member / private variants — dynamic trailing content
+		{"Some Show - Member Feed (🔓 for subscriber@news.com)", "some show"},
+		{"Some Show - Private Feed (access token here)", "some show"},
 		// Standalone lock emoji
 		{"Some Show (🔓)", "some show"},
-		// Subscriber suffix + Plus suffix (combined)
-		{"Show - Subscriber Feed Plus", "show - subscriber feed"},
+		// Subscriber suffix + Plus suffix: index-based stripping hits
+		// "- subscriber feed" first, so the whole decoration is removed.
+		{"Show - Subscriber Feed Plus", "show"},
 		// Public title unchanged
 		{"The Daily", "the daily"},
 	}

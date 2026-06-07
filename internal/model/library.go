@@ -50,16 +50,15 @@ type EpisodeState struct {
 // title and lowercases the result. This enables cross-feed matching when one app
 // has a public feed and another has a paid or private equivalent.
 //
-// Stripped suffixes (case-insensitive, applied in order from most to least specific):
+// Stripped infixes/suffixes (case-insensitive):
 //
-// Subscriber/private feed indicators (publishers append these to private RSS titles):
-//   - " - Subscriber Feed (🔓)"  — NYT pattern (e.g. "The Daily - Subscriber Feed (🔓)")
-//   - " - Subscriber Feed"
-//   - " - Member Feed (🔓)"
-//   - " - Member Feed"
-//   - " - Private Feed"
-//   - " - Premium Feed"
-//   - " (🔓)"                    — standalone lock emoji
+// Subscriber/private feed indicators (index-based so dynamic trailing content
+// such as "🔓 for <name>" or "🔓 for user@example.com" is also stripped):
+//   - " - Subscriber Feed …"  — NYT pattern ("The Daily - Subscriber Feed (🔓 for you@…)")
+//   - " - Member Feed …"
+//   - " - Private Feed …"
+//   - " - Premium Feed …"
+//   - " (🔓)"                 — standalone lock emoji (exact suffix)
 //
 // Plus-tier indicators (podcast networks append these to paid feed titles):
 //   - " Plus"  — NPR Plus and similar (e.g. "Fresh Air Plus" → "fresh air")
@@ -71,20 +70,26 @@ type EpisodeState struct {
 func NormalizePlusTitle(title string) string {
 	t := strings.ToLower(strings.TrimSpace(title))
 
-	// Strip subscriber/private feed suffixes first (most specific → least specific).
-	for _, suffix := range []string{
-		" - subscriber feed (🔓)",
+	// Strip subscriber/private feed decorations using index-based search so that
+	// dynamic trailing content (e.g. "🔓 for user@example.com)") is also covered.
+	// The lock-only exact suffix " (🔓)" is handled separately below.
+	stripped := false
+	for _, infix := range []string{
 		" - subscriber feed",
-		" - member feed (🔓)",
 		" - member feed",
 		" - private feed",
 		" - premium feed",
-		" (🔓)",
 	} {
-		if strings.HasSuffix(t, suffix) {
-			t = strings.TrimSpace(strings.TrimSuffix(t, suffix))
+		if idx := strings.Index(t, infix); idx != -1 {
+			t = strings.TrimSpace(t[:idx])
+			stripped = true
 			break
 		}
+	}
+
+	// Standalone lock emoji suffix (only when no subscriber-feed infix was found).
+	if !stripped && strings.HasSuffix(t, " (🔓)") {
+		t = strings.TrimSpace(strings.TrimSuffix(t, " (🔓)"))
 	}
 
 	// Strip Plus-tier suffixes.

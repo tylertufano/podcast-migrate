@@ -376,6 +376,157 @@ func TestAugment_TitleFallback_MatchesWhenDateMisses(t *testing.T) {
 	}
 }
 
+func TestAugment_OneDayOffSameTitle_Accepted(t *testing.T) {
+	// ±1-day tolerance: Apple episode is published one day after the Overcast
+	// listing date (timezone edge case — same episode, same title).
+	// The title guard must NOT reject this match.
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageFreshAir)
+		},
+		"/itunes12345/fresh-air": func(w http.ResponseWriter, r *http.Request) {
+			// listing has episode "Test Episode" on 2024-06-15
+			fmt.Fprint(w, augListingPage)
+		},
+		"/+HASH1": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augEpisodePage)
+		},
+	})
+
+	epOneDayLater := model.EpisodeState{
+		FeedURL:   appleEp.FeedURL,
+		Title:     "Test Episode", // same title as in augListingPage
+		PubDate:   time.Date(2024, 6, 16, 12, 0, 0, 0, time.UTC), // +1 day vs listing's Jun 15
+		PlayState: model.PlayStatePlayed,
+	}
+
+	index := map[string]overcastIndexEntry{}
+	n := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		&model.Library{},
+		[]model.EpisodeState{epOneDayLater},
+		index,
+		0,
+		map[string]string{appleEp.FeedURL: "fresh air"},
+		false, false, 0, false,
+	)
+	if n != 1 {
+		t.Errorf("±1 day same title: got %d entries added, want 1 — should accept when titles match", n)
+	}
+}
+
+func TestAugment_OneDayOffSeasonMarkerVariant_Accepted(t *testing.T) {
+	// Feed variant: Apple stores the episode title without the "S01" marker that
+	// Overcast shows in its listing cell. The ±1-day fuzzy-title guard must accept
+	// this as the same episode rather than rejecting it as mismatched.
+	//
+	// Real-world pattern (Serial / The Retrievals):
+	//   Apple (subscriber feed): "The Retrievals - Ep. 4" on 2023-08-17
+	//   Overcast (public feed):  "The Retrievals S01 - Ep. 4" on 2023-08-17
+	// Both normalise to "the retrievals ep 4" via FuzzyNormalizeTitle.
+	const listingPageS01 = `<!DOCTYPE html><html><body>
+<a class="extendedepisodecell" data-item-id="4444" href="/+HASH3">
+  <div>The Retrievals S01 - Ep. 4<span class="caption2">Jun 16, 2024 • 40 min</span></div>
+</a>
+</body></html>`
+
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageFreshAir)
+		},
+		"/itunes12345/fresh-air": func(w http.ResponseWriter, r *http.Request) {
+			// listing shows "The Retrievals S01 - Ep. 4" on 2024-06-16
+			fmt.Fprint(w, listingPageS01)
+		},
+	})
+
+	// Apple stored the title without "S01", published one day earlier.
+	epNoS01 := model.EpisodeState{
+		FeedURL:   appleEp.FeedURL,
+		Title:     "The Retrievals - Ep. 4",
+		PubDate:   time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC), // one day before listing's Jun 16
+		PlayState: model.PlayStatePlayed,
+	}
+
+	index := map[string]overcastIndexEntry{}
+	n := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		&model.Library{},
+		[]model.EpisodeState{epNoS01},
+		index,
+		0,
+		// feedToTitle uses "fresh air" to match augPodcastsPageFreshAir →
+		// /itunes12345/fresh-air, which serves listingPageS01 for this test.
+		map[string]string{appleEp.FeedURL: "fresh air"},
+		false, false, 0, false,
+	)
+	if n != 1 {
+		t.Errorf("±1 day season-marker variant: got %d entries added, want 1 — fuzzy title should accept", n)
+	}
+	// Confirm the correct numeric ID landed in the index.
+	normFeed := normalizeFeedURL(appleEp.FeedURL)
+	key := "feeddate:" + normFeed + "|" + epNoS01.PubDate.UTC().Format(time.RFC3339)
+	if entry, ok := index[key]; !ok || entry.numericID != "4444" {
+		t.Errorf("index[%q]: got %+v (ok=%v), want numericID=4444", key, index[key], ok)
+	}
+}
+
+func TestAugment_OneDayOffDifferentTitle_Rejected(t *testing.T) {
+	// Guard against the subscriber-feed false positive: an Apple subscriber
+	// episode published one day before a *different* public episode should NOT
+	// be matched via the ±1-day tolerance.
+	//
+	// Real-world example that triggered this bug:
+	//   Apple (subscriber feed): "Pollercoaster: What the Primaries Tell Us…" on 2026-04-02
+	//   Overcast (public feed):  "Bondi Gets the Boot" on 2026-04-03
+	// The ±1-day window found "Bondi Gets the Boot" (date+1) and falsely marked
+	// it as played in Overcast. The title guard prevents this.
+	const listingPageDifferentTitle = `<!DOCTYPE html><html><body>
+<a class="extendedepisodecell" data-item-id="7777" href="/+HASH2">
+  <div>Bondi Gets the Boot<span class="caption2">Jun 16, 2024 • 30 min</span></div>
+</a>
+</body></html>`
+
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageFreshAir)
+		},
+		"/itunes12345/fresh-air": func(w http.ResponseWriter, r *http.Request) {
+			// listing has "Bondi Gets the Boot" on 2024-06-16
+			fmt.Fprint(w, listingPageDifferentTitle)
+		},
+	})
+
+	// Apple subscriber episode has a completely different title, published one day
+	// before the public episode.
+	epSubscriberExclusive := model.EpisodeState{
+		FeedURL:   appleEp.FeedURL,
+		Title:     "Pollercoaster: What the Primaries Tell Us About the Midterms, So Far",
+		PubDate:   time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC), // 2024-06-15 vs listing's 2024-06-16
+		PlayState: model.PlayStatePlayed,
+	}
+
+	index := map[string]overcastIndexEntry{}
+	n := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		&model.Library{},
+		[]model.EpisodeState{epSubscriberExclusive},
+		index,
+		0,
+		map[string]string{appleEp.FeedURL: "fresh air"},
+		false, false, 0, false,
+	)
+	if n != 0 {
+		t.Errorf("±1 day different title: got %d entries added, want 0 — should reject when titles differ", n)
+	}
+	// Verify the wrong episode ID was not added to the index.
+	normFeed := normalizeFeedURL(appleEp.FeedURL)
+	key := "feeddate:" + normFeed + "|" + epSubscriberExclusive.PubDate.UTC().Format(time.RFC3339)
+	if entry, ok := index[key]; ok {
+		t.Errorf("index should not contain a match for the subscriber-exclusive episode; got numericID=%q", entry.numericID)
+	}
+}
+
 // indexEntryKeys returns all keys in an index map for diagnostic messages.
 func indexEntryKeys(m map[string]overcastIndexEntry) []string {
 	ks := make([]string, 0, len(m))

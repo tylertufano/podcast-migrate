@@ -268,19 +268,22 @@ func TestFetchPlayedEpisodes_ReturnsEpisodes(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("FetchPlayedEpisodes: expected POST, got %s", r.Method)
 		}
+		// NOTE: /user/history returns camelCase field names, NOT the snake_case
+		// used by /user/in_progress.  Keep this test payload exactly as the
+		// real endpoint sends it so we catch any future regression.
 		payload := map[string]any{
 			"episodes": []map[string]any{
 				{
-					"uuid":           "ep-played-1",
-					"podcast_uuid":   "pod1",
-					"title":          "Episode Played",
-					"url":            "https://cdn.example.com/ep_played.mp3",
-					"published_at":   "2024-04-10T10:00:00Z",
-					"duration":       1800,
-					"playing_status": 3,
-					"played_up_to":   1800,
-					"starred":        false,
-					"is_deleted":     false,
+					"uuid":          "ep-played-1",
+					"podcastUuid":   "pod1",           // camelCase
+					"title":         "Episode Played",
+					"url":           "https://cdn.example.com/ep_played.mp3",
+					"published":     "2024-04-10T10:00:00Z", // "published", not "published_at"
+					"duration":      1800,
+					"playingStatus": 3,               // camelCase
+					"playedUpTo":    1800,             // camelCase
+					"starred":       false,
+					"isDeleted":     false,            // camelCase
 				},
 			},
 		}
@@ -302,11 +305,20 @@ func TestFetchPlayedEpisodes_ReturnsEpisodes(t *testing.T) {
 	if ep.UUID != "ep-played-1" {
 		t.Errorf("UUID = %q, want ep-played-1", ep.UUID)
 	}
+	// PodcastUUID is the most important field: it drives feedURL resolution in
+	// Phase A2.  An empty value here means all history episodes get silently
+	// skipped.  Verifying it catches the snake_case / camelCase JSON mismatch.
+	if ep.PodcastUUID != "pod1" {
+		t.Errorf("PodcastUUID = %q, want pod1 (camelCase podcastUuid mismatch?)", ep.PodcastUUID)
+	}
+	if ep.PublishedAt != "2024-04-10T10:00:00Z" {
+		t.Errorf("PublishedAt = %q, want 2024-04-10T10:00:00Z (\"published\" field mismatch?)", ep.PublishedAt)
+	}
 	if ep.PlayingStatus != 3 {
-		t.Errorf("PlayingStatus = %d, want 3 (played)", ep.PlayingStatus)
+		t.Errorf("PlayingStatus = %d, want 3 (played) — camelCase playingStatus mismatch?", ep.PlayingStatus)
 	}
 	if ep.PlayedUpTo != 1800 {
-		t.Errorf("PlayedUpTo = %d, want 1800", ep.PlayedUpTo)
+		t.Errorf("PlayedUpTo = %d, want 1800 — camelCase playedUpTo mismatch?", ep.PlayedUpTo)
 	}
 }
 

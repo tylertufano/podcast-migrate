@@ -475,9 +475,16 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	phaseA2Added := 0
 	for _, ep := range played {
 		feedURL := podUUIDToFeedURL[ep.PodcastUUID]
-		if feedURL == "" || ep.IsDeleted {
+		if feedURL == "" {
+			// Can't resolve podcast — either not subscribed or unknown feed URL.
 			continue
 		}
+		// NOTE: we intentionally do NOT skip ep.IsDeleted here. The /user/history
+		// endpoint routinely returns isDeleted=true even for normally-played
+		// episodes of active subscriptions (it appears to mean "removed from the
+		// active queue" rather than "episode deleted"). Skipping those entries
+		// would make Phase A2 a near-no-op for many users.
+		//
 		// addToIndex uses "first entry wins" so in-progress entries from A1
 		// are never overwritten by played entries from A2.
 		beforeLen := len(index)

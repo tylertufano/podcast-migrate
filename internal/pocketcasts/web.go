@@ -282,15 +282,36 @@ func FetchInProgressEpisodes(ctx context.Context, client *http.Client) ([]APIEpi
 	return payload.Episodes, nil
 }
 
+// historyEpisode is the episode structure returned by the /user/history
+// endpoint.  Unlike the in-progress endpoint (which uses snake_case keys), the
+// history endpoint uses camelCase JSON keys.  This struct captures the
+// camelCase names; FetchPlayedEpisodes converts each entry to APIEpisode before
+// returning so the rest of the codebase only deals with one episode type.
+//
+// Field name evidence: real response dump at
+// https://github.com/AnandChowdhary/life-data/blob/master/podcast-history.yml
+type historyEpisode struct {
+	UUID          string `json:"uuid"`
+	PodcastUUID   string `json:"podcastUuid"`   // camelCase — differs from in_progress
+	Title         string `json:"title"`
+	URL           string `json:"url"`
+	Published     string `json:"published"`     // "published", not "published_at"
+	Duration      int    `json:"duration"`
+	PlayingStatus int    `json:"playingStatus"` // camelCase — differs from in_progress
+	PlayedUpTo    int    `json:"playedUpTo"`    // camelCase — differs from in_progress
+	Starred       bool   `json:"starred"`
+	IsDeleted     bool   `json:"isDeleted"`     // camelCase — often true for history entries
+}
+
 // FetchPlayedEpisodes returns the episodes from the authenticated user's
 // listening history that have been played to completion. The endpoint returns
-// the most-recently-played episodes; older entries may not be included if the
-// history exceeds the server's maximum page size.
+// the most-recently-played episodes (up to ~100); older entries may not be
+// included if the history exceeds the server's cap.
 //
-// The returned episodes have PlayingStatus = PlayingPlayed and PlayedUpTo set
-// to the full episode duration. This is used to supplement the Phase A
-// in-progress index so that episodes previously migrated and fully played in
-// Pocket Casts are not needlessly re-written.
+// Note: history entries routinely have isDeleted=true even for active
+// subscriptions — this appears to mean "removed from the active queue" rather
+// than "episode deleted". Callers should NOT skip isDeleted entries wholesale;
+// filter on feedURL resolution instead.
 func FetchPlayedEpisodes(ctx context.Context, client *http.Client) ([]APIEpisode, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		pcBaseURL+"/user/history", bytes.NewReader([]byte("{}")))
@@ -318,12 +339,30 @@ func FetchPlayedEpisodes(ctx context.Context, client *http.Client) ([]APIEpisode
 	}
 
 	var payload struct {
-		Episodes []APIEpisode `json:"episodes"`
+		Episodes []historyEpisode `json:"episodes"`
 	}
 	if err := json.Unmarshal(respBody, &payload); err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: parse history response: %w", err)
 	}
-	return payload.Episodes, nil
+
+	// Convert camelCase history entries to the standard APIEpisode type.
+	// The Published field maps to PublishedAt (same ISO 8601 format, different key name).
+	out := make([]APIEpisode, 0, len(payload.Episodes))
+	for _, h := range payload.Episodes {
+		out = append(out, APIEpisode{
+			UUID:          h.UUID,
+			PodcastUUID:   h.PodcastUUID,
+			Title:         h.Title,
+			URL:           h.URL,
+			PublishedAt:   h.Published,
+			Duration:      h.Duration,
+			PlayingStatus: h.PlayingStatus,
+			PlayedUpTo:    h.PlayedUpTo,
+			Starred:       h.Starred,
+			IsDeleted:     h.IsDeleted,
+		})
+	}
+	return out, nil
 }
 
 // cacheEpisode is the episode structure returned by the Pocket Casts cache CDN.

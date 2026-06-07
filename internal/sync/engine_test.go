@@ -1211,21 +1211,15 @@ func TestBuildAutoFeedMap_SuffixTitle_NoFalsePositive(t *testing.T) {
 	}
 }
 
-func TestBuildAutoFeedMap_CollisionGuard_SkipsWhenDstURLClaimedBySrcPodcast(t *testing.T) {
-	// Regression test: if the destination has two distinct podcasts stored at
-	// the same feed URL (e.g. audioboom migrated one feed's URL to another's
-	// channel URL and the destination app resolved it incorrectly), the auto
-	// feed-map must NOT remap a source podcast to a URL that is already the
-	// direct feed URL of a different source podcast.
+func TestBuildAutoFeedMap_CollisionGuard1_DstURLAlreadySrcURL(t *testing.T) {
+	// Guard 1 regression: if the destination has a podcast stored at the same
+	// URL as a different source podcast (e.g. PC's catalog resolved JbD to
+	// SL's audioboom URL), the auto feed-map must NOT remap the second source
+	// podcast to that URL — that would conflate both into SL's feed.
 	//
-	// Concrete case: Apple has "#SistersInLaw" at audioboom/5043432 and
-	// "Justice By Design" at audioboom/5137121.  If PC's catalog has erroneously
-	// stored "Justice By Design" at audioboom/5043432 (same URL as SL), a naive
-	// title match would remap JbD→5043432, conflating both podcasts and causing
-	// all JbD episodes to be looked up in the SL feed (where they don't exist).
-	//
-	// The collision guard must fire and produce an empty map so Phase B's
-	// refresh-API fallback can locate JbD by its actual PC UUID instead.
+	// SL is a direct match (same URL in both src and dst) and is skipped.
+	// JbD's title-match target (5043432) is already in srcFeedNorms, so
+	// guard 1 fires and JbD is also skipped.
 	srcLib := &model.Library{
 		Podcasts: []model.Podcast{
 			{FeedURL: "https://audioboom.com/channels/5043432.rss", Title: "#SistersInLaw"},
@@ -1234,16 +1228,39 @@ func TestBuildAutoFeedMap_CollisionGuard_SkipsWhenDstURLClaimedBySrcPodcast(t *t
 	}
 	dstLib := &model.Library{
 		Podcasts: []model.Podcast{
-			// Destination has SL at the correct URL.
 			{FeedURL: "https://audioboom.com/channels/5043432.rss", Title: "#SistersInLaw"},
-			// Destination erroneously has JbD at SL's URL (URL collision in PC catalog).
+			// Erroneously stored at SL's URL in PC's catalog.
 			{FeedURL: "https://audioboom.com/channels/5043432.rss", Title: "Justice By Design"},
 		},
 	}
 	got := buildAutoFeedMap(srcLib, dstLib)
-	// Neither podcast should be remapped: SL is a direct match (same URL), and
-	// JbD's title-match target (5043432) is already claimed by SL in src.
 	if len(got) != 0 {
-		t.Errorf("collision guard must suppress remapping when dst URL is already a src feed URL; got: %v", got)
+		t.Errorf("guard 1: must suppress remap when dst URL is already a direct src feed URL; got: %v", got)
+	}
+}
+
+func TestBuildAutoFeedMap_CollisionGuard2_TwoSrcMapToSameDstURL(t *testing.T) {
+	// Guard 2 regression: Politicon hosts both #SistersInLaw and Justice By
+	// Design, and PC stored both under the same politicon.com feed URL.  Both
+	// podcasts are absent from PC by their audioboom URLs, so both title-match
+	// to politicon.com.  The auto feed-map must suppress BOTH remappings so
+	// Phase B's refresh API can look up each show by its actual PC UUID —
+	// rather than collapsing both into politicon.com where only the first UUID
+	// would be used to fetch episodes, leaving the other show un-found.
+	srcLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://audioboom.com/channels/5043432.rss", Title: "#SistersInLaw"},
+			{FeedURL: "https://audioboom.com/channels/5137121.rss", Title: "Justice By Design"},
+		},
+	}
+	dstLib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "http://www.politicon.com", Title: "#SistersInLaw"},
+			{FeedURL: "http://www.politicon.com", Title: "Justice By Design"},
+		},
+	}
+	got := buildAutoFeedMap(srcLib, dstLib)
+	if len(got) != 0 {
+		t.Errorf("guard 2: must suppress both remaps when two source podcasts match the same dst URL; got: %v", got)
 	}
 }

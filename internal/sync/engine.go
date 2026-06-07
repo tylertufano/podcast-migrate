@@ -296,13 +296,12 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		}
 	}
 
-	// Build the set of normalised source feed URLs.  Used below as a collision
-	// guard: if the destination URL we'd remap a source podcast to is already
-	// the direct feed URL of a *different* source podcast, skip the remapping.
-	// Without this guard, a destination that has erroneously stored two distinct
-	// podcasts at the same URL (e.g. because the RSS host migrated one feed to
-	// the other's URL) would cause buildAutoFeedMap to collapse both source
-	// podcasts onto a single destination URL, mis-attributing episodes.
+	// Build the set of normalised source feed URLs.
+	// Collision guard 1: don't remap a source podcast to a URL that is already
+	// the direct feed URL of a different source podcast.  Example: if the
+	// destination stored "Justice By Design" at the #SistersInLaw audioboom URL
+	// due to a catalog error, a title match would remap JbD's URL to the SL URL,
+	// collapsing both podcasts' episodes onto the same feed.
 	srcFeedNorms := make(map[string]bool, len(srcLib.Podcasts))
 	for _, pod := range srcLib.Podcasts {
 		if norm := migrate.NormalizeFeedURL(pod.FeedURL); norm != "" {
@@ -310,15 +309,30 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		}
 	}
 
+	// Collision guard 2 state: don't remap two different source podcasts to the
+	// same destination URL.  This happens when a publisher (e.g. Politicon) hosts
+	// multiple shows and the destination app stored all of them under a single URL.
+	// Both title matches would fire independently and collapse both Apple podcast
+	// feeds onto one destination URL, causing Phase B to look up episodes for one
+	// show in the other's feed.  When a collision is detected we suppress BOTH
+	// remappings and let Phase B's refresh API resolve each podcast by its actual
+	// UUID instead.
+	//
+	// dstURLClaimed:   norm(dstURL) → first source podcast's FeedURL + Title.
+	// dstURLCollision: norm(dstURL) → true once a collision is detected.
+	type claimEntry struct{ feedURL, title string }
+	dstURLClaimed := make(map[string]claimEntry)
+	dstURLCollision := make(map[string]bool)
+
 	// For each source podcast that is not already subscribed at the destination
 	// by feed URL, attempt a title-based match.
 	//
 	// Pass 1: exact fuzzy-normalised title equality.
-	// Pass 2: prefix-match for podcasts whose titles differ by a subtitle
+	// Pass 2: word-aligned prefix for podcasts whose titles differ by a subtitle
 	// (e.g. Apple "Crooked City" vs PC "Crooked City: Dixon, IL").
 	// A minimum normalised length of 5 characters guards against trivial matches
 	// on short words like "news" accidentally matching "the news hour".
-	var feedMap map[string]string
+	feedMap := make(map[string]string)
 	for _, pod := range srcLib.Podcasts {
 		if pod.FeedURL == "" {
 			continue
@@ -330,47 +344,61 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		if t == "" {
 			continue
 		}
-		// Pass 1: exact match.
-		if dstFeed, ok := dstTitleToFeed[t]; ok {
-			// Collision guard: if this destination URL is already the direct
-			// feed URL of another source podcast, remapping would conflate two
-			// distinct podcasts.  Skip and let Phase B's title-fallback handle
-			// it via the refresh API instead.
-			if srcFeedNorms[migrate.NormalizeFeedURL(dstFeed)] {
-				fmt.Printf("feed-map (auto): skipping remap of %q → %s (destination URL already claimed by another source podcast)\n",
-					pod.Title, dstFeed)
-				continue
-			}
-			if feedMap == nil {
-				feedMap = make(map[string]string)
-			}
-			feedMap[pod.FeedURL] = dstFeed
-			continue
-		}
-		// Pass 2: prefix-match — handles subtitle additions such as
-		// "Crooked City" ↔ "Crooked City: Dixon, IL".
-		//
-		// One title must be a word-aligned prefix of the other.  A plain
-		// contains-match would create false positives like
-		// "Pod Save America" matching "Breaking News from Pod Save America"
-		// (the former appears as a suffix of the latter's fuzzy title).
-		if len(t) >= 5 {
-			for dstT, dstFeed := range dstTitleToFeed {
+
+		// Determine the best-matching destination feed URL (Pass 1 then Pass 2).
+		var dstFeed string
+		if dstF, ok := dstTitleToFeed[t]; ok {
+			dstFeed = dstF
+		} else if len(t) >= 5 {
+			// Pass 2: prefix-match — handles subtitle additions such as
+			// "Crooked City" ↔ "Crooked City: Dixon, IL".
+			//
+			// One title must be a word-aligned prefix of the other.  A plain
+			// contains-match would create false positives like
+			// "Pod Save America" matching "Breaking News from Pod Save America"
+			// (the former appears as a suffix of the latter's fuzzy title).
+			for dstT, dstF := range dstTitleToFeed {
 				if titleHasWordPrefix(dstT, t) || titleHasWordPrefix(t, dstT) {
-					// Same collision guard as Pass 1.
-					if srcFeedNorms[migrate.NormalizeFeedURL(dstFeed)] {
-						fmt.Printf("feed-map (auto): skipping remap of %q → %s (destination URL already claimed by another source podcast)\n",
-							pod.Title, dstFeed)
-						break
-					}
-					if feedMap == nil {
-						feedMap = make(map[string]string)
-					}
-					feedMap[pod.FeedURL] = dstFeed
+					dstFeed = dstF
 					break
 				}
 			}
 		}
+		if dstFeed == "" {
+			continue
+		}
+
+		dstFeedNorm := migrate.NormalizeFeedURL(dstFeed)
+
+		// Collision guard 1: destination URL is already a direct source feed URL.
+		if srcFeedNorms[dstFeedNorm] {
+			fmt.Printf("feed-map (auto): skipping remap of %q → %s (destination URL already claimed by another source podcast)\n",
+				pod.Title, dstFeed)
+			continue
+		}
+
+		// Collision guard 2: a second source podcast wants the same destination URL.
+		if dstURLCollision[dstFeedNorm] {
+			// Already detected a collision here — skip silently.
+			continue
+		}
+		if existing, exists := dstURLClaimed[dstFeedNorm]; exists {
+			// Collision: undo the first mapping and mark this dst URL as ambiguous.
+			delete(feedMap, existing.feedURL)
+			dstURLCollision[dstFeedNorm] = true
+			fmt.Printf("feed-map (auto): suppressed remaps of %q and %q → %s"+
+				" (destination URL matches multiple source podcasts — Phase B will resolve via RSS)\n",
+				existing.title, pod.Title, dstFeed)
+			continue
+		}
+
+		// No collision — apply the remapping.
+		dstURLClaimed[dstFeedNorm] = claimEntry{feedURL: pod.FeedURL, title: pod.Title}
+		feedMap[pod.FeedURL] = dstFeed
+	}
+
+	if len(feedMap) == 0 {
+		return nil
 	}
 	return feedMap
 }

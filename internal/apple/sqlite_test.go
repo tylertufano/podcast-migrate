@@ -180,6 +180,15 @@ func setupSQLiteDB(t *testing.T) string {
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 1 WHERE Z_PK = 15`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep15: %v", err)
 	}
+	// ep16: subscription back-catalog auto-mark — ZPLAYSTATE=2, ZPLAYSTATESOURCE=2,
+	//       ZLASTDATEPLAYED set (to subscription date), ZPLAYHEAD=0, ZPLAYCOUNT=0.
+	//       Apple marks premium podcast back-catalog as played on first subscription;
+	//       ZLASTDATEPLAYED is the subscription date, not an actual listening event.
+	//       Must be EXCLUDED — ZPLAYSTATESOURCE=2 is always an auto-mark.
+	insertEpisode(16, 1, "rss-guid-16", "PLUS Back-Catalog Auto-Marked", 685000000.0, 2400.0, 2, 0, 0.0, 685100000.0, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 2 WHERE Z_PK = 16`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep16: %v", err)
+	}
 
 	return path
 }
@@ -414,6 +423,7 @@ func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	// ep15 (iCloud-sync, ZLASTDATEPLAYED+ZPLAYSTATESOURCE=1)     → included
 	// ep5  (null GUID, no play evidence)                         → excluded (play evidence filter)
 	// ep10 (ZLASTDATEPLAYED only, ZPLAYSTATESOURCE=0/unset)      → excluded
+	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog) â excluded
 	if len(lib.Episodes) != 9 {
 		t.Errorf("got %d episodes, want 9", len(lib.Episodes))
 	}
@@ -440,6 +450,18 @@ func TestSQLiteReader_AutoMarkedEpisodeExcluded(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if ep := findEpisode(lib, "rss-guid-11"); ep != nil {
 		t.Errorf("auto-marked episode (ZPLAYSTATESOURCE=2, no ZLASTDATEPLAYED) should be excluded, got PlayState=%d", ep.PlayState)
+	}
+}
+
+func TestSQLiteReader_AutoMarkedWithLastPlayedExcluded(t *testing.T) {
+	// ep16: ZPLAYSTATE=2, ZPLAYSTATESOURCE=2, ZLASTDATEPLAYED set, ZPLAYHEAD=0, ZPLAYCOUNT=0.
+	// Reproduces the premium subscription back-catalog pattern: Apple marks all prior episodes
+	// as played when a user first subscribes to a podcastâs premium tier (e.g. Freakonomics
+	// Radio PLUS). ZLASTDATEPLAYED is set to the subscription date, not an actual listening
+	// event. ZPLAYSTATESOURCE=2 must be treated as an auto-mark regardless of ZLASTDATEPLAYED.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	if ep := findEpisode(lib, "rss-guid-16"); ep != nil {
+		t.Errorf("subscription back-catalog auto-mark (ZPLAYSTATESOURCE=2 + ZLASTDATEPLAYED) should be excluded, got PlayState=%d", ep.PlayState)
 	}
 }
 

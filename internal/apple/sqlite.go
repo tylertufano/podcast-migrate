@@ -264,18 +264,17 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		//   4 — synced from another device that had it as played
 		//   6 — default/initial state; also used for auto-marks with no play record
 		//
-		// We exclude only the two known auto-mark sources (2 and 6) when they lack
-		// a ZLASTDATEPLAYED timestamp — those rows were never actually listened to.
+		// Sources 2 and 6 are always treated as auto-marks and never trusted,
+		// regardless of whether ZLASTDATEPLAYED is set. Premium podcast subscriptions
+		// (e.g. Freakonomics Radio PLUS) set ZPLAYSTATESOURCE=2 and ZLASTDATEPLAYED
+		// when marking back-catalog episodes on first subscription — ZLASTDATEPLAYED
+		// reflects the subscription date, not an actual listening event.
 		// All other ZPLAYSTATE=2 rows are trusted, including:
 		//   ZPLAYSTATESOURCE=1 (user-initiated "Mark as Played")
 		//   ZPLAYSTATESOURCE=3 (listened to completion)
 		//   ZPLAYSTATESOURCE=4 (synced from another device)
 		//   Any unknown/future source value
-		//
-		// A ZLASTDATEPLAYED timestamp is also accepted as corroborating evidence for
-		// auto-marked rows (2/6) — it indicates the episode was actually played at
-		// some point even if the source was auto.
-		autoMarked := (playStateSource.Int64 == 2 || playStateSource.Int64 == 6) && !lastPlayedRaw.Valid
+		autoMarked := playStateSource.Int64 == 2 || playStateSource.Int64 == 6
 		trustedPlayed := playState.Valid && playState.Int64 == 2 && !autoMarked
 
 		switch {

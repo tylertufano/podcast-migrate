@@ -16,7 +16,8 @@ package pocketcasts
 //   POST https://api.pocketcasts.com/user/podcast/list                       — subscribed podcast list
 //   POST https://api.pocketcasts.com/user/in_progress                        — in-progress episodes (with play state)
 //   POST https://api.pocketcasts.com/user/history                            — recently-played episodes (with play state)
-//   GET  https://cache.pocketcasts.com/podcast/full/{uuid}/{page}/3/1000     — paginated episode metadata (no play state)
+//   POST https://api.pocketcasts.com/user/podcast/episodes                   — per-podcast episode list WITH user play state
+//   GET  https://cache.pocketcasts.com/podcast/full/{uuid}/{page}/3/1000     — paginated episode metadata (no play state, fallback only)
 //   POST https://api.pocketcasts.com/sync/update_episode                     — set play position/status
 //   POST https://api.pocketcasts.com/user/podcast/subscribe                  — subscribe to a podcast by UUID
 //   POST https://refresh.pocketcasts.com/author/add_feed_url                 — resolve RSS feed URL → podcast UUID (public, no auth)
@@ -428,6 +429,81 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastUUID 
 		})
 	}
 	return episodes, payload.HasMoreEpisodes, nil
+}
+
+// FetchUserPodcastEpisodes fetches the complete episode list for a podcast from
+// the authenticated Pocket Casts API. Unlike FetchPodcastEpisodes (public CDN),
+// this endpoint returns the user's actual play state (PlayingStatus, PlayedUpTo)
+// for each episode.
+//
+// The endpoint does not support the same page-based pagination as the CDN; it
+// returns all episodes in a single response. Callers should treat hasMore=false
+// as always true (one call per podcast, no page loop needed).
+//
+// The response uses camelCase JSON keys (same format as /user/history).
+// The page parameter is accepted for API symmetry with FetchPodcastEpisodes but
+// is NOT forwarded in the request body — the endpoint returns all episodes
+// regardless and does not accept a page offset. Always pass page=0.
+func FetchUserPodcastEpisodes(ctx context.Context, client *http.Client, podcastUUID string, _ int) ([]APIEpisode, bool, error) {
+	type reqBody struct {
+		UUID string `json:"uuid"`
+	}
+	b, _ := json.Marshal(reqBody{UUID: podcastUUID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		pcBaseURL+"/user/podcast/episodes", bytes.NewReader(b))
+	if err != nil {
+		return nil, false, fmt.Errorf("pocketcasts/web: build user-episode-list request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("pocketcasts/web: POST /user/podcast/episodes: %w", err)
+	}
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024)) // larger limit: all episodes at once
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, false, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
+	if resp.StatusCode >= 500 {
+		return nil, false, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/podcast/episodes returned HTTP %d", resp.StatusCode)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false, fmt.Errorf("pocketcasts/web: /user/podcast/episodes returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(respBody))
+	}
+
+	// The authenticated endpoint uses the same camelCase format as /user/history.
+	var payload struct {
+		Episodes []historyEpisode `json:"episodes"`
+	}
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return nil, false, fmt.Errorf("pocketcasts/web: parse user-episode-list response: %w", err)
+	}
+
+	out := make([]APIEpisode, 0, len(payload.Episodes))
+	for _, h := range payload.Episodes {
+		ep := APIEpisode{
+			UUID:          h.UUID,
+			PodcastUUID:   podcastUUID, // passed-in UUID; podcastUuid may be absent in per-podcast responses
+			Title:         h.Title,
+			URL:           h.URL,
+			PublishedAt:   h.Published,
+			Duration:      h.Duration,
+			PlayingStatus: h.PlayingStatus,
+			PlayedUpTo:    h.PlayedUpTo,
+			Starred:       h.Starred,
+			IsDeleted:     h.IsDeleted,
+		}
+		// Use PodcastUUID from payload if present (useful for cross-check).
+		if h.PodcastUUID != "" {
+			ep.PodcastUUID = h.PodcastUUID
+		}
+		out = append(out, ep)
+	}
+	// This endpoint returns all episodes at once — no additional pages.
+	return out, false, nil
 }
 
 // UpdateEpisodeProgress sets the playback position and status for an episode.

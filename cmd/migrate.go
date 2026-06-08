@@ -271,7 +271,7 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&appleBearerToken, "apple-bearer-token", "", "Apple Podcasts web API Bearer token (or set APPLE_BEARER_TOKEN); obtain from podcasts.apple.com DevTools → mark episode played → Authorization header")
 	cmd.Flags().StringVar(&appleMediaUserToken, "apple-media-user-token", "", "Apple Podcasts media-user-token (or set APPLE_MEDIA_USER_TOKEN); obtain from podcasts.apple.com DevTools → mark episode played → media-user-token header")
 	cmd.Flags().BoolVar(&strictFeedMatch, "strict-feed-match", false, "only match episodes using feed-URL-anchored strategies (pub date or title + same feed URL); skips cross-feed title fallbacks (strategies 3 and 4)")
-	cmd.Flags().BoolVar(&forceUpdate, "force-update", false, "write source play state even if the destination already shows the episode as played or further along; bypasses the server-state check")
+	cmd.Flags().BoolVar(&forceUpdate, "force-update", false, "write source play state even if the destination already shows the episode as played or further along; bypasses the server-state check. Note: has no effect when --to pocketcasts — Pocket Casts does not expose a reliable per-episode read-back API, so the tool always writes unconditionally regardless of this flag")
 	cmd.Flags().BoolVar(&subscribedOnly, "subscribed-only", false, "only sync play state for podcasts already subscribed to at the destination; skips search and subscribe for unsubscribed feeds")
 	cmd.Flags().DurationVar(&episodeCacheMaxAge, "episode-cache-max-age", 0,
 		"maximum age of cached Overcast episode numeric IDs; entries older than this are\n"+

@@ -27,7 +27,7 @@ func TestFindInIndex_CrossPodcastFallback(t *testing.T) {
 		PublishedAt:   pubTime.Format(time.RFC3339),
 		PlayingStatus: PlayingUnplayed,
 	}
-	addToIndex(index, pcEp, "https://feeds.simplecast.com/justice-by-design")
+	addToIndex(index, pcEp, "https://feeds.simplecast.com/justice-by-design", "test")
 
 	// Source episode has the #SistersInLaw feed URL (Apple attribution).
 	srcEp := model.EpisodeState{
@@ -68,7 +68,7 @@ func TestFindInIndex_FeedURLKeyTakesPriority(t *testing.T) {
 		Title:       "Some Episode Title",
 		PublishedAt: pubTime.Format(time.RFC3339),
 	}
-	addToIndex(index, correctEp, "https://feeds.example.com/podcast-a")
+	addToIndex(index, correctEp, "https://feeds.example.com/podcast-a", "test")
 
 	// "Wrong" entry: different feed, same title+date (simulates another show).
 	wrongEp := &APIEpisode{
@@ -77,7 +77,7 @@ func TestFindInIndex_FeedURLKeyTakesPriority(t *testing.T) {
 		Title:       "Some Episode Title",
 		PublishedAt: pubTime.Format(time.RFC3339),
 	}
-	addToIndex(index, wrongEp, "https://feeds.example.com/podcast-b")
+	addToIndex(index, wrongEp, "https://feeds.example.com/podcast-b", "test")
 
 	// Source episode has the correct feed URL — must get the correct entry.
 	srcEp := model.EpisodeState{

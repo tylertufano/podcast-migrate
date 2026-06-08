@@ -350,6 +350,10 @@ type pcIndexEntry struct {
 	podcastUUID  string
 	currentState model.PlayState
 	currentPos   time.Duration
+	// source records where this entry came from, for diagnostics.
+	// Values: "A1" (in_progress endpoint), "A2" (history), "B-auth" (authenticated
+	// per-podcast endpoint), "B-cdn" (public cache CDN, no real play state).
+	source string
 }
 
 // doWritePlayState is the main write implementation. It:
@@ -455,7 +459,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		if feedURL == "" || ep.IsDeleted {
 			continue
 		}
-		addToIndex(index, &ep, feedURL)
+		addToIndex(index, &ep, feedURL, "A1")
 	}
 	fmt.Printf("pocketcasts: Phase A1: indexed %d in-progress episode(s)\n", len(inProgress))
 
@@ -476,7 +480,6 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	for _, ep := range played {
 		feedURL := podUUIDToFeedURL[ep.PodcastUUID]
 		if feedURL == "" {
-			// Can't resolve podcast — either not subscribed or unknown feed URL.
 			continue
 		}
 		// NOTE: we intentionally do NOT skip ep.IsDeleted here. The /user/history
@@ -488,12 +491,12 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		// addToIndex uses "first entry wins" so in-progress entries from A1
 		// are never overwritten by played entries from A2.
 		beforeLen := len(index)
-		addToIndex(index, &ep, feedURL)
+		addToIndex(index, &ep, feedURL, "A2")
 		if len(index) > beforeLen {
 			phaseA2Added++
 		}
 	}
-	fmt.Printf("pocketcasts: Phase A2: indexed %d additional episode(s) from play history\n", phaseA2Added)
+	fmt.Printf("pocketcasts: Phase A2: indexed %d recently-played episode(s)\n", phaseA2Added)
 
 	// --- Phase B: per-podcast episode fetch for unmatched source episodes ---
 	//
@@ -521,6 +524,12 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	if len(unmatchedFeeds) > 0 {
 		fmt.Printf("pocketcasts: Phase B: %d feed(s) have unmatched episodes — fetching per-podcast episode lists...\n",
 			len(unmatchedFeeds))
+
+		// authEpAvailable starts true: attempt the authenticated /user/podcast/episodes
+		// endpoint for each podcast before fetching CDN pages. If the endpoint
+		// returns a non-retriable error it is disabled for all remaining Phase B
+		// calls in this run.
+		authEpAvailable := true
 
 		added := 0
 		skipped := 0
@@ -635,6 +644,37 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				}
 			}
 
+			// Pass 1 (authenticated): fetch episodes with real play state so
+			// Phase B doesn't blindly treat already-played episodes as unplayed.
+			// addToIndex is first-entry-wins: these entries are never overwritten
+			// by the CDN pass below.
+			if authEpAvailable {
+				authEps, err := fetchUserEpisodesWithRetry(ctx, client, podUUID, requestDelay)
+				if err != nil {
+					var rl *RateLimitError
+					var te *TransientError
+					if !errors.As(err, &rl) && !errors.As(err, &te) {
+						// Non-retriable error — authenticated endpoint not available for
+						// this run; skip it for all remaining podcasts.
+						fmt.Printf("  authenticated episode endpoint unavailable (%v) — using CDN only\n", err)
+						authEpAvailable = false
+					}
+				} else {
+					beforeAdd := len(index)
+					for _, ep := range authEps {
+						if indexFeedURL == "" {
+							continue
+						}
+						addToIndex(index, &ep, indexFeedURL, "B-auth")
+					}
+					added += len(index) - beforeAdd
+					time.Sleep(requestDelay)
+				}
+			}
+
+			// Pass 2 (CDN): fill in episodes not returned by the authenticated
+			// endpoint (typically older episodes). addToIndex's first-entry-wins
+			// ensures Pass 1 play-state entries are not overwritten.
 			for page := 0; page < maxPhaseBPagesPerPodcast; page++ {
 				pageEps, hasMore, err := fetchPodcastEpisodesWithRetry(ctx, client, podUUID, page, requestDelay)
 				if err != nil {
@@ -647,7 +687,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 					if indexFeedURL == "" || ep.IsDeleted {
 						continue
 					}
-					addToIndex(index, &ep, indexFeedURL)
+					addToIndex(index, &ep, indexFeedURL, "B-cdn")
 				}
 				added += len(index) - beforeAdd
 
@@ -674,7 +714,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				continue
 			}
 			podTitle := feedToTitle[ep.FeedURL]
-			entry, ok := findInIndex(index, ep)
+			_, ok := findInIndex(index, ep)
 			if !ok {
 				dryRunNote := "no match found in Pocket Casts account"
 				if ep.FeedURL != "" {
@@ -683,14 +723,6 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
 					playStateLabel(ep.PlayState, ep.PlayPosition), "—", dryRunNote)
 				continue
-			}
-			if !opts.ForceUpdate {
-				if reason := pcSkipReason(ep, entry); reason != "" {
-					writeLogLine(opts.LogWriter, reason, podTitle, ep.Title, ep.PubDate,
-						playStateLabel(ep.PlayState, ep.PlayPosition),
-						playStateLabel(entry.currentState, entry.currentPos), "")
-					continue
-				}
 			}
 			fmt.Printf("  [dry-run] would set progress: %q — %q → %s\n",
 				podTitle, ep.Title, playStateLabel(ep.PlayState, ep.PlayPosition))
@@ -703,24 +735,13 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 
 	// --- Pre-count ---
 	toUpdate := 0
-	alreadyDone := 0
 	for _, ep := range episodes {
 		if ep.FromDestination || ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
 		}
-		entry, ok := findInIndex(index, ep)
-		if !ok {
-			continue
-		}
-		if !opts.ForceUpdate && pcSkipReason(ep, entry) != "" {
-			alreadyDone++
-		} else {
+		if _, ok := findInIndex(index, ep); ok {
 			toUpdate++
 		}
-	}
-	if alreadyDone > 0 {
-		fmt.Printf("pocketcasts: skipping %d already-satisfied episode(s) (Pocket Casts state matches or exceeds source)\n",
-			alreadyDone)
 	}
 	fmt.Printf("pocketcasts: request delay: %v between calls\n", requestDelay)
 	fmt.Printf("pocketcasts: writing play state for %d episode(s)...\n", toUpdate)
@@ -728,8 +749,6 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	// --- Write loop ---
 	updated := 0
 	apiSkipped := 0
-	skippedPlayed := 0
-	skippedAhead := 0
 	notFound := 0
 
 	const (
@@ -754,21 +773,6 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
 				playStateLabel(ep.PlayState, ep.PlayPosition), "—", notFoundNote)
 			continue
-		}
-
-		if !opts.ForceUpdate {
-			if reason := pcSkipReason(ep, entry); reason != "" {
-				switch reason {
-				case "already_played":
-					skippedPlayed++
-				case "already_ahead":
-					skippedAhead++
-				}
-				writeLogLine(opts.LogWriter, reason, podTitle, ep.Title, ep.PubDate,
-					playStateLabel(ep.PlayState, ep.PlayPosition),
-					playStateLabel(entry.currentState, entry.currentPos), "")
-				continue
-			}
 		}
 
 		// Determine API parameters.
@@ -843,7 +847,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 
 		writeLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
 			playStateLabel(ep.PlayState, ep.PlayPosition),
-			playStateLabel(entry.currentState, entry.currentPos), "")
+			playStateLabel(entry.currentState, entry.currentPos),
+			"pc_source:"+entry.source)
 		updated++
 
 		if updated <= 5 || updated%50 == 0 {
@@ -861,12 +866,6 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		time.Sleep(requestDelay)
 	}
 
-	if skippedPlayed > 0 {
-		fmt.Printf("pocketcasts: %d episode(s) skipped — already marked as played in Pocket Casts\n", skippedPlayed)
-	}
-	if skippedAhead > 0 {
-		fmt.Printf("pocketcasts: %d episode(s) skipped — Pocket Casts position already at or ahead of source\n", skippedAhead)
-	}
 	if notFound > 0 {
 		fmt.Printf("pocketcasts: %d episode(s) not matched in Pocket Casts (not subscribed or not found in episode list)\n", notFound)
 	}
@@ -878,7 +877,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 
 // addToIndex adds a Pocket Casts episode to the index under all applicable match keys.
 // feedURL is the RSS feed URL of the parent podcast (resolved from podUUID → feedURL).
-func addToIndex(index map[string]pcIndexEntry, ep *APIEpisode, feedURL string) {
+// source identifies which phase/endpoint provided this entry (e.g. "A1", "A2", "B-auth", "B-cdn").
+func addToIndex(index map[string]pcIndexEntry, ep *APIEpisode, feedURL string, source string) {
 	normFeed := normalizeFeedURL(feedURL)
 	pubTime := ep.ParsePublishedAt()
 
@@ -887,6 +887,7 @@ func addToIndex(index map[string]pcIndexEntry, ep *APIEpisode, feedURL string) {
 		podcastUUID:  ep.PodcastUUID,
 		currentState: pcPlayingStatusToModel(ep.PlayingStatus),
 		currentPos:   time.Duration(ep.PlayedUpTo) * time.Second,
+		source:       source,
 	}
 
 	// Primary: feed URL + pub date (second precision).
@@ -956,12 +957,6 @@ func findInIndex(index map[string]pcIndexEntry, ep model.EpisodeState) (pcIndexE
 	return pcIndexEntry{}, false
 }
 
-// pcSkipReason returns "already_played", "already_ahead", or "" based on
-// whether Pocket Casts' current state already satisfies the desired state.
-func pcSkipReason(desired model.EpisodeState, current pcIndexEntry) string {
-	return migrate.SkipReason(desired.PlayState, desired.PlayPosition, current.currentState, current.currentPos)
-}
-
 // pcPlayingStatusToModel converts a Pocket Casts playing_status integer to the
 // model.PlayState enum used throughout this tool.
 func pcPlayingStatusToModel(status int) model.PlayState {
@@ -975,8 +970,58 @@ func pcPlayingStatusToModel(status int) model.PlayState {
 	}
 }
 
-// fetchPodcastEpisodesWithRetry calls FetchPodcastEpisodes with retry on
-// rate-limit (429) responses. Up to 4 attempts with exponential back-off.
+// fetchUserEpisodesWithRetry calls FetchUserPodcastEpisodes (authenticated, real
+// play state) with retry on rate-limit and transient errors. Returns the episode
+// slice; the authenticated endpoint returns all episodes in one response so
+// there is no page parameter.
+func fetchUserEpisodesWithRetry(ctx context.Context, client *http.Client,
+	podcastUUID string, requestDelay time.Duration) ([]APIEpisode, error) {
+
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			wait := time.Duration(1<<uint(attempt)) * 30 * time.Second
+			fmt.Printf("  rate limited (auth) fetching episode list — waiting %v (attempt %d/%d)...\n",
+				wait, attempt+1, maxAttempts)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+
+		eps, _, err := FetchUserPodcastEpisodes(ctx, client, podcastUUID, 0)
+		if err == nil {
+			return eps, nil
+		}
+
+		var rl *RateLimitError
+		if errors.As(err, &rl) {
+			if attempt == 0 {
+				fmt.Printf("  rate limited (auth) — waiting %v...\n", rl.Wait)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(rl.Wait):
+				}
+			}
+			lastErr = err
+			continue
+		}
+		var te *TransientError
+		if errors.As(err, &te) {
+			lastErr = err
+			continue
+		}
+		return nil, err // non-retriable
+	}
+	return nil, lastErr
+}
+
+// fetchPodcastEpisodesWithRetry calls FetchPodcastEpisodes (public cache CDN,
+// no play state) with retry on rate-limit (429) responses. Up to 4 attempts
+// with exponential back-off.
 func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client,
 	podcastUUID string, page int, requestDelay time.Duration) ([]APIEpisode, bool, error) {
 

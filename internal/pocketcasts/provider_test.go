@@ -331,7 +331,11 @@ func TestProvider_SetLibrary_WritesPlayedEpisode(t *testing.T) {
 	}
 }
 
-func TestProvider_SetLibrary_SkipsAlreadyPlayed(t *testing.T) {
+func TestProvider_SetLibrary_AlwaysWritesRegardlessOfPCState(t *testing.T) {
+	// Pocket Casts does not expose a reliable per-episode read-back API, so the
+	// provider always writes unconditionally — even when the in-progress list
+	// shows the episode as already played. --force-update is effectively the
+	// permanent behaviour for PC targets.
 	var updateCalls []map[string]any
 	restore := newFullTestServer(t, testServerConfig{
 		inProgressEpisodes: []map[string]any{
@@ -341,7 +345,7 @@ func TestProvider_SetLibrary_SkipsAlreadyPlayed(t *testing.T) {
 				"title":          "Episode One",
 				"published_at":   "2024-04-10T08:00:00Z",
 				"duration":       3600,
-				"playing_status": 3, // already played in PC
+				"playing_status": 3, // already played in PC — should still be written
 				"played_up_to":   3600,
 				"is_deleted":     false,
 			},
@@ -369,8 +373,8 @@ func TestProvider_SetLibrary_SkipsAlreadyPlayed(t *testing.T) {
 	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
 		t.Fatalf("SetLibrary: %v", err)
 	}
-	if len(updateCalls) != 0 {
-		t.Errorf("already-played episode should be skipped; got %d update call(s)", len(updateCalls))
+	if len(updateCalls) != 1 {
+		t.Errorf("expected 1 update call (always-write); got %d", len(updateCalls))
 	}
 }
 

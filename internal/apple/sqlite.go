@@ -269,13 +269,20 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		// (e.g. Freakonomics Radio PLUS) set ZPLAYSTATESOURCE=2 and ZLASTDATEPLAYED
 		// when marking back-catalog episodes on first subscription — ZLASTDATEPLAYED
 		// reflects the subscription date, not an actual listening event.
-		// All other ZPLAYSTATE=2 rows are trusted, including:
-		//   ZPLAYSTATESOURCE=1 (user-initiated "Mark as Played")
-		//   ZPLAYSTATESOURCE=3 (listened to completion)
-		//   ZPLAYSTATESOURCE=4 (synced from another device)
-		//   Any unknown/future source value
+		//
+		// Source 3 (listened to completion) is trusted only when at least one
+		// corroborating indicator is present (ZPLAYCOUNT > 0 or ZLASTDATEPLAYED set).
+		// Without either, it is indistinguishable from the same bulk subscription
+		// back-catalog auto-mark pattern, which also uses source=3. All 800+
+		// Freakonomics Radio PLUS back-catalog episodes use source=3, ZPLAYCOUNT=0,
+		// ZLASTDATEPLAYED=NULL — confirmed by direct DB inspection.
+		//
+		// Sources 1 and 4 (manual mark, device-sync) are trusted without corroboration.
 		autoMarked := playStateSource.Int64 == 2 || playStateSource.Int64 == 6
-		trustedPlayed := playState.Valid && playState.Int64 == 2 && !autoMarked
+		unCorroborated := playStateSource.Int64 == 3 &&
+			(!playCount.Valid || playCount.Int64 == 0) &&
+			!lastPlayedRaw.Valid
+		trustedPlayed := playState.Valid && playState.Int64 == 2 && !autoMarked && !unCorroborated
 
 		switch {
 		case playHeadSec.Valid && playHeadSec.Float64 > 0:

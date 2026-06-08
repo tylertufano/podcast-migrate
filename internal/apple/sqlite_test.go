@@ -164,7 +164,8 @@ func setupSQLiteDB(t *testing.T) string {
 	// ep14: played episode with NULL GUID — some RSS feeds omit <guid> for individual
 	//       episodes; Apple stores NULL in ZGUID. Must be INCLUDED and matched by
 	//       title+date downstream. Pub date and title are non-NULL so a match key exists.
-	insertEpisode(14, 1, nil, "No GUID But Played", 687000000.0, 1800.0, 2, 0, 0.0, nil, "STDQ")
+	//       ZLASTDATEPLAYED is set as corroborating evidence (required for source=3).
+	insertEpisode(14, 1, nil, "No GUID But Played", 687000000.0, 1800.0, 2, 0, 0.0, 687100000.0, "STDQ")
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 14`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep14: %v", err)
 	}
@@ -188,6 +189,16 @@ func setupSQLiteDB(t *testing.T) string {
 	insertEpisode(16, 1, "rss-guid-16", "PLUS Back-Catalog Auto-Marked", 685000000.0, 2400.0, 2, 0, 0.0, 685100000.0, "STDQ")
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 2 WHERE Z_PK = 16`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep16: %v", err)
+	}
+	// ep17: source=3 without corroboration — ZPLAYSTATE=2, ZPLAYSTATESOURCE=3,
+	//       ZPLAYHEAD=0, ZPLAYCOUNT=0, ZLASTDATEPLAYED=NULL.
+	//       Confirmed in real data: Apple uses source=3 (not source=2) when bulk-marking
+	//       premium subscriber back-catalog as played on first subscription. Without
+	//       ZPLAYCOUNT or ZLASTDATEPLAYED there is no evidence of actual listening.
+	//       Must be EXCLUDED.
+	insertEpisode(17, 1, "rss-guid-17", "PLUS Source3 No Evidence", 684000000.0, 2400.0, 2, 0, 0.0, nil, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 17`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep17: %v", err)
 	}
 
 	return path
@@ -423,7 +434,8 @@ func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	// ep15 (iCloud-sync, ZLASTDATEPLAYED+ZPLAYSTATESOURCE=1)     → included
 	// ep5  (null GUID, no play evidence)                         → excluded (play evidence filter)
 	// ep10 (ZLASTDATEPLAYED only, ZPLAYSTATESOURCE=0/unset)      → excluded
-	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog) â excluded
+	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog) → excluded
+	// ep17 (source=3 + no ZPLAYCOUNT + no ZLASTDATEPLAYED)       → excluded (uncorroborated)
 	if len(lib.Episodes) != 9 {
 		t.Errorf("got %d episodes, want 9", len(lib.Episodes))
 	}
@@ -462,6 +474,18 @@ func TestSQLiteReader_AutoMarkedWithLastPlayedExcluded(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if ep := findEpisode(lib, "rss-guid-16"); ep != nil {
 		t.Errorf("subscription back-catalog auto-mark (ZPLAYSTATESOURCE=2 + ZLASTDATEPLAYED) should be excluded, got PlayState=%d", ep.PlayState)
+	}
+}
+
+func TestSQLiteReader_UnCorroboratedSource3Excluded(t *testing.T) {
+	// ep17: ZPLAYSTATE=2, ZPLAYSTATESOURCE=3, ZPLAYHEAD=0, ZPLAYCOUNT=0, ZLASTDATEPLAYED=NULL.
+	// Apple uses source=3 when bulk-marking premium subscriber back-catalog as played on first
+	// subscription (e.g. Freakonomics Radio PLUS: 800+ episodes all modified on the same date).
+	// Unlike the auto-mark source=2 case, no ZLASTDATEPLAYED is set — but without ZPLAYCOUNT or
+	// ZLASTDATEPLAYED there is no evidence of actual listening. Must be EXCLUDED.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	if ep := findEpisode(lib, "rss-guid-17"); ep != nil {
+		t.Errorf("uncorroborated source=3 episode should be excluded, got PlayState=%d", ep.PlayState)
 	}
 }
 

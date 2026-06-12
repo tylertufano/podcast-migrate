@@ -249,7 +249,7 @@ func TestBuildFeedMap_EmptyDst_ReturnsError(t *testing.T) {
 // ---- buildProvider ----
 
 func TestBuildProvider_Apple_Podcasts(t *testing.T) {
-	p, err := buildProvider("podcasts", "", "", "", "", "", "", "", "")
+	p, err := buildProvider("podcasts", "", "", "", "", "", "", "", "", "", "")
 	if err != nil {
 		t.Fatalf("buildProvider(podcasts): %v", err)
 	}
@@ -262,7 +262,7 @@ func TestBuildProvider_Apple_Podcasts(t *testing.T) {
 }
 
 func TestBuildProvider_Apple_Alias(t *testing.T) {
-	p, err := buildProvider("apple", "", "", "", "", "", "", "", "")
+	p, err := buildProvider("apple", "", "", "", "", "", "", "", "", "", "")
 	if err != nil {
 		t.Fatalf("buildProvider(apple): %v", err)
 	}
@@ -273,14 +273,14 @@ func TestBuildProvider_Apple_Alias(t *testing.T) {
 
 func TestBuildProvider_Overcast_NoPaths_Error(t *testing.T) {
 	// No source OPML, no export path, no credentials → error.
-	_, err := buildProvider("overcast", "", "", "", "", "", "", "", "")
+	_, err := buildProvider("overcast", "", "", "", "", "", "", "", "", "", "")
 	if err == nil {
 		t.Error("expected error for overcast with no configuration, got nil")
 	}
 }
 
 func TestBuildProvider_Overcast_WithSourceOPML(t *testing.T) {
-	p, err := buildProvider("overcast", "", "", "source.opml", "", "", "", "", "")
+	p, err := buildProvider("overcast", "", "", "source.opml", "", "", "", "", "", "", "")
 	if err != nil {
 		t.Fatalf("buildProvider(overcast, source.opml): %v", err)
 	}
@@ -293,7 +293,7 @@ func TestBuildProvider_Overcast_WithSourceOPML(t *testing.T) {
 }
 
 func TestBuildProvider_Overcast_WithExportPath(t *testing.T) {
-	p, err := buildProvider("overcast", "", "", "", "out.opml", "", "", "", "")
+	p, err := buildProvider("overcast", "", "", "", "out.opml", "", "", "", "", "", "")
 	if err != nil {
 		t.Fatalf("buildProvider(overcast, export): %v", err)
 	}
@@ -307,7 +307,7 @@ func TestBuildProvider_Overcast_WithExportPath(t *testing.T) {
 }
 
 func TestBuildProvider_Overcast_WithCredentials_ReturnsWriteCapable(t *testing.T) {
-	p, err := buildProvider("overcast", "", "", "", "", "user@example.com", "secret", "", "")
+	p, err := buildProvider("overcast", "", "", "", "", "user@example.com", "secret", "", "", "", "")
 	if err != nil {
 		t.Fatalf("buildProvider(overcast, credentials): %v", err)
 	}
@@ -321,7 +321,7 @@ func TestBuildProvider_Overcast_WithCredentials_ReturnsWriteCapable(t *testing.T
 
 func TestBuildProvider_Unknown_ReturnsError(t *testing.T) {
 	for _, name := range []string{"spotify", "", "OVERCAST", "POCKETCASTS"} {
-		_, err := buildProvider(name, "", "", "", "", "", "", "", "")
+		_, err := buildProvider(name, "", "", "", "", "", "", "", "", "", "")
 		if err == nil {
 			t.Errorf("buildProvider(%q): expected error for unknown provider, got nil", name)
 		}
@@ -329,7 +329,7 @@ func TestBuildProvider_Unknown_ReturnsError(t *testing.T) {
 }
 
 func TestBuildProvider_PocketCasts_WithCredentials(t *testing.T) {
-	p, err := buildProvider("pocketcasts", "", "", "", "", "", "", "user@example.com", "secret")
+	p, err := buildProvider("pocketcasts", "", "", "", "", "", "", "user@example.com", "secret", "", "")
 	if err != nil {
 		t.Fatalf("buildProvider(pocketcasts, credentials): %v", err)
 	}
@@ -342,7 +342,7 @@ func TestBuildProvider_PocketCasts_WithCredentials(t *testing.T) {
 }
 
 func TestBuildProvider_PocketCasts_Alias(t *testing.T) {
-	p, err := buildProvider("pc", "", "", "", "", "", "", "user@example.com", "secret")
+	p, err := buildProvider("pc", "", "", "", "", "", "", "user@example.com", "secret", "", "")
 	if err != nil {
 		t.Fatalf("buildProvider(pc): %v", err)
 	}
@@ -352,9 +352,50 @@ func TestBuildProvider_PocketCasts_Alias(t *testing.T) {
 }
 
 func TestBuildProvider_PocketCasts_NoCredentials_Error(t *testing.T) {
-	_, err := buildProvider("pocketcasts", "", "", "", "", "", "", "", "")
+	_, err := buildProvider("pocketcasts", "", "", "", "", "", "", "", "", "", "")
 	if err == nil {
 		t.Error("expected error for pocketcasts with no credentials, got nil")
+	}
+}
+
+func TestBuildProvider_OPML_Source(t *testing.T) {
+	p, err := buildProvider("opml", "", "", "", "", "", "", "", "", "source.opml", "")
+	if err != nil {
+		t.Fatalf("buildProvider(opml, source): %v", err)
+	}
+	caps := p.Capabilities()
+	if !caps.ReadSubscriptions {
+		t.Error("ReadSubscriptions should be true for opml source")
+	}
+	if !caps.ReadPlayState {
+		t.Error("ReadPlayState should be true for opml source")
+	}
+	if caps.WriteSubscriptions {
+		t.Error("WriteSubscriptions should be false for source-only opml provider")
+	}
+}
+
+func TestBuildProvider_OPML_Output(t *testing.T) {
+	p, err := buildProvider("opml", "", "", "", "", "", "", "", "", "", "out.opml")
+	if err != nil {
+		t.Fatalf("buildProvider(opml, output): %v", err)
+	}
+	caps := p.Capabilities()
+	if !caps.WriteSubscriptions {
+		t.Error("WriteSubscriptions should be true for opml output")
+	}
+	if !caps.WritePlayState {
+		t.Error("WritePlayState should be true for opml output (extended)")
+	}
+	if caps.ReadSubscriptions {
+		t.Error("ReadSubscriptions should be false for output-only opml provider")
+	}
+}
+
+func TestBuildProvider_OPML_NoPaths_Error(t *testing.T) {
+	_, err := buildProvider("opml", "", "", "", "", "", "", "", "", "", "")
+	if err == nil {
+		t.Error("expected error for opml with no paths, got nil")
 	}
 }
 

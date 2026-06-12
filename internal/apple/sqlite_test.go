@@ -200,6 +200,16 @@ func setupSQLiteDB(t *testing.T) string {
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 17`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep17: %v", err)
 	}
+	// ep18: manually marked as unplayed — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1
+	//       (residual from when it was played), ZLASTDATEPLAYED set (residual),
+	//       ZPLAYSTATESOURCE=3 (retained from the original listened-to-completion event).
+	//       The user explicitly tapped "Mark as Unplayed" in the Apple Podcasts UI.
+	//       Apple resets ZPLAYSTATE to 0 but does not clear ZPLAYCOUNT or ZLASTDATEPLAYED.
+	//       Must be EXCLUDED — the residual signals must not re-trigger the episode as played.
+	insertEpisode(18, 1, "rss-guid-18", "Manually Unplayed After Listen", 683000000.0, 3600.0, 0, 1, 0.0, 683100000.0, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 18`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep18: %v", err)
+	}
 
 	return path
 }
@@ -423,19 +433,20 @@ func TestSQLiteReader_CountsIncludedPaywalledEpisodes(t *testing.T) {
 
 func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
-	// ep1  (played, ZPLAYSTATESOURCE=3)                          → included
-	// ep2  (in-progress, ZPLAYHEAD=900)                          → included
-	// ep3  (ZPLAYHEAD=300, ZPLAYSTATE=0)                         → included (in-progress)
-	// ep6  (PSUB on public feed)                                 → included
-	// ep7  (PLUS on public feed)                                 → included
-	// ep9  (shadow played, ZPLAYCOUNT=1)                         → included
-	// ep13 (manually marked, ZPLAYSTATESOURCE=1)                 → included
-	// ep14 (null GUID, ZPLAYSTATE=2/played)                      → included (title+date matching)
-	// ep15 (iCloud-sync, ZLASTDATEPLAYED+ZPLAYSTATESOURCE=1)     → included
-	// ep5  (null GUID, no play evidence)                         → excluded (play evidence filter)
-	// ep10 (ZLASTDATEPLAYED only, ZPLAYSTATESOURCE=0/unset)      → excluded
-	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog) → excluded
-	// ep17 (source=3 + no ZPLAYCOUNT + no ZLASTDATEPLAYED)       → excluded (uncorroborated)
+	// ep1  (played, ZPLAYSTATESOURCE=3)                                    → included
+	// ep2  (in-progress, ZPLAYHEAD=900)                                    → included
+	// ep3  (ZPLAYHEAD=300, ZPLAYSTATE=0)                                   → included (in-progress)
+	// ep6  (PSUB on public feed)                                           → included
+	// ep7  (PLUS on public feed)                                           → included
+	// ep9  (shadow played, ZPLAYCOUNT=1, source=0)                        → included
+	// ep13 (manually marked, ZPLAYSTATESOURCE=1)                          → included
+	// ep14 (null GUID, ZPLAYSTATE=2/played)                               → included (title+date matching)
+	// ep15 (iCloud-sync, ZLASTDATEPLAYED+ZPLAYSTATESOURCE=1, ZPLAYCOUNT=0) → included
+	// ep5  (null GUID, no play evidence)                                   → excluded (play evidence filter)
+	// ep10 (ZLASTDATEPLAYED only, ZPLAYSTATESOURCE=0/unset)               → excluded
+	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog)      → excluded
+	// ep17 (source=3 + no ZPLAYCOUNT + no ZLASTDATEPLAYED)                → excluded (uncorroborated)
+	// ep18 (ZPLAYSTATE=0, ZPLAYCOUNT=1 residual, source=3 — manually unplayed) → excluded
 	if len(lib.Episodes) != 9 {
 		t.Errorf("got %d episodes, want 9", len(lib.Episodes))
 	}
@@ -474,6 +485,18 @@ func TestSQLiteReader_AutoMarkedWithLastPlayedExcluded(t *testing.T) {
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if ep := findEpisode(lib, "rss-guid-16"); ep != nil {
 		t.Errorf("subscription back-catalog auto-mark (ZPLAYSTATESOURCE=2 + ZLASTDATEPLAYED) should be excluded, got PlayState=%d", ep.PlayState)
+	}
+}
+
+func TestSQLiteReader_ManuallyUnplayedExcluded(t *testing.T) {
+	// ep18: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1 (residual), ZLASTDATEPLAYED set
+	//       (residual), ZPLAYSTATESOURCE=3 (retained from original listen-to-completion).
+	// The user tapped "Mark as Unplayed" after having listened. Apple resets ZPLAYSTATE
+	// to 0 but leaves ZPLAYCOUNT and ZLASTDATEPLAYED intact. Residual ZPLAYCOUNT must
+	// not re-classify this episode as played on the next sync.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	if ep := findEpisode(lib, "rss-guid-18"); ep != nil {
+		t.Errorf("manually-unplayed episode (ZPLAYSTATE=0, ZPLAYCOUNT=1, source=3) should be excluded, got PlayState=%d", ep.PlayState)
 	}
 }
 
@@ -606,6 +629,47 @@ func TestSQLiteReader_Duration(t *testing.T) {
 	want := 3600 * time.Second
 	if ep.Duration != want {
 		t.Errorf("Duration: got %v, want %v", ep.Duration, want)
+	}
+}
+
+func TestSQLiteReader_MissingDurationColumn(t *testing.T) {
+	// Simulates a macOS schema change where ZDURATION no longer exists.
+	// The reader should succeed and return zero Duration rather than failing.
+	path := filepath.Join(t.TempDir(), "MTLibrary.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	_, _ = db.Exec(`CREATE TABLE ZMTPODCAST (
+		Z_PK INTEGER PRIMARY KEY, ZSUBSCRIBED INTEGER,
+		ZFEEDURL TEXT, ZTITLE TEXT, ZAUTHOR TEXT, ZIMAGEURL TEXT)`)
+	// Schema without ZDURATION — matches macOS 27 behaviour.
+	_, _ = db.Exec(`CREATE TABLE ZMTEPISODE (
+		Z_PK INTEGER PRIMARY KEY, ZPODCAST INTEGER,
+		ZGUID TEXT, ZTITLE TEXT, ZPUBDATE REAL,
+		ZPLAYSTATE INTEGER DEFAULT 0, ZPLAYCOUNT INTEGER DEFAULT 0,
+		ZPLAYHEAD REAL DEFAULT 0.0, ZLASTDATEPLAYED REAL,
+		ZPRICETYPE TEXT, ZPLAYSTATESOURCE INTEGER DEFAULT 0,
+		ZPLAYSTATELASTMODIFIEDDATE REAL)`)
+	_, _ = db.Exec(`INSERT INTO ZMTPODCAST VALUES (1, 1, 'https://feeds.example.com/show-a', 'Show A', 'Author', NULL)`)
+	_, _ = db.Exec(`INSERT INTO ZMTEPISODE
+		(Z_PK, ZPODCAST, ZGUID, ZTITLE, ZPUBDATE, ZPLAYSTATE, ZPLAYSTATESOURCE, ZLASTDATEPLAYED)
+		VALUES (1, 1, 'rss-guid-nodur', 'No Duration Episode', 700000000.0, 2, 3, 700100000.0)`)
+	db.Close()
+
+	lib, err := apple.NewSQLiteReader(path).Read(context.Background())
+	if err != nil {
+		t.Fatalf("Read with missing ZDURATION column: %v", err)
+	}
+	ep := findEpisode(lib, "rss-guid-nodur")
+	if ep == nil {
+		t.Fatal("episode not found — read failed silently")
+	}
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("PlayState: got %d, want Played", ep.PlayState)
+	}
+	if ep.Duration != 0 {
+		t.Errorf("Duration: got %v, want 0 (column absent)", ep.Duration)
 	}
 }
 

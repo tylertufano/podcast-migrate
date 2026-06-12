@@ -12,15 +12,18 @@ package pocketcasts
 // callers use the returned *http.Client normally without per-call setup.
 //
 // Endpoints used:
-//   POST https://api.pocketcasts.com/user/login                              — authenticate, get Bearer token
+//   POST https://api.pocketcasts.com/user/login                              — authenticate, get Bearer token (scope: mobile)
 //   POST https://api.pocketcasts.com/user/podcast/list                       — subscribed podcast list
+//   POST https://refresh.pocketcasts.com/import/export_feed_urls             — batch UUID → feed URL (returns subscriber URLs; requires mobile scope)
 //   POST https://api.pocketcasts.com/user/in_progress                        — in-progress episodes (with play state)
 //   POST https://api.pocketcasts.com/user/history                            — recently-played episodes (with play state)
 //   POST https://api.pocketcasts.com/user/podcast/episodes                   — per-podcast episode list WITH user play state
 //   GET  https://cache.pocketcasts.com/podcast/full/{uuid}/{page}/3/1000     — paginated episode metadata (no play state, fallback only)
 //   POST https://api.pocketcasts.com/sync/update_episode                     — set play position/status
+//   POST https://api.pocketcasts.com/user/sync/update                        — full/delta play-state sync (protobuf; used by mobile apps)
 //   POST https://api.pocketcasts.com/user/podcast/subscribe                  — subscribe to a podcast by UUID
 //   POST https://refresh.pocketcasts.com/author/add_feed_url                 — resolve RSS feed URL → podcast UUID (public, no auth)
+//   GET  https://itunes.apple.com/search?term=…&media=podcast                — recover RSS feed URL for unsubscribed podcasts (--pc-include-unsubscribed only)
 
 import (
 	"bytes"
@@ -29,9 +32,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 var pcBaseURL     = "https://api.pocketcasts.com"
@@ -105,10 +111,11 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // APIPodcast is a podcast as returned by /user/podcast/list.
 type APIPodcast struct {
-	UUID   string `json:"uuid"`
-	Title  string `json:"title"`
-	Author string `json:"author"`
-	URL    string `json:"url"` // RSS feed URL
+	UUID      string `json:"uuid"`
+	Title     string `json:"title"`
+	Author    string `json:"author"`
+	URL       string `json:"url"`       // RSS feed URL; empty for webFeed:false podcasts
+	IsPrivate bool   `json:"isPrivate"` // subscriber-only feed with no public RSS equivalent
 }
 
 // APIEpisode is an episode as returned by episode list endpoints.
@@ -165,7 +172,7 @@ func Login(ctx context.Context, email, password string) (*http.Client, error) {
 		Token string `json:"token"`
 	}
 
-	reqBody, err := json.Marshal(loginReq{Email: email, Password: password, Scope: "webplayer"})
+	reqBody, err := json.Marshal(loginReq{Email: email, Password: password, Scope: "mobile"})
 	if err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: marshal login request: %w", err)
 	}
@@ -245,9 +252,110 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]APIPod
 	return payload.Podcasts, nil
 }
 
+// FetchExportFeedURLs resolves a batch of podcast UUIDs to their RSS feed URLs
+// using the Pocket Casts export service at refresh.pocketcasts.com. This is
+// the same endpoint the iOS app uses to build its OPML export, so it returns
+// the actual URL the user subscribed with — including private/subscriber URLs
+// that /user/podcast/list does not expose.
+//
+// Requires a client authenticated with the "mobile" scope (the default for Login).
+// Returns a map of UUID → feed URL; UUIDs not known to the service are absent from
+// the map. An empty UUID slice returns (nil, nil) without making a network call.
+func FetchExportFeedURLs(ctx context.Context, client *http.Client, uuids []string) (map[string]string, error) {
+	if len(uuids) == 0 {
+		return nil, nil
+	}
+	type reqBody struct {
+		UUIDs []string `json:"uuids"`
+		V     string   `json:"v"`
+		DT    string   `json:"dt"`
+	}
+	body, err := json.Marshal(reqBody{UUIDs: uuids, V: "1", DT: "1"})
+	if err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: marshal export-feed-urls request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		pcRefreshURL+"/import/export_feed_urls", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: build export-feed-urls request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: POST /import/export_feed_urls: %w", err)
+	}
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
+	if resp.StatusCode >= 500 {
+		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /import/export_feed_urls returned HTTP %d", resp.StatusCode)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("pocketcasts/web: /import/export_feed_urls returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(respBody))
+	}
+
+	var payload struct {
+		Status string            `json:"status"`
+		Result map[string]string `json:"result"`
+	}
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return nil, fmt.Errorf("pocketcasts/web: parse export-feed-urls response: %w", err)
+	}
+	if payload.Status != "ok" {
+		return nil, fmt.Errorf("pocketcasts/web: export-feed-urls returned status %q", payload.Status)
+	}
+	return payload.Result, nil
+}
+
+// LookupFeedURL searches the iTunes podcast directory for the public RSS feed
+// URL of a podcast identified by title and author. Returns "" if no confident
+// match is found or the API is unavailable. No authentication is required.
+func LookupFeedURL(ctx context.Context, title, author string) (string, error) {
+	q := url.QueryEscape(title + " " + author)
+	apiURL := "https://itunes.apple.com/search?term=" + q + "&media=podcast&limit=5"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("iTunes search returned HTTP %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Results []struct {
+			CollectionName string `json:"collectionName"`
+			FeedURL        string `json:"feedUrl"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+	titleLower := strings.ToLower(title)
+	for _, r := range result.Results {
+		if strings.ToLower(r.CollectionName) == titleLower && r.FeedURL != "" {
+			return r.FeedURL, nil
+		}
+	}
+	return "", nil
+}
+
 // FetchInProgressEpisodes returns all episodes the authenticated user currently
 // has in progress (partially listened to). This does not include episodes that
 // have been played to completion — use FetchPlayedEpisodes for those.
+//
+// The /user/in_progress endpoint uses the same camelCase JSON format as
+// /user/history, so this function parses via historyEpisode and converts.
 func FetchInProgressEpisodes(ctx context.Context, client *http.Client) ([]APIEpisode, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		pcBaseURL+"/user/in_progress", bytes.NewReader([]byte("{}")))
@@ -275,12 +383,28 @@ func FetchInProgressEpisodes(ctx context.Context, client *http.Client) ([]APIEpi
 	}
 
 	var payload struct {
-		Episodes []APIEpisode `json:"episodes"`
+		Episodes []historyEpisode `json:"episodes"`
 	}
 	if err := json.Unmarshal(respBody, &payload); err != nil {
 		return nil, fmt.Errorf("pocketcasts/web: parse in-progress response: %w", err)
 	}
-	return payload.Episodes, nil
+
+	out := make([]APIEpisode, 0, len(payload.Episodes))
+	for _, h := range payload.Episodes {
+		out = append(out, APIEpisode{
+			UUID:          h.UUID,
+			PodcastUUID:   h.PodcastUUID,
+			Title:         h.Title,
+			URL:           h.URL,
+			PublishedAt:   h.Published,
+			Duration:      h.Duration,
+			PlayingStatus: h.PlayingStatus,
+			PlayedUpTo:    h.PlayedUpTo,
+			Starred:       h.Starred,
+			IsDeleted:     h.IsDeleted,
+		})
+	}
+	return out, nil
 }
 
 // historyEpisode is the episode structure returned by the /user/history
@@ -374,6 +498,35 @@ type cacheEpisode struct {
 	URL       string `json:"url"`
 	Duration  int    `json:"duration"`
 	Published string `json:"published"` // ISO 8601, e.g. "2024-01-15T10:00:00Z"
+}
+
+// FetchPodcastMeta returns the title and RSS feed URL for a podcast from the
+// cache CDN. Used to recover metadata for podcasts not in the subscription list.
+func FetchPodcastMeta(ctx context.Context, client *http.Client, podcastUUID string) (title, feedURL string, err error) {
+	apiURL := fmt.Sprintf("%s/podcast/full/%s/0/3/1", pcCacheURL, podcastUUID) // page 0, 1 episode (we only need the podcast object)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("pocketcasts/web: podcast meta returned HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		Podcast struct {
+			Title string `json:"title"`
+			URL   string `json:"url"`
+		} `json:"podcast"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", "", err
+	}
+	return payload.Podcast.Title, payload.Podcast.URL, nil
 }
 
 // FetchPodcastEpisodes fetches one page of episode metadata for a podcast from
@@ -504,6 +657,217 @@ func FetchUserPodcastEpisodes(ctx context.Context, client *http.Client, podcastU
 	}
 	// This endpoint returns all episodes at once — no additional pages.
 	return out, false, nil
+}
+
+// SyncEpisodeState is one episode record returned by /user/sync/update.
+// Unlike most PC API responses it carries only play state — not episode
+// metadata (title, published date). Callers join with per-podcast episode
+// lists to get the full picture.
+type SyncEpisodeState struct {
+	EpisodeUUID   string
+	PodcastUUID   string
+	PlayingStatus int   // 1=unplayed, 2=in_progress, 3=played
+	PlayedUpTo    int64 // seconds
+}
+
+// FetchSyncUpdate fetches the complete episode play-state index from the
+// Pocket Casts sync service using the same protobuf endpoint the mobile apps
+// use. lastModified should be 0 for a full sync, or the value returned by a
+// prior call for an incremental (delta) sync.
+//
+// Wire protocol: POST /user/sync/update with Content-Type application/octet-stream.
+// Proto schema: sync_api.proto in github.com/Automattic/pocket-casts-android.
+func FetchSyncUpdate(ctx context.Context, client *http.Client, lastModified int64) ([]SyncEpisodeState, int64, error) {
+	reqBody := encodeSyncUpdateRequest(lastModified)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		pcBaseURL+"/user/sync/update", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, 0, fmt.Errorf("pocketcasts/web: build sync-update request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, &TransientError{cause: fmt.Errorf("pocketcasts/web: POST /user/sync/update: %w", err)}
+	}
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, 0, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+	}
+	if resp.StatusCode >= 500 {
+		return nil, 0, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/sync/update returned HTTP %d", resp.StatusCode)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, fmt.Errorf("pocketcasts/web: /user/sync/update returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(respBody))
+	}
+
+	return decodeSyncUpdateResponse(respBody)
+}
+
+// encodeSyncUpdateRequest encodes a SyncUpdateRequest proto message.
+//
+// SyncUpdateRequest { int64 device_utc_time_ms=1; int64 last_modified=2; string device_id=4; repeated Record records=5; }
+// We send the current time, the caller's lastModified, and an empty records
+// list (read-only — no local changes to push).
+func encodeSyncUpdateRequest(lastModified int64) []byte {
+	var b []byte
+	b = protowire.AppendTag(b, 1, protowire.VarintType)
+	b = protowire.AppendVarint(b, uint64(time.Now().UnixMilli()))
+	b = protowire.AppendTag(b, 2, protowire.VarintType)
+	b = protowire.AppendVarint(b, uint64(lastModified))
+	// field 5 (records) omitted — empty repeated field is valid proto3
+	return b
+}
+
+// decodeSyncUpdateResponse parses a protobuf SyncUpdateResponse.
+//
+// SyncUpdateResponse { int64 last_modified=1; repeated Record records=2; }
+// Record { oneof { SyncUserPodcast podcast=1; SyncUserEpisode episode=2; ... } }
+// SyncUserEpisode {
+//   string uuid=1; string podcast_uuid=2;
+//   Int32Value playing_status=7; Int64Value played_up_to=9;
+// }
+func decodeSyncUpdateResponse(b []byte) ([]SyncEpisodeState, int64, error) {
+	var lastModified int64
+	var episodes []SyncEpisodeState
+
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return nil, 0, fmt.Errorf("pocketcasts/web: malformed sync-update response (tag)")
+		}
+		b = b[n:]
+
+		switch {
+		case num == 1 && typ == protowire.VarintType:
+			v, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return nil, 0, fmt.Errorf("pocketcasts/web: malformed sync-update last_modified")
+			}
+			lastModified = int64(v)
+			b = b[n:]
+
+		case num == 2 && typ == protowire.BytesType:
+			rec, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return nil, 0, fmt.Errorf("pocketcasts/web: malformed sync-update record")
+			}
+			b = b[n:]
+			if ep, ok := decodeSyncRecord(rec); ok {
+				episodes = append(episodes, ep)
+			}
+
+		default:
+			n := protowire.ConsumeFieldValue(num, typ, b)
+			if n < 0 {
+				return nil, 0, fmt.Errorf("pocketcasts/web: malformed sync-update response (field)")
+			}
+			b = b[n:]
+		}
+	}
+	return episodes, lastModified, nil
+}
+
+// decodeSyncRecord extracts a SyncUserEpisode from a Record oneof message.
+// Returns false if the record contains no episode field (podcast, playlist, etc.).
+func decodeSyncRecord(b []byte) (SyncEpisodeState, bool) {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return SyncEpisodeState{}, false
+		}
+		b = b[n:]
+		if num == 2 && typ == protowire.BytesType {
+			epBytes, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return SyncEpisodeState{}, false
+			}
+			return decodeSyncUserEpisode(epBytes), true
+		}
+		n = protowire.ConsumeFieldValue(num, typ, b)
+		if n < 0 {
+			return SyncEpisodeState{}, false
+		}
+		b = b[n:]
+	}
+	return SyncEpisodeState{}, false
+}
+
+// decodeSyncUserEpisode parses a SyncUserEpisode proto message.
+func decodeSyncUserEpisode(b []byte) SyncEpisodeState {
+	var ep SyncEpisodeState
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			break
+		}
+		b = b[n:]
+		switch {
+		case num == 1 && typ == protowire.BytesType:
+			s, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return ep
+			}
+			ep.EpisodeUUID = string(s)
+			b = b[n:]
+		case num == 2 && typ == protowire.BytesType:
+			s, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return ep
+			}
+			ep.PodcastUUID = string(s)
+			b = b[n:]
+		case num == 7 && typ == protowire.BytesType: // Int32Value playing_status
+			wv, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return ep
+			}
+			b = b[n:]
+			ep.PlayingStatus = int(decodeVarintWrapper(wv))
+		case num == 9 && typ == protowire.BytesType: // Int64Value played_up_to
+			wv, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return ep
+			}
+			b = b[n:]
+			ep.PlayedUpTo = int64(decodeVarintWrapper(wv))
+		default:
+			n := protowire.ConsumeFieldValue(num, typ, b)
+			if n < 0 {
+				return ep
+			}
+			b = b[n:]
+		}
+	}
+	return ep
+}
+
+// decodeVarintWrapper parses a google.protobuf.Int32Value or Int64Value —
+// a message containing a single varint at field 1.
+func decodeVarintWrapper(b []byte) uint64 {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return 0
+		}
+		b = b[n:]
+		if num == 1 && typ == protowire.VarintType {
+			v, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return 0
+			}
+			return v
+		}
+		n = protowire.ConsumeFieldValue(num, typ, b)
+		if n < 0 {
+			return 0
+		}
+		b = b[n:]
+	}
+	return 0
 }
 
 // UpdateEpisodeProgress sets the playback position and status for an episode.

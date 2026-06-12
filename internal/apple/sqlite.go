@@ -156,6 +156,29 @@ func cleanFeedURL(rawURL string) string {
 	return strings.TrimSuffix(result, "?")
 }
 
+// columnExists reports whether the named column is present in a table.
+// Used to probe for columns that may have been renamed or removed across OS versions.
+// Returns false on any error (treated as absent — caller falls back gracefully).
+func columnExists(ctx context.Context, db *sql.DB, table, column string) bool {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return false
+		}
+		if strings.EqualFold(name, column) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.EpisodeState, int, error) {
 	// When a since-time is set, only episodes whose ZPLAYSTATELASTMODIFIEDDATE
 	// is after the cutoff are returned. The cutoff is converted to CoreData
@@ -167,6 +190,16 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		sinceClause = "\n\t\t  AND e.ZPLAYSTATELASTMODIFIEDDATE > ?"
 		sinceArgs = append(sinceArgs, sinceSecs)
 	}
+
+	// ZDURATION was removed in macOS 27. Probe once and fall back to NULL so
+	// the rest of the query and scan logic is unchanged — duration is optional
+	// metadata (used for PC progress writes) and its absence is non-fatal.
+	durationExpr := "e.ZDURATION"
+	if !columnExists(ctx, db, "ZMTEPISODE", "ZDURATION") {
+		durationExpr = "NULL"
+		fmt.Printf("apple: ZMTEPISODE.ZDURATION column not found — episode durations will not be populated (macOS schema change)\n")
+	}
+
 	// Fetch all episodes with any evidence of having been played. Apple Podcasts
 	// uses several fields to track play history — no single column is authoritative:
 	//
@@ -190,7 +223,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			p.ZFEEDURL,
 			e.ZTITLE,
 			e.ZPUBDATE,
-			e.ZDURATION,
+			` + durationExpr + `,
 			e.ZPLAYHEAD,
 			e.ZLASTDATEPLAYED,
 			e.ZPLAYSTATE,
@@ -295,14 +328,18 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			// ZPLAYSTATE=1 (in-progress) without a stored playhead — app explicitly
 			// set the episode as started; treat as played rather than silently dropping.
 			ep.PlayState = model.PlayStatePlayed
-		case playCount.Valid && playCount.Int64 > 0:
-			// Played at least once (possibly on another device before iCloud sync
-			// back-filled ZPLAYSTATE). Rare with modern sync but kept as a fallback.
+		case playCount.Valid && playCount.Int64 > 0 && playStateSource.Int64 == 0:
+			// Played on another device and iCloud synced ZPLAYCOUNT but not
+			// ZPLAYSTATE or ZPLAYSTATESOURCE (both remain at default 0).
+			// Requiring source==0 excludes episodes where the user manually marked as
+			// unplayed: those retain ZPLAYSTATESOURCE from the original play event
+			// (e.g. 3=completion, 1=manual), so source != 0 after an unplay action.
 			ep.PlayState = model.PlayStatePlayed
 		case lastPlayedRaw.Valid &&
 			playStateSource.Int64 != 0 &&
 			playStateSource.Int64 != 2 &&
-			playStateSource.Int64 != 6:
+			playStateSource.Int64 != 6 &&
+			(!playCount.Valid || playCount.Int64 == 0):
 			// ZLASTDATEPLAYED is set and ZPLAYSTATESOURCE carries a non-auto value
 			// (1=manual, 3=completion, 4=device-sync, or similar).
 			// This pattern occurs when an episode was played on another device (e.g.
@@ -311,6 +348,10 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			// ZPLAYSTATESOURCE=0 (unset/default) is excluded: Apple also sets
 			// ZLASTDATEPLAYED for non-user events such as background downloads and
 			// iCloud metadata refreshes, leaving ZPLAYSTATESOURCE at 0.
+			// ZPLAYCOUNT>0 is also excluded: combined with a non-zero source, that
+			// residual count is indistinguishable from an episode the user listened to
+			// and then manually marked as unplayed (ZPLAYSTATE reset to 0, but count
+			// and source retained from the original play event).
 			ep.PlayState = model.PlayStatePlayed
 		default:
 			// No reliable evidence of genuine playback; skip this episode.

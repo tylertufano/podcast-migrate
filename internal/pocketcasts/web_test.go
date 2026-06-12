@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/pocketcasts"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // newTestServer creates an httptest.Server with the given mux, points
@@ -66,8 +68,8 @@ func TestLogin_Success(t *testing.T) {
 			Scope    string `json:"scope"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body.Scope != "webplayer" {
-			t.Errorf("Login: scope = %q, want webplayer", body.Scope)
+		if body.Scope != "mobile" {
+			t.Errorf("Login: scope = %q, want mobile", body.Scope)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"token":"tok123","uuid":"user-1"}`))
@@ -215,16 +217,16 @@ func TestFetchInProgressEpisodes_ReturnsEpisodes(t *testing.T) {
 		payload := map[string]any{
 			"episodes": []map[string]any{
 				{
-					"uuid":           "ep-uuid-1",
-					"podcast_uuid":   "pod1",
-					"title":          "Episode One",
-					"url":            "https://cdn.example.com/ep1.mp3",
-					"published_at":   "2024-03-15T10:00:00Z",
-					"duration":       3600,
-					"playing_status": 2,
-					"played_up_to":   900,
-					"starred":        false,
-					"is_deleted":     false,
+					"uuid":          "ep-uuid-1",
+					"podcastUuid":   "pod1",
+					"title":         "Episode One",
+					"url":           "https://cdn.example.com/ep1.mp3",
+					"published":     "2024-03-15T10:00:00Z",
+					"duration":      3600,
+					"playingStatus": 2,
+					"playedUpTo":    900,
+					"starred":       false,
+					"isDeleted":     false,
 				},
 			},
 		}
@@ -714,6 +716,189 @@ func TestSubscribePodcast_RateLimit(t *testing.T) {
 	if rl.Wait != 45*time.Second {
 		t.Errorf("Wait = %v, want 45s", rl.Wait)
 	}
+}
+
+// ---- FetchSyncUpdate ----
+
+func TestFetchSyncUpdate_ReturnsEpisodes(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/sync/update", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/octet-stream" {
+			t.Errorf("Content-Type = %q, want application/octet-stream", ct)
+		}
+		resp := buildWebTestSyncResponse(42000, []pocketcasts.SyncEpisodeState{
+			{EpisodeUUID: "ep-1", PodcastUUID: "pod-a", PlayingStatus: pocketcasts.PlayingPlayed, PlayedUpTo: 3600},
+			{EpisodeUUID: "ep-2", PodcastUUID: "pod-a", PlayingStatus: pocketcasts.PlayingInProgress, PlayedUpTo: 900},
+		})
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(resp)
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	client := authedClient(t)
+	eps, lastMod, err := pocketcasts.FetchSyncUpdate(context.Background(), client, 0)
+	if err != nil {
+		t.Fatalf("FetchSyncUpdate: %v", err)
+	}
+
+	if lastMod != 42000 {
+		t.Errorf("lastModified = %d, want 42000", lastMod)
+	}
+	if len(eps) != 2 {
+		t.Fatalf("len(episodes) = %d, want 2", len(eps))
+	}
+
+	ep1 := eps[0]
+	if ep1.EpisodeUUID != "ep-1" {
+		t.Errorf("ep[0].EpisodeUUID = %q, want ep-1", ep1.EpisodeUUID)
+	}
+	if ep1.PodcastUUID != "pod-a" {
+		t.Errorf("ep[0].PodcastUUID = %q, want pod-a", ep1.PodcastUUID)
+	}
+	if ep1.PlayingStatus != pocketcasts.PlayingPlayed {
+		t.Errorf("ep[0].PlayingStatus = %d, want %d (played)", ep1.PlayingStatus, pocketcasts.PlayingPlayed)
+	}
+	if ep1.PlayedUpTo != 3600 {
+		t.Errorf("ep[0].PlayedUpTo = %d, want 3600", ep1.PlayedUpTo)
+	}
+
+	ep2 := eps[1]
+	if ep2.PlayingStatus != pocketcasts.PlayingInProgress {
+		t.Errorf("ep[1].PlayingStatus = %d, want %d (in-progress)", ep2.PlayingStatus, pocketcasts.PlayingInProgress)
+	}
+	if ep2.PlayedUpTo != 900 {
+		t.Errorf("ep[1].PlayedUpTo = %d, want 900", ep2.PlayedUpTo)
+	}
+}
+
+func TestFetchSyncUpdate_EmptyResponse(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/sync/update", func(w http.ResponseWriter, r *http.Request) {
+		resp := buildWebTestSyncResponse(0, nil)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(resp)
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	client := authedClient(t)
+	eps, _, err := pocketcasts.FetchSyncUpdate(context.Background(), client, 0)
+	if err != nil {
+		t.Fatalf("FetchSyncUpdate: %v", err)
+	}
+	if len(eps) != 0 {
+		t.Errorf("len(episodes) = %d, want 0", len(eps))
+	}
+}
+
+func TestFetchSyncUpdate_ServerError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/sync/update", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	client := authedClient(t)
+	_, _, err := pocketcasts.FetchSyncUpdate(context.Background(), client, 0)
+	if err == nil {
+		t.Fatal("expected error from 500 response, got nil")
+	}
+}
+
+func TestFetchSyncUpdate_DeltaSync_SendsLastModified(t *testing.T) {
+	var receivedLastMod int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/login", loginHandler)
+	mux.HandleFunc("/user/sync/update", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		// Parse field 2 (last_modified) from the request body.
+		for len(body) > 0 {
+			num, typ, n := protowire.ConsumeTag(body)
+			body = body[n:]
+			if typ == protowire.VarintType {
+				v, n2 := protowire.ConsumeVarint(body)
+				body = body[n2:]
+				if num == 2 {
+					receivedLastMod = int64(v)
+				}
+			} else {
+				_, n2 := protowire.ConsumeBytes(body)
+				if n2 < 0 {
+					break
+				}
+				body = body[n2:]
+			}
+		}
+		resp := buildWebTestSyncResponse(99999, nil)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(resp)
+	})
+	restore := newTestServer(t, mux)
+	defer restore()
+
+	client := authedClient(t)
+	_, _, err := pocketcasts.FetchSyncUpdate(context.Background(), client, 12345)
+	if err != nil {
+		t.Fatalf("FetchSyncUpdate: %v", err)
+	}
+	if receivedLastMod != 12345 {
+		t.Errorf("last_modified in request = %d, want 12345", receivedLastMod)
+	}
+}
+
+// buildWebTestSyncResponse builds a minimal SyncUpdateResponse binary for use
+// in web tests. Mirrors the helper in provider_test.go but scoped locally to
+// avoid cross-file helper duplication.
+func buildWebTestSyncResponse(lastModified int64, episodes []pocketcasts.SyncEpisodeState) []byte {
+	var b []byte
+	if lastModified != 0 {
+		b = protowire.AppendTag(b, 1, protowire.VarintType)
+		b = protowire.AppendVarint(b, uint64(lastModified))
+	}
+	for _, ep := range episodes {
+		epMsg := buildWebTestSyncUserEpisode(ep)
+		var rec []byte
+		rec = protowire.AppendTag(rec, 2, protowire.BytesType)
+		rec = protowire.AppendBytes(rec, epMsg)
+		b = protowire.AppendTag(b, 2, protowire.BytesType)
+		b = protowire.AppendBytes(b, rec)
+	}
+	return b
+}
+
+func buildWebTestSyncUserEpisode(ep pocketcasts.SyncEpisodeState) []byte {
+	var b []byte
+	if ep.EpisodeUUID != "" {
+		b = protowire.AppendTag(b, 1, protowire.BytesType)
+		b = protowire.AppendBytes(b, []byte(ep.EpisodeUUID))
+	}
+	if ep.PodcastUUID != "" {
+		b = protowire.AppendTag(b, 2, protowire.BytesType)
+		b = protowire.AppendBytes(b, []byte(ep.PodcastUUID))
+	}
+	if ep.PlayingStatus != 0 {
+		var w []byte
+		w = protowire.AppendTag(w, 1, protowire.VarintType)
+		w = protowire.AppendVarint(w, uint64(ep.PlayingStatus))
+		b = protowire.AppendTag(b, 7, protowire.BytesType)
+		b = protowire.AppendBytes(b, w)
+	}
+	if ep.PlayedUpTo != 0 {
+		var w []byte
+		w = protowire.AppendTag(w, 1, protowire.VarintType)
+		w = protowire.AppendVarint(w, uint64(ep.PlayedUpTo))
+		b = protowire.AppendTag(b, 9, protowire.BytesType)
+		b = protowire.AppendBytes(b, w)
+	}
+	return b
 }
 
 // ---- helpers ----

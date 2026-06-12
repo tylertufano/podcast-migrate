@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tyler/podcast-migrate/internal/apple"
 	"github.com/tyler/podcast-migrate/internal/migrate"
+	"github.com/tyler/podcast-migrate/internal/opml"
 	"github.com/tyler/podcast-migrate/internal/overcast"
 	"github.com/tyler/podcast-migrate/internal/pocketcasts"
 	"github.com/tyler/podcast-migrate/internal/provider"
@@ -46,9 +47,12 @@ func migrateCmd() *cobra.Command {
 		episodeCacheMaxAge  time.Duration // --episode-cache-max-age
 		clearEpisodeCache   bool          // --clear-episode-cache
 		sinceStr            string        // --since (delta sync cutoff)
-		pocketcastsEmail    string        // --pocketcasts-email / POCKETCASTS_EMAIL
-		pocketcastsPassword string        // --pocketcasts-password / POCKETCASTS_PASSWORD
-		feedMapPairs        []string      // --feed-map (repeatable, "SRC_URL=DST_URL")
+		pocketcastsEmail        string   // --pocketcasts-email / POCKETCASTS_EMAIL
+		pocketcastsPassword     string   // --pocketcasts-password / POCKETCASTS_PASSWORD
+		pcIncludeUnsubscribed   bool     // --pc-include-unsubscribed
+		feedMapPairs            []string // --feed-map (repeatable, "SRC_URL=DST_URL")
+		opmlFile            string        // --opml-file (source OPML path when --from opml)
+		opmlOut             string        // --opml-out (output OPML path when --to opml)
 	)
 
 	cmd := &cobra.Command{
@@ -148,9 +152,17 @@ func migrateCmd() *cobra.Command {
 				return err
 			}
 
-			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", "", "", pocketcastsEmail, pocketcastsPassword)
+			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", "", "", pocketcastsEmail, pocketcastsPassword, opmlFile, "")
 			if err != nil {
 				return fmt.Errorf("source: %w", err)
+			}
+
+			// --pc-include-unsubscribed: include play history for podcasts the user is
+			// no longer subscribed to in Pocket Casts (off by default).
+			if pcIncludeUnsubscribed {
+				if pcProv, ok := src.(*pocketcasts.Provider); ok {
+					pcProv.IncludeUnsubscribed = true
+				}
 			}
 
 			// --since: limit the Apple source to episodes modified after the cutoff.
@@ -168,7 +180,7 @@ func migrateCmd() *cobra.Command {
 			}
 			// Pass sqlitePath and opmlFallback for the destination too — needed when
 			// the destination is Apple Podcasts (reverse sync: overcast → podcasts).
-			dst, err := buildProvider(to, sqlitePath, opmlFallback, overcastSourceOPML, overcastOut, overcastEmail, overcastPassword, pocketcastsEmail, pocketcastsPassword)
+			dst, err := buildProvider(to, sqlitePath, opmlFallback, overcastSourceOPML, overcastOut, overcastEmail, overcastPassword, pocketcastsEmail, pocketcastsPassword, "", opmlOut)
 			if err != nil {
 				return fmt.Errorf("destination: %w", err)
 			}
@@ -287,6 +299,9 @@ func migrateCmd() *cobra.Command {
 		"Pocket Casts account email (or set POCKETCASTS_EMAIL env var)")
 	cmd.Flags().StringVar(&pocketcastsPassword, "pocketcasts-password", "",
 		"Pocket Casts account password (or set POCKETCASTS_PASSWORD env var)")
+	cmd.Flags().BoolVar(&pcIncludeUnsubscribed, "pc-include-unsubscribed", false,
+		"when --from pocketcasts: also export play history for podcasts no longer subscribed to;\n"+
+			"the feed URL is recovered via the Pocket Casts CDN or iTunes Search API")
 	cmd.Flags().StringArrayVar(&feedMapPairs, "feed-map", nil,
 		"map a source subscriber feed URL to a destination analog feed URL\n"+
 			"(format: SRC_URL=DST_URL; repeatable). Use when you have already\n"+
@@ -295,6 +310,14 @@ func migrateCmd() *cobra.Command {
 			"from SRC_URL are matched against DST_URL instead of the public feed,\n"+
 			"without requiring --subscribed-only.\n"+
 			"Example: --feed-map 'https://private.apple.feed/abc=https://private.target.feed/xyz'")
+	cmd.Flags().StringVar(&opmlFile, "opml-file", "",
+		"path to source OPML file (required when --from opml);\n"+
+			"supports standard OPML (subscriptions) and extended OPML with episode play state\n"+
+			"(compatible with Overcast extended export from overcast.fm/account/export_opml/extended)")
+	cmd.Flags().StringVar(&opmlOut, "opml-out", "",
+		"path for the generated OPML output file (required when --to opml);\n"+
+			"writes extended OPML with episode play state when --play-state is set,\n"+
+			"subscriptions only otherwise (compatible with any standard OPML importer)")
 
 	_ = cmd.MarkFlagRequired("from")
 	_ = cmd.MarkFlagRequired("to")
@@ -363,7 +386,7 @@ func buildFeedMap(pairs []string) (map[string]string, error) {
 	return m, nil
 }
 
-func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, overcastEmail, overcastPassword, pcEmail, pcPassword string) (provider.Provider, error) {
+func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, overcastEmail, overcastPassword, pcEmail, pcPassword, opmlSourceFile, opmlOutputFile string) (provider.Provider, error) {
 	switch name {
 	case "podcasts", "apple":
 		return apple.NewProvider(sqlitePath, opmlFallback), nil
@@ -380,8 +403,18 @@ func buildProvider(name, sqlitePath, opmlFallback, overcastImport, overcastOut, 
 			return nil, fmt.Errorf("pocketcasts requires credentials: set POCKETCASTS_EMAIL and POCKETCASTS_PASSWORD, or use --pocketcasts-email / --pocketcasts-password")
 		}
 		return pocketcasts.NewProvider(pcEmail, pcPassword), nil
+	case "opml":
+		if opmlSourceFile != "" {
+			return opml.NewSourceProvider(opmlSourceFile), nil
+		}
+		if opmlOutputFile != "" {
+			// Extended OPML (with play state) is always written; SetLibrary respects
+			// opts.OnlySubscriptions to omit episode outlines when not migrating play state.
+			return opml.NewOutputProvider(opmlOutputFile, true), nil
+		}
+		return nil, fmt.Errorf("opml requires --opml-file (source) or --opml-out (destination)")
 	default:
-		return nil, fmt.Errorf("unknown provider %q (supported: podcasts, apple, overcast, pocketcasts)", name)
+		return nil, fmt.Errorf("unknown provider %q (supported: podcasts, apple, overcast, pocketcasts, opml)", name)
 	}
 }
 

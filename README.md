@@ -27,10 +27,9 @@ podcast-migrate reads your library directly from the source app's local data, me
 
 **Pocket Casts (source and destination)**
 
-- Reads subscriptions and in-progress episode play state via the Pocket Casts web API (authenticated with your account credentials)
+- Reads subscriptions, in-progress episodes, and play history via the Pocket Casts web API (authenticated with your account credentials). Play history covers the most-recently played episodes (server-capped at ~100 entries).
 - **Play state write** via the same unofficial web API the Pocket Casts web player uses — propagates to iPhone, Android, and all devices through Pocket Casts' own sync. Also automatically subscribes to any source podcast not yet in your Pocket Casts library before writing its episodes, so a full cross-app migration works in a single run. Use `--subscribed-only` to skip the subscribe step.
-- Two-phase episode matching: Phase A indexes in-progress episodes (fast); Phase B fetches per-podcast episode pages for any episodes not found in Phase A, handling episodes you've never started in Pocket Casts
-- **Phase 1 limitation:** `--from pocketcasts` returns only episodes currently in-progress. Fully played history requires a future Phase 2 release (see [Future work](#future-work))
+- Two-phase episode matching: Phase A indexes in-progress and recently-played episodes (fast); Phase B fetches per-podcast episode pages for any episodes not found in Phase A, handling episodes you've never started in Pocket Casts
 
 **Sync engine**
 
@@ -49,9 +48,9 @@ podcast-migrate reads your library directly from the source app's local data, me
 |---|:---:|:---:|:---:|:---:|
 | Apple Podcasts | ✅ | ✅ | — | ✅ (web API → syncs to all devices) |
 | Overcast | ✅ | ✅ | ✅ (OPML + auto on play-state write²) | ✅ (unofficial web API) |
-| Pocket Casts | ✅ | ✅ in-progress¹ | ✅ (auto on play-state write²) | ✅ (unofficial web API) |
+| Pocket Casts | ✅ | ✅ in-progress + recent history¹ | ✅ (auto on play-state write²) | ✅ (unofficial web API) |
 
-¹ Fully played history requires Phase 2 (see [Future work](#future-work)).  
+¹ Play history covers the most-recently played episodes (server-capped at ~100 entries). Older fully-played history is not available from the Pocket Casts API.  
 ² Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
 
 ## Installation
@@ -279,7 +278,7 @@ podcast-migrate migrate --from pocketcasts --to podcasts \
   --play-state
 ```
 
-See [Overcast → Apple Podcasts](#overcast--apple-podcasts-sync-play-state-to-iphone) for how to capture the Apple tokens (same one-time DevTools step). The Pocket Casts source provides in-progress episodes only (Phase 1); add fully played history once Phase 2 is available.
+See [Overcast → Apple Podcasts](#overcast--apple-podcasts-sync-play-state-to-iphone) for how to capture the Apple tokens (same one-time DevTools step). The Pocket Casts source provides in-progress episodes plus recently played history (server-capped at ~100 entries).
 
 ### Pocket Casts → Overcast (sync play state)
 
@@ -369,11 +368,8 @@ podcast-migrate import --to overcast \
 
 ## Future work
 
-### Pocket Casts — Phase 2
-The current Pocket Casts provider (Phase 1) has one known limitation: `--from pocketcasts` only surfaces episodes that are currently **in-progress**. Fully played history requires fetching `/user/history`, which returns the complete played list. Phase 2 will:
-
-- Fetch full play history so `--from pocketcasts` covers all played + in-progress episodes (not just the ones currently in progress)
-- Add `--since` support for the Pocket Casts source (delta sync)
+### Pocket Casts — full history
+`--from pocketcasts` now includes play history via `/user/history`, but the endpoint is server-capped at ~100 most-recently-played entries. Older fully-played episodes are not available from the API. A future enhancement could add `--since` support for the Pocket Casts source (the API does not expose play timestamps, so filtering would be limited to episode publish dates).
 
 ### Additional providers
 The `Provider` interface makes adding new services straightforward. Candidates:

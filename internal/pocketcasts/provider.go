@@ -25,17 +25,23 @@ const maxPhaseBPagesPerPodcast = 20
 
 // Provider implements provider.Provider for Pocket Casts.
 //
-// Reading:  fetches podcast subscriptions and in-progress episode play state
-//           from the Pocket Casts web API.
+// Reading:  fetches podcast subscriptions, in-progress episodes, and play
+//           history from the Pocket Casts web API.
 //
-// Writing:  writes episode play state via the same API.  Subscription writes
-//           are not yet implemented (Phase 2).
+// Writing:  writes episode play state via the same API.
 //
 // All operations require email and password credentials for the Pocket Casts
 // account. The unofficial web API is used — see web.go for details.
 type Provider struct {
 	email    string
 	password string
+
+	// IncludeUnsubscribed, when true, also exports play state for podcasts
+	// that appear in the PC sync history but are no longer subscribed to. The
+	// feed URL is recovered via the PC CDN or the iTunes Search API. Off by
+	// default — unsubscribed podcasts are intentionally excluded because the
+	// user may have left them, and including them could clutter a migration.
+	IncludeUnsubscribed bool
 }
 
 // NewProvider returns a Pocket Casts provider with the given credentials.
@@ -57,9 +63,11 @@ func (p *Provider) Capabilities() provider.Capabilities {
 // GetLibrary fetches the authenticated user's Pocket Casts library.
 //
 // Subscriptions: all subscribed podcasts with their RSS feed URLs.
-// Play state: currently-in-progress episodes only. Fully-played episodes are
-// not included in the read path (Phase 1 limitation — see Phase 2 plan for
-// full history support via the /user/history API).
+// Play state: complete — uses /user/sync/update (the same protobuf endpoint
+// the mobile apps use) to identify every podcast with play activity, then
+// fetches full episode metadata from /user/podcast/episodes for each of those
+// podcasts. Falls back to /user/in_progress + /user/history if the sync
+// endpoint is unavailable.
 func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 	fmt.Printf("pocketcasts: authenticating as %s...\n", p.email)
 	client, err := Login(ctx, p.email, p.password)
@@ -73,57 +81,215 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 		return nil, fmt.Errorf("pocketcasts: fetch subscriptions: %w", err)
 	}
 
-	// Build podUUID → feedURL map for episode join.
+	// Batch-resolve feed URLs for any podcast the subscription list returned
+	// without one. /user/podcast/list omits URLs for private/subscriber feeds
+	// (isPrivate:true) and some public feeds (webFeed:false). The export
+	// endpoint uses the same URL the user originally subscribed with, so it
+	// returns subscriber URLs (e.g. Slate Plus, NPR Plus) as well as the
+	// public feed for webFeed:false podcasts.
+	var missingURLUUIDs []string
+	for _, ap := range apiPods {
+		if ap.UUID != "" && ap.URL == "" {
+			missingURLUUIDs = append(missingURLUUIDs, ap.UUID)
+		}
+	}
+	exportedURLs := make(map[string]string)
+	if len(missingURLUUIDs) > 0 {
+		fmt.Printf("pocketcasts: resolving feed URLs for %d podcast(s) via export service...\n", len(missingURLUUIDs))
+		var exportErr error
+		exportedURLs, exportErr = FetchExportFeedURLs(ctx, client, missingURLUUIDs)
+		if exportErr != nil {
+			fmt.Printf("pocketcasts: warning: export-feed-urls failed (%v) — affected podcasts will be skipped\n", exportErr)
+		}
+	}
+
 	podUUIDToFeedURL := make(map[string]string, len(apiPods))
 	var podcasts []model.Podcast
 	for _, ap := range apiPods {
-		if ap.UUID == "" || ap.URL == "" {
+		if ap.UUID == "" {
 			continue
 		}
-		podUUIDToFeedURL[ap.UUID] = ap.URL
+		feedURL := ap.URL
+		if feedURL == "" {
+			feedURL = exportedURLs[ap.UUID]
+		}
+		if feedURL == "" {
+			fmt.Printf("pocketcasts: warning: no feed URL found for %q — skipping\n", ap.Title)
+			continue
+		}
+		podUUIDToFeedURL[ap.UUID] = feedURL
 		podcasts = append(podcasts, model.Podcast{
-			FeedURL: ap.URL,
+			FeedURL: feedURL,
 			Title:   ap.Title,
 			Author:  ap.Author,
 		})
 	}
 	fmt.Printf("pocketcasts: %d subscribed podcast(s)\n", len(podcasts))
 
-	fmt.Printf("pocketcasts: fetching in-progress episodes...\n")
-	inProgress, err := FetchInProgressEpisodes(ctx, client)
-	if err != nil {
-		// Non-fatal: log and continue with an empty episode list.
-		fmt.Printf("pocketcasts: warning: could not fetch in-progress episodes (%v)\n", err)
-		inProgress = nil
+	// seenUUIDs prevents duplicates across all episode sources.
+	seenUUIDs := make(map[string]bool)
+	var episodes []model.EpisodeState
+
+	// Primary path: use /user/sync/update to get the complete play-state index,
+	// then fetch full episode metadata only for the podcasts that have play activity.
+	// lastModified=1 is used (not 0) because PC treats lastModified=0 as "initial
+	// setup sync" and returns only ~2500 recent entries; lastModified=1 triggers
+	// the full incremental path and returns all stored play history.
+	fmt.Printf("pocketcasts: fetching full sync state...\n")
+	syncEps, _, syncErr := FetchSyncUpdate(ctx, client, 1)
+	if syncErr != nil {
+		fmt.Printf("pocketcasts: warning: sync/update failed (%v) — falling back to in_progress + history\n", syncErr)
 	}
 
-	var episodes []model.EpisodeState
-	for _, ep := range inProgress {
-		feedURL := podUUIDToFeedURL[ep.PodcastUUID]
-		if feedURL == "" || ep.IsDeleted {
-			continue
+	if syncErr == nil {
+		// Collect unique podcast UUIDs that have played or in-progress episodes.
+		activePodcasts := make(map[string]bool)
+		for _, se := range syncEps {
+			if se.PlayingStatus == PlayingPlayed || se.PlayingStatus == PlayingInProgress {
+				activePodcasts[se.PodcastUUID] = true
+			}
 		}
-		es := model.EpisodeState{
-			FeedURL: feedURL,
-			Title:   ep.Title,
-			PubDate: ep.ParsePublishedAt(),
+		fmt.Printf("pocketcasts: sync/update: %d episode(s) with play state across %d podcast(s)\n",
+			len(syncEps), len(activePodcasts))
+
+		// Build a UUID → SyncEpisodeState lookup for play-state overlay.
+		syncByUUID := make(map[string]SyncEpisodeState, len(syncEps))
+		for _, se := range syncEps {
+			syncByUUID[se.EpisodeUUID] = se
 		}
-		if ep.Duration > 0 {
-			es.Duration = time.Duration(ep.Duration) * time.Second
+
+		// Fetch CDN episode metadata (title, pub date, UUID) for each active
+		// podcast. /user/podcast/episodes does not return titles; the CDN endpoint
+		// does. We overlay play state from the sync map onto each CDN episode.
+		fetched := 0
+		skippedUnsubscribed := 0
+		for podUUID := range activePodcasts {
+			feedURL := podUUIDToFeedURL[podUUID]
+			if feedURL == "" {
+				// Podcast is in sync state but not in subscription list (or
+				// subscription has no URL). Only attempt recovery when
+				// IncludeUnsubscribed is set; otherwise skip silently and count.
+				if !p.IncludeUnsubscribed {
+					skippedUnsubscribed++
+					continue
+				}
+				podTitle, cdnURL, metaErr := FetchPodcastMeta(ctx, client, podUUID)
+				if metaErr == nil && cdnURL != "" {
+					feedURL = cdnURL
+				} else if metaErr == nil && podTitle != "" {
+					feedURL, _ = LookupFeedURL(ctx, podTitle, "")
+				}
+				if feedURL == "" {
+					if podTitle != "" {
+						fmt.Printf("pocketcasts: warning: no feed URL found for %q (%s) — play state skipped\n", podTitle, podUUID)
+					} else {
+						fmt.Printf("pocketcasts: warning: no feed URL found for podcast %s — play state skipped\n", podUUID)
+					}
+					continue
+				}
+				podUUIDToFeedURL[podUUID] = feedURL
+				// Add as a podcast entry so it appears in the subscription list.
+				if podTitle == "" {
+					podTitle, _, _ = FetchPodcastMeta(ctx, client, podUUID)
+				}
+				podcasts = append(podcasts, model.Podcast{FeedURL: feedURL, Title: podTitle})
+				fmt.Printf("pocketcasts: recovered feed URL for unsubscribed podcast %q via CDN/iTunes\n", podTitle)
+				time.Sleep(DefaultRequestDelay)
+			}
+			for page := 0; ; page++ {
+				pageEps, hasMore, err := FetchPodcastEpisodes(ctx, client, podUUID, page)
+				if err != nil {
+					fmt.Printf("  warning: could not fetch CDN episodes for podcast %s (page %d): %v\n", podUUID, page, err)
+					break
+				}
+				for _, ep := range pageEps {
+					if seenUUIDs[ep.UUID] || ep.IsDeleted {
+						continue
+					}
+					se, ok := syncByUUID[ep.UUID]
+					if !ok {
+						continue // not interacted with
+					}
+					switch se.PlayingStatus {
+					case PlayingPlayed, PlayingInProgress:
+					default:
+						continue
+					}
+					es := model.EpisodeState{
+						FeedURL: feedURL,
+						Title:   ep.Title,
+						PubDate: ep.ParsePublishedAt(),
+					}
+					if ep.Duration > 0 {
+						es.Duration = time.Duration(ep.Duration) * time.Second
+					}
+					if se.PlayingStatus == PlayingInProgress {
+						es.PlayState = model.PlayStateInProgress
+						es.PlayPosition = time.Duration(se.PlayedUpTo) * time.Second
+					} else {
+						es.PlayState = model.PlayStatePlayed
+					}
+					seenUUIDs[ep.UUID] = true
+					episodes = append(episodes, es)
+					fetched++
+				}
+				if !hasMore {
+					break
+				}
+				time.Sleep(DefaultRequestDelay)
+			}
+			time.Sleep(DefaultRequestDelay)
 		}
-		switch ep.PlayingStatus {
-		case PlayingPlayed:
-			es.PlayState = model.PlayStatePlayed
-		case PlayingInProgress:
-			es.PlayState = model.PlayStateInProgress
-			es.PlayPosition = time.Duration(ep.PlayedUpTo) * time.Second
-		default:
-			// Unplayed episodes from the in-progress list are unusual but skip them.
-			continue
+		if skippedUnsubscribed > 0 {
+			fmt.Printf("pocketcasts: skipped %d unsubscribed podcast(s) with play history (use --pc-include-unsubscribed to include)\n", skippedUnsubscribed)
 		}
-		episodes = append(episodes, es)
+		fmt.Printf("pocketcasts: %d episode(s) read (complete history via sync/update)\n", fetched)
+	} else {
+		// Fallback: /user/in_progress + /user/history (capped at ~100 played).
+		fmt.Printf("pocketcasts: fetching in-progress episodes...\n")
+		inProgress, err := FetchInProgressEpisodes(ctx, client)
+		if err != nil {
+			fmt.Printf("pocketcasts: warning: could not fetch in-progress episodes (%v)\n", err)
+		}
+		for _, ep := range inProgress {
+			feedURL := podUUIDToFeedURL[ep.PodcastUUID]
+			if feedURL == "" || ep.IsDeleted {
+				continue
+			}
+			es := episodeStateFromAPI(&ep, feedURL)
+			if es == nil {
+				continue
+			}
+			seenUUIDs[ep.UUID] = true
+			episodes = append(episodes, *es)
+		}
+		fmt.Printf("pocketcasts: %d in-progress episode(s) read\n", len(episodes))
+
+		time.Sleep(DefaultRequestDelay)
+		fmt.Printf("pocketcasts: fetching play history...\n")
+		played, err := FetchPlayedEpisodes(ctx, client)
+		if err != nil {
+			fmt.Printf("pocketcasts: warning: could not fetch play history (%v)\n", err)
+		}
+		playedAdded := 0
+		for _, ep := range played {
+			if seenUUIDs[ep.UUID] {
+				continue
+			}
+			feedURL := podUUIDToFeedURL[ep.PodcastUUID]
+			if feedURL == "" {
+				continue
+			}
+			es := episodeStateFromAPI(&ep, feedURL)
+			if es == nil {
+				continue
+			}
+			seenUUIDs[ep.UUID] = true
+			episodes = append(episodes, *es)
+			playedAdded++
+		}
+		fmt.Printf("pocketcasts: %d played episode(s) read from history (capped ~100)\n", playedAdded)
 	}
-	fmt.Printf("pocketcasts: %d in-progress episode(s) read\n", len(episodes))
 
 	return &model.Library{
 		Podcasts:       podcasts,
@@ -131,6 +297,29 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 		ExportedAt:     time.Now(),
 		SourceProvider: "Pocket Casts",
 	}, nil
+}
+
+// episodeStateFromAPI converts an APIEpisode to a model.EpisodeState.
+// Returns nil if the episode has no played/in-progress state.
+func episodeStateFromAPI(ep *APIEpisode, feedURL string) *model.EpisodeState {
+	es := &model.EpisodeState{
+		FeedURL: feedURL,
+		Title:   ep.Title,
+		PubDate: ep.ParsePublishedAt(),
+	}
+	if ep.Duration > 0 {
+		es.Duration = time.Duration(ep.Duration) * time.Second
+	}
+	switch ep.PlayingStatus {
+	case PlayingPlayed:
+		es.PlayState = model.PlayStatePlayed
+	case PlayingInProgress:
+		es.PlayState = model.PlayStateInProgress
+		es.PlayPosition = time.Duration(ep.PlayedUpTo) * time.Second
+	default:
+		return nil
+	}
+	return es
 }
 
 // SetLibrary writes subscriptions and/or episode play state to Pocket Casts.
@@ -395,6 +584,24 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	}
 	time.Sleep(requestDelay)
 
+	// Batch-resolve feed URLs missing from the subscription list (same logic as
+	// GetLibrary — see that function for the full rationale).
+	var missingURLUUIDs []string
+	for _, ap := range apiPods {
+		if ap.UUID != "" && ap.URL == "" {
+			missingURLUUIDs = append(missingURLUUIDs, ap.UUID)
+		}
+	}
+	exportedURLs := make(map[string]string)
+	if len(missingURLUUIDs) > 0 {
+		var exportErr error
+		exportedURLs, exportErr = FetchExportFeedURLs(ctx, client, missingURLUUIDs)
+		if exportErr != nil {
+			fmt.Printf("pocketcasts: warning: export-feed-urls failed (%v) — some feed URLs may be missing\n", exportErr)
+		}
+	}
+	time.Sleep(requestDelay)
+
 	// Build bidirectional feed URL ↔ podcast UUID maps.
 	podUUIDToFeedURL := make(map[string]string, len(apiPods))
 	normFeedToPodUUID := make(map[string]string, len(apiPods))
@@ -408,15 +615,24 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	// contains-match for subtitle differences ("Crooked City" ↔ "Crooked City: Dixon, IL").
 	fuzzyTitleToPodUUID := make(map[string]string, len(apiPods))
 	for _, ap := range apiPods {
-		if ap.UUID == "" || ap.URL == "" {
+		if ap.UUID == "" {
 			continue
 		}
-		podUUIDToFeedURL[ap.UUID] = ap.URL
-		norm := normalizeFeedURL(ap.URL)
-		if _, exists := normFeedToPodUUID[norm]; !exists {
-			normFeedToPodUUID[norm] = ap.UUID
-			normFeedToPodTitle[norm] = ap.Title
+		feedURL := ap.URL
+		if feedURL == "" {
+			feedURL = exportedURLs[ap.UUID]
 		}
+		// URL-based maps: only when a feed URL is known.
+		if feedURL != "" {
+			podUUIDToFeedURL[ap.UUID] = feedURL
+			norm := normalizeFeedURL(feedURL)
+			if _, exists := normFeedToPodUUID[norm]; !exists {
+				normFeedToPodUUID[norm] = ap.UUID
+				normFeedToPodTitle[norm] = ap.Title
+			}
+		}
+		// Title-based maps: always populate, even for podcasts still without a
+		// known URL — Phase B can still match by title in that case.
 		if normTitle := model.NormalizePlusTitle(ap.Title); normTitle != "" {
 			if _, exists := normTitleToPodUUID[normTitle]; !exists {
 				normTitleToPodUUID[normTitle] = ap.UUID
@@ -497,6 +713,27 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		}
 	}
 	fmt.Printf("pocketcasts: Phase A2: indexed %d recently-played episode(s)\n", phaseA2Added)
+
+	// --- Phase A_sync: full play-state overlay from /user/sync/update ---
+	//
+	// /user/sync/update is the protobuf endpoint used by Pocket Casts mobile apps.
+	// It returns ALL episodes PC has ever interacted with — not capped at ~100 like
+	// /user/history. We fetch it once here and use the resulting map as a play-state
+	// overlay when CDN-fetched episodes (Phase B Pass 2) would otherwise default to
+	// PlayingUnplayed.
+	// lastModified=1 (not 0): see GetLibrary for why 0 returns a truncated subset.
+	fmt.Printf("pocketcasts: fetching complete sync state for play-state overlay...\n")
+	syncStateByUUID := make(map[string]SyncEpisodeState)
+	syncEps, _, syncErr := FetchSyncUpdate(ctx, client, 1)
+	if syncErr != nil {
+		fmt.Printf("pocketcasts: warning: sync/update failed (%v) — CDN play-state overlay disabled\n", syncErr)
+	} else {
+		for _, se := range syncEps {
+			syncStateByUUID[se.EpisodeUUID] = se
+		}
+		fmt.Printf("pocketcasts: sync/update: %d episode(s) in play-state overlay\n", len(syncStateByUUID))
+	}
+	time.Sleep(requestDelay)
 
 	// --- Phase B: per-podcast episode fetch for unmatched source episodes ---
 	//
@@ -686,6 +923,12 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				for _, ep := range pageEps {
 					if indexFeedURL == "" || ep.IsDeleted {
 						continue
+					}
+					// Overlay accurate play state from sync/update. CDN episodes
+					// default to PlayingUnplayed; the sync state has the real values.
+					if se, ok := syncStateByUUID[ep.UUID]; ok {
+						ep.PlayingStatus = se.PlayingStatus
+						ep.PlayedUpTo = int(se.PlayedUpTo)
 					}
 					addToIndex(index, &ep, indexFeedURL, "B-cdn")
 				}

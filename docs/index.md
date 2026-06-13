@@ -56,9 +56,10 @@ export APPLE_MEDIA_USER_TOKEN="0.Apg..."
 
 ## Documentation
 
-- [Architecture](architecture.md) — system design, package layout, data flow
+- [Usage](usage.md) — step-by-step migration guides for every supported direction
 - [Commands](commands.md) — all CLI commands and their flags
 - [Providers](providers.md) — Apple Podcasts, Overcast, Pocket Casts, OPML adapters
+- [Architecture](architecture.md) — system design, package layout, data flow
 - [Episode Matching](episode-matching.md) — matching cascade, conflict resolution, feed mapping
 - [Testing](testing.md) — test suite overview, coverage gaps, and planned improvements
 

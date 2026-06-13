@@ -180,15 +180,34 @@ func columnExists(ctx context.Context, db *sql.DB, table, column string) bool {
 }
 
 func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.EpisodeState, int, error) {
-	// When a since-time is set, only episodes whose ZPLAYSTATELASTMODIFIEDDATE
-	// is after the cutoff are returned. The cutoff is converted to CoreData
+	// When a since-time is set, only episodes whose play-related timestamp columns
+	// are after the cutoff are returned. The cutoff is converted to CoreData
 	// epoch seconds (seconds since 2001-01-01 UTC).
+	//
+	// Three columns can reflect a recent listening event:
+	//   ZPLAYSTATELASTMODIFIEDDATE — updated when ZPLAYSTATE changes
+	//     (e.g. unplayed→in-progress, in-progress→played).
+	//   ZPLAYHEADLASTMODIFIEDDATE — updated whenever the playback position
+	//     advances. Critical for in-progress episodes resumed within the window
+	//     but first started earlier: ZPLAYSTATE doesn't change so
+	//     ZPLAYSTATELASTMODIFIEDDATE is stale, yet ZPLAYHEAD was updated.
+	//   ZLASTDATEPLAYED — set when an episode is completed or marked as played.
+	//
+	// We probe for ZPLAYHEADLASTMODIFIEDDATE because it was added in a later
+	// macOS version and may not be present on all installs.
 	var sinceArgs []any
 	sinceClause := ""
 	if !r.sinceTime.IsZero() {
 		sinceSecs := r.sinceTime.Sub(coreDataEpoch).Seconds()
-		sinceClause = "\n\t\t  AND e.ZPLAYSTATELASTMODIFIEDDATE > ?"
-		sinceArgs = append(sinceArgs, sinceSecs)
+		if columnExists(ctx, db, "ZMTEPISODE", "ZPLAYHEADLASTMODIFIEDDATE") {
+			sinceClause = "\n\t\t  AND (e.ZPLAYSTATELASTMODIFIEDDATE > ? OR e.ZPLAYHEADLASTMODIFIEDDATE > ? OR e.ZLASTDATEPLAYED > ?)"
+			sinceArgs = append(sinceArgs, sinceSecs, sinceSecs, sinceSecs)
+		} else {
+			// ZPLAYHEADLASTMODIFIEDDATE absent — in-progress episodes resumed within
+			// the window but first started earlier may be missed by the delta filter.
+			sinceClause = "\n\t\t  AND (e.ZPLAYSTATELASTMODIFIEDDATE > ? OR e.ZLASTDATEPLAYED > ?)"
+			sinceArgs = append(sinceArgs, sinceSecs, sinceSecs)
+		}
 	}
 
 	// ZDURATION was removed in macOS 27. Probe once and fall back to NULL so

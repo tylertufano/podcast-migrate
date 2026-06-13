@@ -89,7 +89,7 @@ func TestAugment_EmptyEpisodes_ReturnsZero(t *testing.T) {
 		nil, // empty
 		map[string]overcastIndexEntry{},
 		0, map[string]string{},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("empty episodes: got %d, want 0", n)
@@ -107,7 +107,7 @@ func TestAugment_AllUnplayed_ReturnsZero(t *testing.T) {
 		map[string]overcastIndexEntry{},
 		0,
 		map[string]string{"https://feeds.example.com/s": "test show"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("all-unplayed: got %d, want 0", n)
@@ -127,7 +127,7 @@ func TestAugment_AllAlreadyIndexed_ReturnsZero(t *testing.T) {
 		index,
 		0,
 		map[string]string{feedURL: "fresh air"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("all-indexed: got %d, want 0", n)
@@ -158,7 +158,7 @@ func TestAugment_StrictFeedMatch_SkipsAllFeeds(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		true, // strictFeedMatch
-		false, 0, false,
+		false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("strictFeedMatch: got %d, want 0", n)
@@ -191,7 +191,7 @@ func TestAugment_SubscribedOnly_SkipsUnsubscribed(t *testing.T) {
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		false,
 		true, // subscribedOnly
-		0, false,
+		0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("subscribedOnly with no match: got %d, want 0", n)
@@ -227,7 +227,7 @@ func TestAugment_NormalPath_AddsToIndex(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("normal path: got %d entries added, want 1", n)
@@ -270,7 +270,7 @@ func TestAugment_NumericIDShortcut_AddsToIndex(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("NumericID shortcut: got %d entries added, want 1", n)
@@ -327,7 +327,7 @@ func TestAugment_PodPageCacheDedup(t *testing.T) {
 		map[string]overcastIndexEntry{},
 		0,
 		map[string]string{feed1: "fresh air", feed2: "fresh air plus"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 
 	if count := atomic.LoadInt32(&listingFetchCount); count != 1 {
@@ -369,7 +369,7 @@ func TestAugment_TitleFallback_MatchesWhenDateMisses(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("title fallback: got %d entries added, want 1", n)
@@ -408,7 +408,7 @@ func TestAugment_OneDayOffSameTitle_Accepted(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("±1 day same title: got %d entries added, want 1 — should accept when titles match", n)
@@ -458,7 +458,7 @@ func TestAugment_OneDayOffSeasonMarkerVariant_Accepted(t *testing.T) {
 		// feedToTitle uses "fresh air" to match augPodcastsPageFreshAir →
 		// /itunes12345/fresh-air, which serves listingPageS01 for this test.
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("±1 day season-marker variant: got %d entries added, want 1 — fuzzy title should accept", n)
@@ -514,7 +514,7 @@ func TestAugment_OneDayOffDifferentTitle_Rejected(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false,
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("±1 day different title: got %d entries added, want 0 — should reject when titles differ", n)

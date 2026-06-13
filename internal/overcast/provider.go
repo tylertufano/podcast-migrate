@@ -242,7 +242,22 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	//    user listened to in Apple but never opened in Overcast). Runs in both
 	//    dry-run and live mode: the page fetches are read-only GETs, so running
 	//    them in dry-run gives an accurate preview of what the live run will do.
-	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch, opts.SubscribedOnly, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache)
+	//
+	//    The episode ID cache is loaded here so that written-state records (set
+	//    by the write loop below) are persisted alongside the numeric IDs after
+	//    the run completes. The cache is passed into augmentation so that
+	//    previously-written states populate currentState/currentPos for
+	//    extended-matching entries — enabling the skip check to fire correctly
+	//    when the same episode is synced a second time.
+	idCache := loadEpisodeIDCache()
+	if opts.ClearEpisodeCache {
+		n := idCache.clear()
+		if n > 0 {
+			fmt.Printf("overcast: episode ID cache cleared (%d entries discarded)\n", n)
+		}
+	}
+	defer idCache.save()
+	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch, opts.SubscribedOnly, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache, idCache)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
@@ -423,6 +438,13 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			playStateLabel(entry.currentState, entry.currentPos), "")
 		updated++
 
+		// Record what we just wrote so subsequent runs skip re-writing the same state.
+		// Only applicable for extended-matching entries (those found via podcast listing
+		// pages / episode hash fetches); OPML-sourced entries already carry live state.
+		if entry.episodeURL != "" {
+			idCache.setWrittenState(entry.episodeURL, ep.PlayState, ep.PlayPosition)
+		}
+
 		// Log the first 5 successes and then every 50th so the user can verify
 		// things are working without drowning in lines.
 		if updated <= 5 || updated%50 == 0 {
@@ -523,6 +545,7 @@ func augmentIndexFromPodcastPages(
 	subscribedOnly bool,
 	episodeCacheMaxAge time.Duration,
 	clearEpisodeCache bool,
+	idCache *episodeIDCache,
 ) int {
 	// Guard against a zero/negative delay — callers such as tests may pass 0.
 	if requestDelay <= 0 {
@@ -855,7 +878,15 @@ func augmentIndexFromPodcastPages(
 			if matched.NumericID != "" {
 				key := "feeddate:" + normFeed + "|" + ap.PubDate.UTC().Format(time.RFC3339)
 				if _, exists := index[key]; !exists {
-					index[key] = overcastIndexEntry{numericID: matched.NumericID}
+					// Retrieve any previously written state (maxAge=0: written state
+					// is always valid regardless of how old the ID cache entry is).
+					_, writtenState, writtenPos := idCache.getEntry(matched.OvercastURL, 0)
+					index[key] = overcastIndexEntry{
+						numericID:    matched.NumericID,
+						episodeURL:   matched.OvercastURL,
+						currentState: writtenState,
+						currentPos:   writtenPos,
+					}
 					added++
 				}
 				continue
@@ -894,10 +925,11 @@ func augmentIndexFromPodcastPages(
 	// Step 4: resolve hashes → numeric IDs.
 	//
 	// Strategy:
-	//  1. Load a persistent on-disk cache. Episodes resolved in prior runs are
-	//     served instantly with no HTTP request.
+	//  1. Check the persistent on-disk cache (idCache, managed by the caller).
+	//     Episodes resolved in prior runs are served instantly with no HTTP request.
+	//     Written-state records from prior writes also populate currentState/currentPos
+	//     so the skip check in the write loop fires on repeated runs.
 	//  2. Fetch remaining (cache misses) with a bounded pool of concurrent GETs.
-	//  3. Save the updated cache to disk for the next run.
 	//
 	// On the first sync the cache is empty and all episodes need fetching.
 	// On every subsequent sync only new episodes require fetches.
@@ -907,27 +939,25 @@ func augmentIndexFromPodcastPages(
 		maxFetchErrors  = 10 // abort if this many goroutine errors accumulate
 	)
 
-	idCache := loadEpisodeIDCache()
-
-	// Honour --clear-episode-cache: wipe all entries before this run.
-	// The cache will be repopulated with fresh data during the run.
-	if clearEpisodeCache {
-		n := idCache.clear()
-		if n > 0 {
-			fmt.Printf("overcast: episode ID cache cleared (%d entries discarded)\n", n)
-		}
-	}
-
 	// Pass A: serve cache hits immediately.
+	// Also populate currentState/currentPos from the written-state cache so the
+	// write-side skip check fires on subsequent runs (episodes found via extended
+	// matching have no OPML-sourced state, but after a successful write the cache
+	// records what was written — preventing re-writes of the same play state).
 	cacheHits := 0
 	for _, item := range pending {
-		id := idCache.get(item.episodeURL, episodeCacheMaxAge)
+		id, writtenState, writtenPos := idCache.getEntry(item.episodeURL, episodeCacheMaxAge)
 		if id == "" {
 			continue
 		}
 		key := "feeddate:" + item.normFeedURL + "|" + item.dateRFC3339
 		if _, exists := index[key]; !exists {
-			index[key] = overcastIndexEntry{numericID: id}
+			index[key] = overcastIndexEntry{
+				numericID:    id,
+				episodeURL:   item.episodeURL,
+				currentState: writtenState,
+				currentPos:   writtenPos,
+			}
 			added++
 			cacheHits++
 		}
@@ -952,7 +982,6 @@ func augmentIndexFromPodcastPages(
 	}
 
 	if len(misses) == 0 {
-		idCache.save()
 		return added
 	}
 
@@ -961,8 +990,9 @@ func augmentIndexFromPodcastPages(
 
 	// Pass B: fetch cache misses concurrently.
 	type fetchResult struct {
-		key       string
-		numericID string
+		key        string
+		numericID  string
+		episodeURL string // preserved for written-state cache updates
 	}
 
 	results := make(chan fetchResult, len(misses))
@@ -1007,7 +1037,7 @@ func augmentIndexFromPodcastPages(
 					wait := time.Duration(1<<uint(attempt)) * 30 * time.Second
 					select {
 					case <-fetchCtx.Done():
-						results <- fetchResult{key, ""}
+						results <- fetchResult{key: key}
 						return
 					case <-time.After(wait):
 					}
@@ -1020,7 +1050,7 @@ func augmentIndexFromPodcastPages(
 				select {
 				case <-rateTicker.C:
 				case <-fetchCtx.Done():
-					results <- fetchResult{key, ""}
+					results <- fetchResult{key: key}
 					return
 				}
 
@@ -1030,7 +1060,7 @@ func augmentIndexFromPodcastPages(
 					if errors.As(err, &rl) {
 						select {
 						case <-fetchCtx.Done():
-							results <- fetchResult{key, ""}
+							results <- fetchResult{key: key}
 							return
 						case <-time.After(rl.Wait):
 						}
@@ -1058,7 +1088,7 @@ func augmentIndexFromPodcastPages(
 						fmt.Printf("  too many errors (%d), stopping extended matching\n", n)
 						cancelFetch()
 					}
-					results <- fetchResult{key, ""}
+					results <- fetchResult{key: key}
 					return
 				}
 				numericID = id
@@ -1068,7 +1098,7 @@ func augmentIndexFromPodcastPages(
 			if numericID != "" {
 				idCache.set(item.episodeURL, numericID)
 			}
-			results <- fetchResult{key, numericID}
+			results <- fetchResult{key, numericID, item.episodeURL}
 		}()
 	}
 
@@ -1084,7 +1114,15 @@ func augmentIndexFromPodcastPages(
 		resolved++
 		if r.numericID != "" && r.key != "" {
 			if _, exists := index[r.key]; !exists {
-				index[r.key] = overcastIndexEntry{numericID: r.numericID}
+				// Retrieve any previously written state from the cache so the
+				// skip check in the write loop fires on subsequent runs.
+				_, writtenState, writtenPos := idCache.getEntry(r.episodeURL, 0)
+				index[r.key] = overcastIndexEntry{
+					numericID:    r.numericID,
+					episodeURL:   r.episodeURL,
+					currentState: writtenState,
+					currentPos:   writtenPos,
+				}
 				added++
 			}
 		}
@@ -1094,16 +1132,17 @@ func augmentIndexFromPodcastPages(
 		}
 	}
 
-	idCache.save()
 	return added
 }
 
 // overcastIndexEntry holds the data needed to update an episode's progress in Overcast.
-// currentState is populated from the OPML export so we can skip no-op API calls.
+// currentState is populated from the OPML export (or written-state cache for episodes
+// found via extended matching) so we can skip no-op API calls.
 type overcastIndexEntry struct {
 	numericID    string            // overcastId value, e.g. "2891974064154832"
-	currentState model.PlayState   // play state already in Overcast (from OPML)
-	currentPos   time.Duration     // current playback position in Overcast (from OPML)
+	currentState model.PlayState   // play state already in Overcast (from OPML or cache)
+	currentPos   time.Duration     // current playback position in Overcast (from OPML or cache)
+	episodeURL   string            // "https://overcast.fm/+HASH" — set for extended-matching entries
 }
 
 // buildOvercastIndex creates a lookup map from match keys to Overcast episode data.

@@ -7,12 +7,18 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/tyler/podcast-migrate/internal/model"
 )
 
 // episodeCacheEntry is a single record in the on-disk episode ID cache.
+// WrittenState and WrittenPosSec record the last play state written to Overcast
+// for this episode, allowing subsequent runs to skip re-writing the same state.
 type episodeCacheEntry struct {
-	ID       string    `json:"id"`
-	CachedAt time.Time `json:"t"`
+	ID           string    `json:"id"`
+	CachedAt     time.Time `json:"t"`
+	WrittenState int       `json:"ws,omitempty"` // model.PlayState (0=unplayed, 1=in-progress, 2=played)
+	WrittenPosSec float64  `json:"wp,omitempty"` // playback position in seconds at last write
 }
 
 // cacheFile is the versioned on-disk format.
@@ -100,19 +106,40 @@ func episodeIDCachePath() string {
 // Returns "" when the entry is absent or when maxAge > 0 and the entry is stale
 // (including entries migrated from the legacy format that have no timestamp).
 func (c *episodeIDCache) get(episodeURL string, maxAge time.Duration) string {
+	id, _, _ := c.getEntry(episodeURL, maxAge)
+	return id
+}
+
+// getEntry returns the numericID and the last-written play state for an episode URL.
+// The ID is subject to maxAge (empty string when stale); the written state is always
+// returned regardless of age (it records what we last wrote, not a fetched value).
+func (c *episodeIDCache) getEntry(episodeURL string, maxAge time.Duration) (id string, writtenState model.PlayState, writtenPos time.Duration) {
 	c.mu.RLock()
 	entry, ok := c.items[episodeURL]
 	c.mu.RUnlock()
 	if !ok {
-		return ""
+		return "", model.PlayStateUnplayed, 0
 	}
+	writtenState = model.PlayState(entry.WrittenState)
+	writtenPos = time.Duration(entry.WrittenPosSec * float64(time.Second))
 	if maxAge > 0 {
-		// No timestamp (legacy entry) or entry too old → treat as stale.
 		if entry.CachedAt.IsZero() || time.Since(entry.CachedAt) > maxAge {
-			return ""
+			return "", writtenState, writtenPos
 		}
 	}
-	return entry.ID
+	return entry.ID, writtenState, writtenPos
+}
+
+// setWrittenState records the play state last written to Overcast for this episode.
+// The numericID entry is preserved; only the written-state fields are updated.
+func (c *episodeIDCache) setWrittenState(episodeURL string, state model.PlayState, pos time.Duration) {
+	c.mu.Lock()
+	entry := c.items[episodeURL]
+	entry.WrittenState = int(state)
+	entry.WrittenPosSec = pos.Seconds()
+	c.items[episodeURL] = entry
+	c.dirty = true
+	c.mu.Unlock()
 }
 
 // set stores a numericID for an episode URL with the current timestamp and

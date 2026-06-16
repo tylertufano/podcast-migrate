@@ -527,6 +527,210 @@ func TestAugment_OneDayOffDifferentTitle_Rejected(t *testing.T) {
 	}
 }
 
+// ── OPML play-state seeding tests ────────────────────────────────────────────
+//
+// These tests verify that augmentIndexFromPodcastPages uses the live OPML state
+// (via buildOPMLNumericIDIndex) to seed currentState for augmented episodes, even
+// when the episode ID cache is empty (first run). This fixes the bug where PC →
+// Overcast migrations without a --overcast-match-opml file would show all augmented
+// episodes as "unplayed" and trigger unnecessary writes.
+
+func TestAugment_OPMLState_NumericIDShortcut_SeedsCurrentState(t *testing.T) {
+	// The listing page provides data-item-id="9999" (no per-episode fetch).
+	// The overcastLib has that same episode (GUID="9999") marked as played.
+	// Expected: index entry has currentState=Played, so a "played" write is skipped.
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageFreshAir)
+		},
+		"/itunes12345/fresh-air": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augListingPageWithNumericID) // data-item-id="9999"
+		},
+	})
+
+	overcastLib := &model.Library{
+		Episodes: []model.EpisodeState{
+			{GUID: "9999", PlayState: model.PlayStatePlayed},
+		},
+	}
+
+	index := map[string]overcastIndexEntry{}
+	n := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		overcastLib,
+		[]model.EpisodeState{appleEp},
+		index,
+		0,
+		map[string]string{appleEp.FeedURL: "fresh air"},
+		false, false, 0, false, newTestCache(t),
+	)
+	if n != 1 {
+		t.Fatalf("expected 1 entry added, got %d", n)
+	}
+
+	normFeed := normalizeFeedURL(appleEp.FeedURL)
+	key := "feeddate:" + normFeed + "|" + appleEp.PubDate.UTC().Format(time.RFC3339)
+	entry, ok := index[key]
+	if !ok {
+		t.Fatalf("index missing key %q", key)
+	}
+	if entry.currentState != model.PlayStatePlayed {
+		t.Errorf("currentState: got %v, want PlayStatePlayed — OPML state should seed the index even on first run", entry.currentState)
+	}
+}
+
+func TestAugment_OPMLState_CacheHitPath_SeedsCurrentState(t *testing.T) {
+	// The episode URL is in the ID cache (cache hit path, Pass A) but the written
+	// state in the cache is Unplayed (e.g. the cache entry was written before any
+	// play-state write). The OPML has the same numeric ID as Played.
+	// Expected: currentState=Played (OPML takes precedence over empty cache state).
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageFreshAir)
+		},
+		"/itunes12345/fresh-air": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augListingPage) // no data-item-id → pending list
+		},
+	})
+
+	// Pre-populate the cache: id="9999", no written state (writtenState=Unplayed).
+	// The episode URL must use the test server's base URL since OvercastURL is
+	// constructed as overcastBaseURL+hash, and overcastBaseURL is set to srv.URL in tests.
+	episodeURL := srv.URL + "/+HASH1"
+	cache := newTestCache(t)
+	cache.set(episodeURL, "9999")
+
+	overcastLib := &model.Library{
+		Episodes: []model.EpisodeState{
+			{GUID: "9999", PlayState: model.PlayStatePlayed},
+		},
+	}
+
+	index := map[string]overcastIndexEntry{}
+	n := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		overcastLib,
+		[]model.EpisodeState{appleEp},
+		index,
+		0,
+		map[string]string{appleEp.FeedURL: "fresh air"},
+		false, false, 0, false, cache,
+	)
+	if n != 1 {
+		t.Fatalf("expected 1 entry added, got %d", n)
+	}
+
+	normFeed := normalizeFeedURL(appleEp.FeedURL)
+	key := "feeddate:" + normFeed + "|" + appleEp.PubDate.UTC().Format(time.RFC3339)
+	entry, ok := index[key]
+	if !ok {
+		t.Fatalf("index missing key %q", key)
+	}
+	if entry.currentState != model.PlayStatePlayed {
+		t.Errorf("currentState: got %v, want PlayStatePlayed — OPML state should seed cache-hit entries", entry.currentState)
+	}
+}
+
+func TestAugment_OPMLState_WorkerPath_SeedsCurrentState(t *testing.T) {
+	// Episode is not in the cache; worker fetches /+HASH1 and resolves numericID="9999".
+	// The OPML has that episode marked as InProgress(30m).
+	// Expected: currentState=InProgress, currentPos=30m.
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageFreshAir)
+		},
+		"/itunes12345/fresh-air": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augListingPage) // no data-item-id
+		},
+		"/+HASH1": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augEpisodePage) // data-item-id="9999"
+		},
+	})
+
+	wantPos := 30 * time.Minute
+	overcastLib := &model.Library{
+		Episodes: []model.EpisodeState{
+			{GUID: "9999", PlayState: model.PlayStateInProgress, PlayPosition: wantPos},
+		},
+	}
+
+	index := map[string]overcastIndexEntry{}
+	n := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		overcastLib,
+		[]model.EpisodeState{appleEp},
+		index,
+		0,
+		map[string]string{appleEp.FeedURL: "fresh air"},
+		false, false, 0, false, newTestCache(t),
+	)
+	if n != 1 {
+		t.Fatalf("expected 1 entry added, got %d", n)
+	}
+
+	normFeed := normalizeFeedURL(appleEp.FeedURL)
+	key := "feeddate:" + normFeed + "|" + appleEp.PubDate.UTC().Format(time.RFC3339)
+	entry, ok := index[key]
+	if !ok {
+		t.Fatalf("index missing key %q", key)
+	}
+	if entry.currentState != model.PlayStateInProgress {
+		t.Errorf("currentState: got %v, want PlayStateInProgress", entry.currentState)
+	}
+	if entry.currentPos != wantPos {
+		t.Errorf("currentPos: got %v, want %v", entry.currentPos, wantPos)
+	}
+}
+
+func TestAugment_OPMLState_FurthestWins_CacheAhead(t *testing.T) {
+	// The cache records a previous write of "played"; the OPML shows "unplayed"
+	// (e.g. Overcast hasn't reflected the write yet, or the OPML entry is stale).
+	// Expected: currentState=Played (cache wins because it's further).
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageFreshAir)
+		},
+		"/itunes12345/fresh-air": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augListingPage)
+		},
+	})
+
+	// Cache has id="9999" with written state=Played. URL must use the test server's
+	// base URL since OvercastURL is built as overcastBaseURL+hash in FetchPodcastEpisodes.
+	episodeURL := srv.URL + "/+HASH1"
+	cache := newTestCache(t)
+	cache.set(episodeURL, "9999")
+	cache.setWrittenState(episodeURL, model.PlayStatePlayed, 0)
+
+	// OPML shows Unplayed (hasn't caught up yet).
+	overcastLib := &model.Library{
+		Episodes: []model.EpisodeState{
+			{GUID: "9999", PlayState: model.PlayStateUnplayed},
+		},
+	}
+
+	index := map[string]overcastIndexEntry{}
+	augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		overcastLib,
+		[]model.EpisodeState{appleEp},
+		index,
+		0,
+		map[string]string{appleEp.FeedURL: "fresh air"},
+		false, false, 0, false, cache,
+	)
+
+	normFeed := normalizeFeedURL(appleEp.FeedURL)
+	key := "feeddate:" + normFeed + "|" + appleEp.PubDate.UTC().Format(time.RFC3339)
+	entry, ok := index[key]
+	if !ok {
+		t.Fatalf("index missing key %q", key)
+	}
+	if entry.currentState != model.PlayStatePlayed {
+		t.Errorf("currentState: got %v, want PlayStatePlayed — cache Played should beat OPML Unplayed", entry.currentState)
+	}
+}
+
 // indexEntryKeys returns all keys in an index map for diagnostic messages.
 func indexEntryKeys(m map[string]overcastIndexEntry) []string {
 	ks := make([]string, 0, len(m))

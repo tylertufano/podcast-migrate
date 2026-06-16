@@ -223,12 +223,7 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 					if ep.Duration > 0 {
 						es.Duration = time.Duration(ep.Duration) * time.Second
 					}
-					if se.PlayingStatus == PlayingInProgress {
-						es.PlayState = model.PlayStateInProgress
-						es.PlayPosition = time.Duration(se.PlayedUpTo) * time.Second
-					} else {
-						es.PlayState = model.PlayStatePlayed
-					}
+					es.PlayState, es.PlayPosition = inferPlayState(se.PlayingStatus, int(se.PlayedUpTo), ep.Duration)
 					seenUUIDs[ep.UUID] = true
 					episodes = append(episodes, es)
 					fetched++
@@ -311,11 +306,8 @@ func episodeStateFromAPI(ep *APIEpisode, feedURL string) *model.EpisodeState {
 		es.Duration = time.Duration(ep.Duration) * time.Second
 	}
 	switch ep.PlayingStatus {
-	case PlayingPlayed:
-		es.PlayState = model.PlayStatePlayed
-	case PlayingInProgress:
-		es.PlayState = model.PlayStateInProgress
-		es.PlayPosition = time.Duration(ep.PlayedUpTo) * time.Second
+	case PlayingPlayed, PlayingInProgress:
+		es.PlayState, es.PlayPosition = inferPlayState(ep.PlayingStatus, ep.PlayedUpTo, ep.Duration)
 	default:
 		return nil
 	}
@@ -1125,11 +1117,12 @@ func addToIndex(index map[string]pcIndexEntry, ep *APIEpisode, feedURL string, s
 	normFeed := normalizeFeedURL(feedURL)
 	pubTime := ep.ParsePublishedAt()
 
+	currState, currPos := inferPlayState(ep.PlayingStatus, ep.PlayedUpTo, ep.Duration)
 	entry := pcIndexEntry{
 		episodeUUID:  ep.UUID,
 		podcastUUID:  ep.PodcastUUID,
-		currentState: pcPlayingStatusToModel(ep.PlayingStatus),
-		currentPos:   time.Duration(ep.PlayedUpTo) * time.Second,
+		currentState: currState,
+		currentPos:   currPos,
 		source:       source,
 	}
 
@@ -1200,16 +1193,27 @@ func findInIndex(index map[string]pcIndexEntry, ep model.EpisodeState) (pcIndexE
 	return pcIndexEntry{}, false
 }
 
-// pcPlayingStatusToModel converts a Pocket Casts playing_status integer to the
-// model.PlayState enum used throughout this tool.
-func pcPlayingStatusToModel(status int) model.PlayState {
-	switch status {
+// nearEndThreshold is the maximum seconds before the end of an episode at which
+// a Pocket Casts InProgress episode is promoted to Played. Pocket Casts does not
+// always transition playing_status to 3 (Played) when the playhead reaches the
+// last few seconds (e.g. after the main content ends before outro music finishes).
+const nearEndThreshold = 60
+
+// inferPlayState converts a Pocket Casts playing_status + playedUpToSec + durationSec
+// into a model PlayState and position. InProgress episodes within nearEndThreshold
+// seconds of the total duration are promoted to Played so skip-reason checks fire
+// correctly instead of triggering redundant writes.
+func inferPlayState(playingStatus, playedUpToSec, durationSec int) (model.PlayState, time.Duration) {
+	switch playingStatus {
 	case PlayingPlayed:
-		return model.PlayStatePlayed
+		return model.PlayStatePlayed, 0
 	case PlayingInProgress:
-		return model.PlayStateInProgress
+		if durationSec > 0 && playedUpToSec > 0 && playedUpToSec >= durationSec-nearEndThreshold {
+			return model.PlayStatePlayed, 0
+		}
+		return model.PlayStateInProgress, time.Duration(playedUpToSec) * time.Second
 	default:
-		return model.PlayStateUnplayed
+		return model.PlayStateUnplayed, 0
 	}
 }
 

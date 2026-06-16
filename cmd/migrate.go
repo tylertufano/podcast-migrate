@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -28,11 +29,13 @@ func migrateCmd() *cobra.Command {
 		playState        bool
 		sqlitePath       string
 		opmlFallback     string
-		overcastSourceOPML string
-		overcastMatchOPML  string
-		overcastOut      string
-		overcastEmail    string
-		overcastPassword string
+		overcastSourceOPML       string
+		overcastMatchOPML        string
+		overcastOut              string
+		overcastEmail            string
+		overcastPassword         string
+		overcastClearSourceCache bool   // --clear-source-opml-cache
+		overcastSaveSourceOPML   string // --overcast-save-source-opml
 		conflictStrategy        string
 		requestDelay            time.Duration
 		titleMatchTolerance     time.Duration
@@ -117,14 +120,16 @@ func migrateCmd() *cobra.Command {
 			}
 
 			// Direction-aware validation for --play-state:
-			//   * --from overcast: always requires --overcast-source-opml (the source data)
+			//   * --from overcast: requires --overcast-source-opml OR credentials for auto-fetch
 			//   * --to overcast:   requires credentials; destination matching OPML is
 			//                      either --overcast-match-opml or auto-fetched after login
 			//   * --from/to pocketcasts: requires Pocket Casts credentials
 			if playState {
-				if from == "overcast" && overcastSourceOPML == "" {
-					return fmt.Errorf("--play-state requires --overcast-source-opml when --from overcast " +
-						"(path to your extended OPML from overcast.fm/account/export_opml/extended)")
+				if from == "overcast" && overcastSourceOPML == "" && overcastEmail == "" {
+					return fmt.Errorf("--play-state with --from overcast requires either " +
+						"--overcast-source-opml (path to your extended OPML export) " +
+						"or Overcast credentials (OVERCAST_EMAIL + OVERCAST_PASSWORD / " +
+						"--overcast-email / --overcast-password) for automatic fetch")
 				}
 				if to == "overcast" && overcastEmail == "" {
 					return fmt.Errorf("--play-state requires Overcast credentials when --to overcast: " +
@@ -152,9 +157,21 @@ func migrateCmd() *cobra.Command {
 				return err
 			}
 
-			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", "", "", pocketcastsEmail, pocketcastsPassword, opmlFile, "")
+			// Pass Overcast credentials to the source provider so it can auto-fetch
+			// the extended OPML when --overcast-source-opml is not specified.
+			src, err := buildProvider(from, sqlitePath, opmlFallback, overcastSourceOPML, "", overcastEmail, overcastPassword, pocketcastsEmail, pocketcastsPassword, opmlFile, "")
 			if err != nil {
 				return fmt.Errorf("source: %w", err)
+			}
+
+			// Wire auto-fetch options into the Overcast source provider.
+			if op, ok := src.(*overcast.Provider); ok {
+				if overcastClearSourceCache {
+					op.SetClearSourceOPMLCache(true)
+				}
+				if overcastSaveSourceOPML != "" {
+					op.SetSaveSourceOPMLPath(overcastSaveSourceOPML)
+				}
 			}
 
 			// --pc-include-unsubscribed: include play history for podcasts the user is
@@ -266,11 +283,20 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&playState, "play-state", false, "also write episode play state (Podcasts→Overcast: uses unofficial web API, requires Overcast credentials; Overcast→Podcasts: uses Apple Podcasts web API when --apple-bearer-token/--apple-media-user-token are set, otherwise writes to local SQLite)")
 	cmd.Flags().StringVar(&sqlitePath, "sqlite", "", "path to MTLibrary.sqlite (default: auto-detect)")
 	cmd.Flags().StringVar(&opmlFallback, "opml-fallback", "", "path to Apple Podcasts OPML export (fallback if SQLite unavailable)")
-	cmd.Flags().StringVar(&overcastSourceOPML, "overcast-source-opml", "", "path to Overcast extended OPML export used as the migration source (from overcast.fm/account/export_opml/extended)")
+	cmd.Flags().StringVar(&overcastSourceOPML, "overcast-source-opml", "", "path to Overcast extended OPML export used as the migration source;\n"+
+		"optional when Overcast credentials are set — the extended OPML is fetched automatically\n"+
+		"and cached for 24 h (see --clear-source-opml-cache)")
 	cmd.Flags().StringVar(&overcastMatchOPML, "overcast-match-opml", "", "path to Overcast OPML used for destination episode matching when writing play state (optional; if omitted and credentials are set, the live account library is fetched automatically)")
 	cmd.Flags().StringVar(&overcastOut, "overcast-out", "", "path for the generated Overcast import OPML file")
 	cmd.Flags().StringVar(&overcastEmail, "overcast-email", "", "Overcast account email (or set OVERCAST_EMAIL env var)")
 	cmd.Flags().StringVar(&overcastPassword, "overcast-password", "", "Overcast account password (or set OVERCAST_PASSWORD env var)")
+	cmd.Flags().BoolVar(&overcastClearSourceCache, "clear-source-opml-cache", false,
+		"discard the cached Overcast source OPML and force a fresh download;\n"+
+			"only effective when --from overcast without --overcast-source-opml")
+	cmd.Flags().StringVar(&overcastSaveSourceOPML, "overcast-save-source-opml", "",
+		"save a copy of the fetched Overcast source OPML to this path;\n"+
+			"if the flag is given without a value, ~/Downloads/overcast.opml is used")
+	cmd.Flags().Lookup("overcast-save-source-opml").NoOptDefVal = filepath.Join(os.Getenv("HOME"), "Downloads", "overcast.opml")
 	cmd.Flags().StringVar(&conflictStrategy, "conflict", "furthest", "conflict resolution: furthest | source | target")
 	cmd.Flags().DurationVar(&requestDelay, "request-delay", 0, "delay between consecutive API requests to Overcast or Apple (default 1s; increase if you hit 429 rate limits)")
 	cmd.Flags().DurationVar(&titleMatchTolerance, "title-match-tolerance", 72*time.Hour,

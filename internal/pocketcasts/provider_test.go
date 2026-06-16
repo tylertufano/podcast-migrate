@@ -1070,3 +1070,4 @@ func buildTestVarintWrapper(v uint64) []byte {
 	b = protowire.AppendVarint(b, v)
 	return b
 }
+

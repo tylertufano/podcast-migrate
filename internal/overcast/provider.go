@@ -38,11 +38,13 @@ const DefaultRequestDelay = 1 * time.Second
 //  1. matchOPMLPath (set via SetMatchOPMLPath / --overcast-match-opml) — explicit snapshot
 //  2. Auto-fetched from overcast.fm/account/export_opml/extended after login — live state
 type Provider struct {
-	sourceOPMLPath string // path to Overcast OPML export used by GetLibrary (--overcast-source-opml)
-	matchOPMLPath  string // path to OPML used for write-side episode matching (--overcast-match-opml, optional)
-	exportOPMLPath string // destination path for generated import file (for subscription writes)
-	email          string // Overcast account email (enables play state writes)
-	password       string // Overcast account password
+	sourceOPMLPath       string // path to Overcast OPML export used by GetLibrary (--overcast-source-opml)
+	matchOPMLPath        string // path to OPML used for write-side episode matching (--overcast-match-opml, optional)
+	exportOPMLPath       string // destination path for generated import file (for subscription writes)
+	email                string // Overcast account email (enables play state writes and auto-fetch)
+	password             string // Overcast account password
+	clearSourceOPMLCache bool   // if true, bypass the on-disk cache and re-fetch source OPML from the live account
+	saveSourceOPMLPath   string // if non-empty, save a copy of the fetched source OPML to this path after download
 }
 
 // NewProvider returns an Overcast provider without web API credentials.
@@ -76,12 +78,24 @@ func NewProviderWithCredentials(sourceOPMLPath, exportOPMLPath, email, password 
 // Overcast library. Equivalent to passing --overcast-match-opml on the command line.
 func (p *Provider) SetMatchOPMLPath(path string) { p.matchOPMLPath = path }
 
+// SetClearSourceOPMLCache configures GetLibrary to bypass the on-disk source OPML cache
+// and re-fetch from the live account even if a fresh cached copy exists.
+func (p *Provider) SetClearSourceOPMLCache(clear bool) { p.clearSourceOPMLCache = clear }
+
+// SetSaveSourceOPMLPath configures GetLibrary to write a copy of the fetched source OPML
+// to the given path after downloading it. Has no effect when --overcast-source-opml is set
+// (explicit file is used directly, no download occurs).
+func (p *Provider) SetSaveSourceOPMLPath(path string) { p.saveSourceOPMLPath = path }
+
 func (p *Provider) Name() string { return "Overcast" }
 
 func (p *Provider) Capabilities() provider.Capabilities {
+	// Reading is possible from an explicit OPML file or by auto-fetching when credentials
+	// are available (GetLibrary handles both paths).
+	canRead := p.sourceOPMLPath != "" || p.email != ""
 	return provider.Capabilities{
-		ReadSubscriptions:  p.sourceOPMLPath != "",
-		ReadPlayState:      p.sourceOPMLPath != "",
+		ReadSubscriptions:  canRead,
+		ReadPlayState:      canRead,
 		WriteSubscriptions: p.exportOPMLPath != "",
 		// Play state writes require credentials; the matching OPML is either provided
 		// explicitly via SetMatchOPMLPath or auto-fetched from the live account after login.
@@ -90,13 +104,62 @@ func (p *Provider) Capabilities() provider.Capabilities {
 }
 
 func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
-	if p.sourceOPMLPath == "" {
+	// Explicit file path — read directly, no auth needed.
+	if p.sourceOPMLPath != "" {
+		return NewOPMLReader(p.sourceOPMLPath).Read(ctx)
+	}
+
+	// No explicit path — credentials required for auto-fetch.
+	if p.email == "" || p.password == "" {
 		return nil, &provider.ErrCapabilityUnsupported{
 			Provider:  p.Name(),
-			Operation: "read (no source OPML path configured — use --overcast-source-opml)",
+			Operation: "read (no source OPML — use --overcast-source-opml, or set OVERCAST_EMAIL and OVERCAST_PASSWORD for automatic fetch)",
 		}
 	}
-	return NewOPMLReader(p.sourceOPMLPath).Read(ctx)
+
+	// Check the on-disk cache first (skip when clearSourceOPMLCache is set).
+	if hit, _ := loadCachedSourceOPML(ctx, p.clearSourceOPMLCache); hit != nil {
+		age := hit.age.Round(time.Minute)
+		fmt.Printf("overcast: using cached source OPML (%s old)\n", age)
+		return hit.lib, nil
+	}
+
+	// Login and fetch a fresh copy.
+	fmt.Printf("overcast: authenticating as %s...\n", p.email)
+	httpClient, err := Login(ctx, p.email, p.password)
+	if err != nil {
+		return nil, fmt.Errorf("overcast: authentication failed: %w", err)
+	}
+
+	fmt.Printf("overcast: fetching extended OPML from live account...\n")
+	rawOPML, err := FetchRawExtendedOPML(ctx, httpClient)
+	if err != nil {
+		return nil, fmt.Errorf("overcast: fetch source OPML: %w", err)
+	}
+
+	// Persist to local cache so subsequent runs within 24h skip the download.
+	cachePath := sourceOPMLCachePath()
+	if err := saveRawSourceOPML(rawOPML); err != nil {
+		fmt.Printf("overcast: warning: could not cache source OPML (%v); parsing from memory\n", err)
+		return parseOPMLBytes(rawOPML)
+	}
+
+	// Optionally save a copy to the user-specified path.
+	if p.saveSourceOPMLPath != "" {
+		if err := os.WriteFile(p.saveSourceOPMLPath, rawOPML, 0644); err != nil {
+			fmt.Printf("overcast: warning: could not save OPML copy to %s: %v\n", p.saveSourceOPMLPath, err)
+		} else {
+			fmt.Printf("overcast: saved OPML copy to %s\n", p.saveSourceOPMLPath)
+		}
+	}
+
+	lib, err := NewOPMLReader(cachePath).Read(ctx)
+	if err != nil {
+		return parseOPMLBytes(rawOPML)
+	}
+	fmt.Printf("overcast: fetched %d podcast(s), %d episode(s) from live account\n",
+		len(lib.Podcasts), len(lib.Episodes))
+	return lib, nil
 }
 
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
@@ -563,6 +626,13 @@ func augmentIndexFromPodcastPages(
 		return 0
 	}
 
+	// Build a numeric-ID → play-state index from the OPML matching library so that
+	// extended-match entries can inherit their currentState even when the episode
+	// ID cache is empty (first run). Episodes in the OPML that fail to match by
+	// feed URL (source and destination use different feed URLs for the same podcast)
+	// are found here instead, preventing unnecessary writes on subsequent runs.
+	opmlByNumericID := buildOPMLNumericIDIndex(overcastLib)
+
 	// Step 1: build feedURL → OPML podcast info.
 	// OvercastID (from the OPML overcastId attribute) is used to verify search results.
 
@@ -881,11 +951,19 @@ func augmentIndexFromPodcastPages(
 					// Retrieve any previously written state (maxAge=0: written state
 					// is always valid regardless of how old the ID cache entry is).
 					_, writtenState, writtenPos := idCache.getEntry(matched.OvercastURL, 0)
+					// Prefer the live OPML state over the written-state cache: the OPML
+					// reflects current Overcast state, while the cache records what this
+					// tool last wrote. Take whichever represents more listening progress.
+					currState, currPos := furthestPlayState(
+						writtenState, writtenPos,
+						opmlByNumericID[matched.NumericID].state,
+						opmlByNumericID[matched.NumericID].pos,
+					)
 					index[key] = overcastIndexEntry{
 						numericID:    matched.NumericID,
 						episodeURL:   matched.OvercastURL,
-						currentState: writtenState,
-						currentPos:   writtenPos,
+						currentState: currState,
+						currentPos:   currPos,
 					}
 					added++
 				}
@@ -952,11 +1030,15 @@ func augmentIndexFromPodcastPages(
 		}
 		key := "feeddate:" + item.normFeedURL + "|" + item.dateRFC3339
 		if _, exists := index[key]; !exists {
+			currState, currPos := furthestPlayState(
+				writtenState, writtenPos,
+				opmlByNumericID[id].state, opmlByNumericID[id].pos,
+			)
 			index[key] = overcastIndexEntry{
 				numericID:    id,
 				episodeURL:   item.episodeURL,
-				currentState: writtenState,
-				currentPos:   writtenPos,
+				currentState: currState,
+				currentPos:   currPos,
 			}
 			added++
 			cacheHits++
@@ -1117,11 +1199,15 @@ func augmentIndexFromPodcastPages(
 				// Retrieve any previously written state from the cache so the
 				// skip check in the write loop fires on subsequent runs.
 				_, writtenState, writtenPos := idCache.getEntry(r.episodeURL, 0)
+				currState, currPos := furthestPlayState(
+					writtenState, writtenPos,
+					opmlByNumericID[r.numericID].state, opmlByNumericID[r.numericID].pos,
+				)
 				index[r.key] = overcastIndexEntry{
 					numericID:    r.numericID,
 					episodeURL:   r.episodeURL,
-					currentState: writtenState,
-					currentPos:   writtenPos,
+					currentState: currState,
+					currentPos:   currPos,
 				}
 				added++
 			}
@@ -1143,6 +1229,50 @@ type overcastIndexEntry struct {
 	currentState model.PlayState   // play state already in Overcast (from OPML or cache)
 	currentPos   time.Duration     // current playback position in Overcast (from OPML or cache)
 	episodeURL   string            // "https://overcast.fm/+HASH" — set for extended-matching entries
+}
+
+// furthestPlayState returns the (state, pos) pair representing the furthest listening
+// progress between two candidates. Played is always furthest; between two InProgress
+// states the higher position wins; Unplayed is the least advanced.
+func furthestPlayState(s1 model.PlayState, p1 time.Duration, s2 model.PlayState, p2 time.Duration) (model.PlayState, time.Duration) {
+	switch {
+	case s1 == model.PlayStatePlayed:
+		return s1, p1
+	case s2 == model.PlayStatePlayed:
+		return s2, p2
+	case s1 == model.PlayStateInProgress && s2 == model.PlayStateInProgress:
+		if p1 >= p2 {
+			return s1, p1
+		}
+		return s2, p2
+	case s1 == model.PlayStateInProgress:
+		return s1, p1
+	case s2 == model.PlayStateInProgress:
+		return s2, p2
+	default:
+		return s1, p1
+	}
+}
+
+// overcastOPMLState holds play state extracted from the matching OPML, keyed by numeric ID.
+type overcastOPMLState struct {
+	state model.PlayState
+	pos   time.Duration
+}
+
+// buildOPMLNumericIDIndex returns a map from Overcast numeric episode ID → play state/pos,
+// extracted from the OPML-sourced matching library.
+func buildOPMLNumericIDIndex(lib *model.Library) map[string]overcastOPMLState {
+	if lib == nil {
+		return nil
+	}
+	m := make(map[string]overcastOPMLState, len(lib.Episodes))
+	for _, ep := range lib.Episodes {
+		if ep.GUID != "" {
+			m[ep.GUID] = overcastOPMLState{state: ep.PlayState, pos: ep.PlayPosition}
+		}
+	}
+	return m
 }
 
 // buildOvercastIndex creates a lookup map from match keys to Overcast episode data.

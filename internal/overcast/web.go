@@ -264,7 +264,11 @@ func SetProgress(ctx context.Context, client *http.Client, numericID string, pos
 // overcast.fm/account/export_opml/extended and passing it via --overcast-match-opml,
 // but happens automatically at write time so the destination index always reflects
 // the account's current subscriptions and play state.
-func FetchExtendedOPML(ctx context.Context, client *http.Client) (*model.Library, error) {
+// FetchRawExtendedOPML downloads the extended OPML from the live Overcast account and
+// returns the raw XML bytes. The client must be authenticated (obtained from Login).
+// Use FetchExtendedOPML when you only need the parsed library and don't need to cache
+// or save the raw bytes.
+func FetchRawExtendedOPML(ctx context.Context, client *http.Client) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		overcastBaseURL+"/account/export_opml/extended", nil)
 	if err != nil {
@@ -286,7 +290,16 @@ func FetchExtendedOPML(ctx context.Context, client *http.Client) (*model.Library
 		return nil, fmt.Errorf("overcast/web: fetch extended OPML: HTTP %d: %s",
 			resp.StatusCode, bodyExcerpt(body))
 	}
+	return body, nil
+}
 
+// FetchExtendedOPML downloads and parses the extended OPML from the live Overcast account.
+// The client must be authenticated (obtained from Login).
+func FetchExtendedOPML(ctx context.Context, client *http.Client) (*model.Library, error) {
+	body, err := FetchRawExtendedOPML(ctx, client)
+	if err != nil {
+		return nil, err
+	}
 	lib, err := parseOPMLBytes(body)
 	if err != nil {
 		return nil, fmt.Errorf("overcast/web: parse fetched OPML: %w", err)

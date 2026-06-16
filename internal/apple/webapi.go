@@ -134,6 +134,12 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 			continue
 		}
 
+		// preWriteLabel captures the Apple server state before any write, so the
+		// log's target_state column is consistent with Overcast and Pocket Casts
+		// (which also record the pre-write state). Falls back to "—" when
+		// ForceUpdate skips the server check or when the check itself fails.
+		preWriteLabel := "—"
+
 		// Check current server state and skip if Apple is already at or beyond
 		// the position we want to write. Skipped when ForceUpdate is set.
 		if !opts.ForceUpdate {
@@ -143,6 +149,15 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 				fmt.Printf("  warning: could not check play status for %q (id=%d): %v — will update anyway\n",
 					ep.Title, appleID, err)
 			} else {
+				switch {
+				case srvPos.completed:
+					preWriteLabel = "played"
+				case srvPos.recorded && srvPos.positionMs > 0:
+					preWriteLabel = fmt.Sprintf("in_progress(%s)", (time.Duration(srvPos.positionMs)*time.Millisecond).Round(time.Second))
+				default:
+					preWriteLabel = "unplayed"
+				}
+
 				if srvPos.completed {
 					// Server already has the episode marked as played — nothing to do
 					// regardless of whether we wanted to mark it played or in-progress.
@@ -172,12 +187,8 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 			continue
 		}
 
-		targetLabel := "played"
-		if !wantCompleted {
-			targetLabel = fmt.Sprintf("in_progress(%s)", ep.PlayPosition.Round(time.Second))
-		}
 		writeLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
-			playStateLabel(ep.PlayState, ep.PlayPosition), targetLabel, "")
+			playStateLabel(ep.PlayState, ep.PlayPosition), preWriteLabel, "")
 		marked++
 
 		select {

@@ -149,19 +149,18 @@ func TestOvercastProvider_WithCredentials_Capabilities(t *testing.T) {
 }
 
 func TestOvercastProvider_WithCredentials_NoSourceOPML_WritePlayStateTrue(t *testing.T) {
-	// Credentials alone are sufficient for WritePlayState — the destination matching
-	// OPML is auto-fetched from the live account after login (no sourceOPMLPath needed).
+	// Credentials alone are sufficient for both reading (auto-fetched source OPML)
+	// and writing (destination matching OPML auto-fetched after login).
 	p := overcast.NewProviderWithCredentials("", "/tmp/out.opml", "user@example.com", "secret")
 	caps := p.Capabilities()
 	if !caps.WritePlayState {
-		t.Error("WritePlayState should be true when credentials are set (match OPML auto-fetched at write time)")
+		t.Error("WritePlayState should be true when credentials are set")
 	}
-	// ReadSubscriptions and ReadPlayState still require a source OPML.
-	if caps.ReadSubscriptions {
-		t.Error("ReadSubscriptions should be false when sourceOPMLPath is empty")
+	if !caps.ReadSubscriptions {
+		t.Error("ReadSubscriptions should be true when credentials are set (source OPML auto-fetched)")
 	}
-	if caps.ReadPlayState {
-		t.Error("ReadPlayState should be false when sourceOPMLPath is empty")
+	if !caps.ReadPlayState {
+		t.Error("ReadPlayState should be true when credentials are set (source OPML auto-fetched)")
 	}
 }
 

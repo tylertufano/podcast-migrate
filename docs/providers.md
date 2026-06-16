@@ -106,18 +106,27 @@ Writes play state via `amp-api.podcasts.apple.com`. This approach writes to Appl
 
 | Operation | Supported |
 |---|---|
-| Read subscriptions | ✓ (from OPML export) |
-| Read play state | ✓ (from extended OPML) |
+| Read subscriptions | ✓ (from OPML — explicit file or auto-fetched) |
+| Read play state | ✓ (from extended OPML — explicit file or auto-fetched) |
 | Write subscriptions | ✓ (generates OPML import file) |
 | Write play state | ✓ (unofficial web API, when credentials set) |
 
-### Reading — OPMLReader
+### Reading — source OPML
 
-Parses Overcast's extended OPML export (`overcast.fm/account/export_opml/extended`). The extended format includes per-episode `<outline>` elements with:
+The Overcast provider reads from an extended OPML export (`overcast.fm/account/export_opml/extended`). The extended format includes per-episode `<outline>` elements with:
 - `overcastId` attribute → stored as `EpisodeState.GUID` (used as the `numericId` for `set_progress` calls)
 - `userUpdatedDate` → pub date
 - `played` → play state
 - `progress` → playback position in seconds
+
+**Auto-fetch**: when `--overcast-source-opml` is not set and Overcast credentials are provided, the provider fetches the extended OPML directly from `overcast.fm/account/export_opml/extended` after login and caches it at:
+
+```
+~/Library/Caches/podcast-migrate/overcast-source.opml   (macOS)
+~/.cache/podcast-migrate/overcast-source.opml            (Linux)
+```
+
+The cache is valid for 24 hours. Use `--clear-source-opml-cache` to force a fresh fetch, or `--overcast-save-source-opml [path]` to save a copy (defaults to `~/Downloads/overcast.opml` when given without a value).
 
 ### Writing — Subscriptions
 

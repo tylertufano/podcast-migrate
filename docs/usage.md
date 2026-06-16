@@ -96,34 +96,32 @@ This direction writes play state via the Apple Podcasts web API, syncing to **al
 
 The Bearer token expires in ~90 days; re-capture it the same way if you get `401` errors. The `media-user-token` lasts longer but also expires eventually.
 
-### Step 2 — Export your Overcast library
+### Step 2 — Run the migration
 
-Sign in to `overcast.fm`, go to **Account → Export OPML**, and download the extended OPML file.
-
-### Step 3 — Run the migration
+With Overcast credentials set, the tool fetches and caches your extended OPML automatically — no manual export needed:
 
 ```sh
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
 export APPLE_BEARER_TOKEN="eyJhbGci..."
 export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
 
 # Dry-run first
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --dry-run
 
 # Live run
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state
 ```
 
-Or pass tokens as flags instead of env vars:
+The source OPML is cached for 24 hours under `~/Library/Caches/podcast-migrate/overcast-source.opml`. Use `--clear-source-opml-cache` to force a fresh download, or `--overcast-save-source-opml` to save a copy (defaults to `~/Downloads/overcast.opml` when given without a value).
+
+If you prefer to supply an OPML file you downloaded manually, pass it with `--overcast-source-opml`:
 
 ```sh
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml --play-state \
-  --apple-bearer-token "eyJhbGci..." \
-  --apple-media-user-token "0.Apgf..."
+  --overcast-source-opml ~/Downloads/overcast.opml --play-state
 ```
 
 **Scope:** Only episodes indexed in the Apple Podcasts catalog (public RSS feeds) can be marked this way. Private or unlisted feeds without a catalog entry are skipped and reported.
@@ -135,17 +133,14 @@ podcast-migrate migrate --from overcast --to podcasts \
 ```sh
 # Single podcast
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --podcast "fresh air"
 
 # Multiple podcasts
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --podcast "fresh air" --podcast "planet money"
 
 # From a file (one title word or phrase per line)
 podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --podcast-list ~/my-podcasts.txt
 ```
 
@@ -257,7 +252,7 @@ The Overcast match library is auto-fetched from your live account using the prov
 
 ## Overcast → Pocket Casts
 
-Export your Overcast library first from `overcast.fm/account/export_opml/extended`, then:
+With Overcast credentials set, the extended OPML is fetched automatically — no manual export needed:
 
 ```sh
 export OVERCAST_EMAIL="you@example.com"
@@ -267,14 +262,14 @@ export POCKETCASTS_PASSWORD="yourpassword"
 
 # Dry-run first
 podcast-migrate migrate --from overcast --to pocketcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --dry-run
 
 # Live run
 podcast-migrate migrate --from overcast --to pocketcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state
 ```
+
+Or supply a manually-downloaded OPML with `--overcast-source-opml ~/Downloads/overcast.opml` if you prefer.
 
 ---
 

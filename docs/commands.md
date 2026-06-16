@@ -37,7 +37,7 @@ podcast-migrate migrate --from <src> --to <dst> [flags]
 |---|---|
 | `--sqlite` | Path to `MTLibrary.sqlite` (auto-detected when omitted) |
 | `--opml-fallback` | Apple Podcasts OPML export (fallback when SQLite is inaccessible) |
-| `--overcast-source-opml` | Overcast extended OPML export (required when `--from overcast` with `--play-state`) |
+| `--overcast-source-opml` | Overcast extended OPML export. Optional when Overcast credentials are set — the extended OPML is fetched automatically and cached for 24 h (see `--clear-source-opml-cache`). Required when using a specific snapshot (e.g. restoring from an old export). |
 | `--overcast-match-opml` | Overcast OPML used for write-side episode matching (optional; auto-fetched after login when omitted) |
 | `--overcast-out` | Output path for generated Overcast import OPML |
 | `--opml-file` | Source OPML path (required when `--from opml`) |
@@ -91,6 +91,8 @@ The `--since` filter matches any of three Apple Podcasts timestamp columns:
 | `--force-update` | false | Write source state even if destination is already ahead |
 | `--episode-cache-max-age` | 0 (indefinite) | Treat Overcast episode ID cache entries older than this as stale |
 | `--clear-episode-cache` | false | Discard and rebuild Overcast episode ID cache |
+| `--clear-source-opml-cache` | false | Discard the cached Overcast source OPML and force a fresh download (only effective when `--from overcast` without `--overcast-source-opml`) |
+| `--overcast-save-source-opml [path]` | — | Save a copy of the auto-fetched Overcast source OPML to this path. If given without a value, saves to `~/Downloads/overcast.opml`. |
 | `--feed-map SRC=DST` | — | Remap a source feed URL to a destination feed URL (repeatable) |
 | `--log-file /path` | — | Write per-episode CSV log (columns: status, podcast, episode, pub_date, source_state, target_state, note) |
 | `--pc-include-unsubscribed` | false | When `--from pocketcasts`: include play history for unsubscribed podcasts |
@@ -113,13 +115,15 @@ podcast-migrate migrate --from podcasts --to overcast \
   --overcast-source-opml ~/Downloads/overcast.opml \
   --play-state --since 48h
 
-# Reverse sync: Overcast → Apple Podcasts (syncs to all Apple devices)
+# Reverse sync: Overcast → Apple Podcasts (credentials auto-fetch the source OPML)
+podcast-migrate migrate --from overcast --to podcasts --play-state
+
+# Reverse sync: Overcast → Apple Podcasts (explicit OPML; useful for restoring from a snapshot)
 podcast-migrate migrate --from overcast --to podcasts \
   --overcast-source-opml ~/Downloads/overcast.opml --play-state
 
 # Pocket Casts → Overcast (full migration)
 podcast-migrate migrate --from pocketcasts --to overcast \
-  --overcast-source-opml ~/Downloads/overcast.opml \
   --overcast-out ~/Desktop/import.opml --play-state
 
 # Use an explicit feed URL remapping for a subscriber feed
@@ -227,7 +231,7 @@ podcast-migrate --version
 
 The version string is injected at build time via `-ldflags`:
 ```
-go build -ldflags="-X github.com/tyler/podcast-migrate/cmd.version=v0.11.0" .
+go build -ldflags="-X github.com/tyler/podcast-migrate/cmd.version=v0.12.0" .
 ```
 
 Local builds without ldflags report `dev`.

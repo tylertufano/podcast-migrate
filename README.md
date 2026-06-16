@@ -53,10 +53,12 @@ podcast-migrate migrate --from podcasts --to overcast \
   --play-state --since 48h
 
 # Sync play state Overcast → Apple Podcasts (syncs to iPhone, iPad, Mac)
+# Overcast credentials auto-fetch the source OPML — no manual export needed
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
 export APPLE_BEARER_TOKEN="eyJhbGci..."
 export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
-podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml --play-state
+podcast-migrate migrate --from overcast --to podcasts --play-state
 ```
 
 See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-step guides for every supported migration direction.

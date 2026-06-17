@@ -201,14 +201,29 @@ func setupSQLiteDB(t *testing.T) string {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep17: %v", err)
 	}
 	// ep18: manually marked as unplayed — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1
-	//       (residual from when it was played), ZLASTDATEPLAYED set (residual),
-	//       ZPLAYSTATESOURCE=3 (retained from the original listened-to-completion event).
+	//       (residual from when it was played), ZLASTDATEPLAYED=NULL (cleared by the
+	//       unplay action), ZPLAYSTATESOURCE=3 (retained from the original listen).
 	//       The user explicitly tapped "Mark as Unplayed" in the Apple Podcasts UI.
-	//       Apple resets ZPLAYSTATE to 0 but does not clear ZPLAYCOUNT or ZLASTDATEPLAYED.
-	//       Must be EXCLUDED — the residual signals must not re-trigger the episode as played.
-	insertEpisode(18, 1, "rss-guid-18", "Manually Unplayed After Listen", 683000000.0, 3600.0, 0, 1, 0.0, 683100000.0, "STDQ")
+	//       Apple resets ZPLAYSTATE to 0 AND clears ZLASTDATEPLAYED on unplay, while
+	//       retaining ZPLAYCOUNT and ZPLAYSTATESOURCE from the original event.
+	//       ZLASTDATEPLAYED=NULL is the discriminator: an episode played-but-not-synced
+	//       retains its ZLASTDATEPLAYED (evidence of the real listening event), while an
+	//       episode manually unplayed has its ZLASTDATEPLAYED cleared.
+	//       Must be EXCLUDED — no ZLASTDATEPLAYED means the new source=3 case does not fire.
+	insertEpisode(18, 1, "rss-guid-18", "Manually Unplayed After Listen", 683000000.0, 3600.0, 0, 1, 0.0, nil, "STDQ")
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 18`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep18: %v", err)
+	}
+	// ep19: mobile completion sync gap — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1,
+	//       ZLASTDATEPLAYED set, ZPLAYSTATESOURCE=3 (listened to completion on iPhone).
+	//       Apple's iCloud sync delivered the play count and timestamp but ZPLAYSTATE
+	//       never transitioned to 2 on the Mac (a common sync gap). The combination of
+	//       source=3 (completion) + ZPLAYCOUNT>0 + ZLASTDATEPLAYED set is strong evidence
+	//       of genuine listening. ZLASTDATEPLAYED distinguishes this from ep18 (manually
+	//       unplayed, where Apple clears ZLASTDATEPLAYED). Must be INCLUDED as PlayStatePlayed.
+	insertEpisode(19, 1, "rss-guid-19", "Mobile Completion Sync Gap", 682000000.0, 3600.0, 0, 1, 0.0, 682100000.0, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 19`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep19: %v", err)
 	}
 
 	return path
@@ -444,11 +459,12 @@ func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	// ep15 (iCloud-sync, ZLASTDATEPLAYED+ZPLAYSTATESOURCE=1, ZPLAYCOUNT=0) → included
 	// ep5  (null GUID, no play evidence)                                   → excluded (play evidence filter)
 	// ep10 (ZLASTDATEPLAYED only, ZPLAYSTATESOURCE=0/unset)               → excluded
-	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog)      → excluded
-	// ep17 (source=3 + no ZPLAYCOUNT + no ZLASTDATEPLAYED)                → excluded (uncorroborated)
-	// ep18 (ZPLAYSTATE=0, ZPLAYCOUNT=1 residual, source=3 — manually unplayed) → excluded
-	if len(lib.Episodes) != 9 {
-		t.Errorf("got %d episodes, want 9", len(lib.Episodes))
+	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog)           → excluded
+	// ep17 (source=3 + no ZPLAYCOUNT + no ZLASTDATEPLAYED)                     → excluded (uncorroborated)
+	// ep18 (source=3, ZPLAYCOUNT=1, ZLASTDATEPLAYED=NULL — manually unplayed)  → excluded
+	// ep19 (source=3, ZPLAYCOUNT=1, ZLASTDATEPLAYED set — mobile sync gap)     → included
+	if len(lib.Episodes) != 10 {
+		t.Errorf("got %d episodes, want 10", len(lib.Episodes))
 	}
 }
 
@@ -489,14 +505,32 @@ func TestSQLiteReader_AutoMarkedWithLastPlayedExcluded(t *testing.T) {
 }
 
 func TestSQLiteReader_ManuallyUnplayedExcluded(t *testing.T) {
-	// ep18: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1 (residual), ZLASTDATEPLAYED set
-	//       (residual), ZPLAYSTATESOURCE=3 (retained from original listen-to-completion).
+	// ep18: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1 (residual), ZLASTDATEPLAYED=NULL
+	//       (cleared by the unplay action), ZPLAYSTATESOURCE=3.
 	// The user tapped "Mark as Unplayed" after having listened. Apple resets ZPLAYSTATE
-	// to 0 but leaves ZPLAYCOUNT and ZLASTDATEPLAYED intact. Residual ZPLAYCOUNT must
-	// not re-classify this episode as played on the next sync.
+	// to 0 AND clears ZLASTDATEPLAYED. ZLASTDATEPLAYED=NULL is the discriminator that
+	// prevents this from matching the mobile-completion-sync-gap case (ep19), which
+	// retains ZLASTDATEPLAYED because no unplay action occurred.
 	lib := readLibrary(t, setupSQLiteDB(t))
 	if ep := findEpisode(lib, "rss-guid-18"); ep != nil {
-		t.Errorf("manually-unplayed episode (ZPLAYSTATE=0, ZPLAYCOUNT=1, source=3) should be excluded, got PlayState=%d", ep.PlayState)
+		t.Errorf("manually-unplayed episode (ZPLAYSTATE=0, ZPLAYCOUNT=1, source=3, ZLASTDATEPLAYED=NULL) should be excluded, got PlayState=%d", ep.PlayState)
+	}
+}
+
+func TestSQLiteReader_MobileCompletionSyncGapIncluded(t *testing.T) {
+	// ep19: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1, ZLASTDATEPLAYED set,
+	//       ZPLAYSTATESOURCE=3 (listened to completion on a mobile device).
+	// Apple's iCloud sync delivered the play count, source, and timestamp but ZPLAYSTATE
+	// never transitioned to 2 on the Mac (a common iCloud sync gap). The combination of
+	// source=3 (completion) + ZPLAYCOUNT>0 + ZLASTDATEPLAYED distinguishes this from the
+	// manually-unplayed pattern (ep18), where Apple clears ZLASTDATEPLAYED on unplay.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	ep := findEpisode(lib, "rss-guid-19")
+	if ep == nil {
+		t.Fatal("mobile-completion-sync-gap episode (source=3, ZPLAYCOUNT=1, ZLASTDATEPLAYED set) should be included")
+	}
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("PlayState: got %d, want PlayStatePlayed", ep.PlayState)
 	}
 }
 

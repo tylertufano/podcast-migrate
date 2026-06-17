@@ -355,6 +355,20 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			// (e.g. 3=completion, 1=manual), so source != 0 after an unplay action.
 			ep.PlayState = model.PlayStatePlayed
 		case lastPlayedRaw.Valid &&
+			playStateSource.Int64 == 3 &&
+			playCount.Valid && playCount.Int64 > 0:
+			// Completed on a mobile device (source=3) with a recorded play count and
+			// last-played date, but ZPLAYSTATE=0 because the completion flag did not
+			// sync back to the Mac via iCloud. This is a common iCloud sync gap: the
+			// mobile device records the completion (incrementing ZPLAYCOUNT and setting
+			// ZLASTDATEPLAYED) but ZPLAYSTATE stays at 0 on the Mac.
+			//
+			// ZLASTDATEPLAYED is required: when the user manually marks an episode as
+			// unplayed, Apple clears ZLASTDATEPLAYED while retaining source=3 and
+			// ZPLAYCOUNT. Requiring the date field makes "completed but not synced"
+			// distinguishable from "completed then manually unplayed".
+			ep.PlayState = model.PlayStatePlayed
+		case lastPlayedRaw.Valid &&
 			playStateSource.Int64 != 0 &&
 			playStateSource.Int64 != 2 &&
 			playStateSource.Int64 != 6 &&
@@ -367,10 +381,10 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			// ZPLAYSTATESOURCE=0 (unset/default) is excluded: Apple also sets
 			// ZLASTDATEPLAYED for non-user events such as background downloads and
 			// iCloud metadata refreshes, leaving ZPLAYSTATESOURCE at 0.
-			// ZPLAYCOUNT>0 is also excluded: combined with a non-zero source, that
-			// residual count is indistinguishable from an episode the user listened to
-			// and then manually marked as unplayed (ZPLAYSTATE reset to 0, but count
-			// and source retained from the original play event).
+			// ZPLAYCOUNT>0 is also excluded here (handled by the source=3 case above):
+			// combined with a non-zero source other than 3, that residual count is
+			// indistinguishable from an episode the user listened to and then manually
+			// marked as unplayed (ZPLAYSTATE reset to 0, but count and source retained).
 			ep.PlayState = model.PlayStatePlayed
 		default:
 			// No reliable evidence of genuine playback; skip this episode.

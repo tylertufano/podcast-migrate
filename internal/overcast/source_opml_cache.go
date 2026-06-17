@@ -12,9 +12,21 @@ import (
 
 const sourceOPMLCacheMaxAge = 24 * time.Hour
 
+// sourceOPMLCacheTestPath, when non-empty, overrides the default cache path.
+// Only set via setSourceOPMLCachePathForTest; never in production code.
+var sourceOPMLCacheTestPath string
+
+// setSourceOPMLCachePathForTest redirects the source OPML cache to path so
+// that tests can use a temp directory instead of the real user cache.
+// Reset to "" to restore the default behaviour.
+func setSourceOPMLCachePathForTest(path string) { sourceOPMLCacheTestPath = path }
+
 // sourceOPMLCachePath returns the path where the auto-fetched Overcast source OPML is cached.
 // Follows the same directory convention as the episode ID cache.
 func sourceOPMLCachePath() string {
+	if sourceOPMLCacheTestPath != "" {
+		return sourceOPMLCacheTestPath
+	}
 	dir, err := os.UserCacheDir()
 	if err != nil {
 		return filepath.Join(os.TempDir(), "podcast-migrate-overcast-source.opml")

@@ -949,7 +949,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				continue
 			}
 			podTitle := feedToTitle[ep.FeedURL]
-			_, ok := findInIndex(index, ep)
+			entry, ok := findInIndex(index, ep)
 			if !ok {
 				dryRunNote := "no match found in Pocket Casts account"
 				if ep.FeedURL != "" {
@@ -958,6 +958,14 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
 					playStateLabel(ep.PlayState, ep.PlayPosition), "—", dryRunNote)
 				continue
+			}
+			if !opts.ForceUpdate {
+				if reason := migrate.SkipReason(ep.PlayState, ep.PlayPosition, entry.currentState, entry.currentPos); reason != "" {
+					writeLogLine(opts.LogWriter, reason, podTitle, ep.Title, ep.PubDate,
+						playStateLabel(ep.PlayState, ep.PlayPosition),
+						playStateLabel(entry.currentState, entry.currentPos), "")
+					continue
+				}
 			}
 			fmt.Printf("  [dry-run] would set progress: %q — %q → %s\n",
 				podTitle, ep.Title, playStateLabel(ep.PlayState, ep.PlayPosition))
@@ -970,13 +978,23 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 
 	// --- Pre-count ---
 	toUpdate := 0
+	alreadyDone := 0
 	for _, ep := range episodes {
 		if ep.FromDestination || ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
 		}
-		if _, ok := findInIndex(index, ep); ok {
+		entry, ok := findInIndex(index, ep)
+		if !ok {
+			continue
+		}
+		if !opts.ForceUpdate && migrate.SkipReason(ep.PlayState, ep.PlayPosition, entry.currentState, entry.currentPos) != "" {
+			alreadyDone++
+		} else {
 			toUpdate++
 		}
+	}
+	if alreadyDone > 0 {
+		fmt.Printf("pocketcasts: skipping %d already-satisfied episode(s) (Pocket Casts state matches or exceeds source)\n", alreadyDone)
 	}
 	fmt.Printf("pocketcasts: request delay: %v between calls\n", requestDelay)
 	fmt.Printf("pocketcasts: writing play state for %d episode(s)...\n", toUpdate)
@@ -984,6 +1002,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	// --- Write loop ---
 	updated := 0
 	apiSkipped := 0
+	alreadySatisfied := 0
 	notFound := 0
 
 	const (
@@ -1008,6 +1027,16 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
 				playStateLabel(ep.PlayState, ep.PlayPosition), "—", notFoundNote)
 			continue
+		}
+
+		if !opts.ForceUpdate {
+			if reason := migrate.SkipReason(ep.PlayState, ep.PlayPosition, entry.currentState, entry.currentPos); reason != "" {
+				writeLogLine(opts.LogWriter, reason, podTitle, ep.Title, ep.PubDate,
+					playStateLabel(ep.PlayState, ep.PlayPosition),
+					playStateLabel(entry.currentState, entry.currentPos), "")
+				alreadySatisfied++
+				continue
+			}
 		}
 
 		// Determine API parameters.
@@ -1103,6 +1132,9 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 
 	if notFound > 0 {
 		fmt.Printf("pocketcasts: %d episode(s) not matched in Pocket Casts (not subscribed or not found in episode list)\n", notFound)
+	}
+	if alreadySatisfied > 0 {
+		fmt.Printf("pocketcasts: %d episode(s) skipped — Pocket Casts state already matches or exceeds source\n", alreadySatisfied)
 	}
 	if apiSkipped > 0 {
 		fmt.Printf("pocketcasts: %d episode(s) failed during write (see warnings above)\n", apiSkipped)

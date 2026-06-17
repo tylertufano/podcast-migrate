@@ -43,9 +43,10 @@ WHERE (ZPLAYSTATE != 0 OR ZPLAYHEAD > 0 OR ZPLAYCOUNT > 0 OR ZLASTDATEPLAYED IS 
 1. `ZPLAYHEAD > 0` → `PlayStateInProgress` with the stored position
 2. `ZPLAYSTATE = 2` AND trusted (not auto-marked) → `PlayStatePlayed`
 3. `ZPLAYSTATE = 1` with no playhead → `PlayStatePlayed` (started, no position stored)
-4. `ZPLAYCOUNT > 0` AND `ZPLAYSTATESOURCE = 0` → `PlayStatePlayed` (iCloud synced without state)
-5. `ZLASTDATEPLAYED` set with a non-auto source (1, 3, or 4) AND `ZPLAYCOUNT = 0` → `PlayStatePlayed` (played on another device, only timestamp synced)
-6. Otherwise: **skip** (no reliable evidence of genuine playback)
+4. `ZPLAYCOUNT > 0` AND `ZPLAYSTATESOURCE = 0` → `PlayStatePlayed` (iCloud synced count without state)
+5. `ZLASTDATEPLAYED` SET AND `ZPLAYSTATESOURCE = 3` AND `ZPLAYCOUNT > 0` → `PlayStatePlayed` (iCloud sync gap: listened to completion on a mobile device; completion flag did not sync back to Mac but count and timestamp did — see below)
+6. `ZLASTDATEPLAYED` SET AND `ZPLAYSTATESOURCE` is a non-auto value (1, 3, or 4) AND `ZPLAYCOUNT = 0` → `PlayStatePlayed` (played on another device, only timestamp synced)
+7. Otherwise: **skip** (no reliable evidence of genuine playback)
 
 **Trust logic for `ZPLAYSTATESOURCE`:**
 
@@ -53,12 +54,14 @@ WHERE (ZPLAYSTATE != 0 OR ZPLAYHEAD > 0 OR ZPLAYCOUNT > 0 OR ZLASTDATEPLAYED IS 
 |---|---|---|
 | 1 | Manually marked by user in UI | ✓ Always |
 | 2 | Auto-marked when a newer episode arrived | ✗ Never |
-| 3 | Listened to completion | ✓ Only when `ZPLAYCOUNT > 0` OR `ZLASTDATEPLAYED` is set |
+| 3 | Listened to completion | ✓ Only when `ZPLAYCOUNT > 0` AND `ZLASTDATEPLAYED` is set (case 5) |
 | 4 | Synced from another device | ✓ Always |
 | 6 | Default/initial (also bulk auto-marks) | ✗ Never |
-| 0 | Unset | Conditional (see case 4 and 5 above) |
+| 0 | Unset | Conditional (see cases 4 and 6 above) |
 
 Source 3 is conditional because Apple Podcasts Subscription (PSUB/PLUS) back-catalog auto-marks also use source=3 with no play count or date — identical to a genuine completion.
+
+**iCloud sync gap (case 5)**: When an episode is listened to completion on iPhone or iPad, the mobile device records the event (incrementing `ZPLAYCOUNT` and setting `ZLASTDATEPLAYED`) but `ZPLAYSTATE` often remains `0` on the Mac because iCloud does not always propagate the completion flag. Apple also clears `ZLASTDATEPLAYED` when the user manually marks an episode as unplayed (while retaining `ZPLAYCOUNT` and `ZPLAYSTATESOURCE=3`). Requiring `ZLASTDATEPLAYED` to be set makes "completed but not synced" (date present) reliably distinguishable from "completed then manually unplayed" (date cleared). This gap affects a large fraction of episodes played on mobile.
 
 **Delta sync** (`--since`): filters by three timestamp columns:
 - `ZPLAYSTATELASTMODIFIEDDATE` — updated on state transitions
@@ -218,7 +221,7 @@ Podcast UUID resolution when the source feed URL doesn't match any PC subscripti
 
 **`UpdateEpisodeProgress`**: `POST api.pocketcasts.com/user/playback/sync_progress` with `{ episode_uuid, podcast_uuid, playing_status, played_up_to, duration }`.
 
-**Important**: Pocket Casts has no per-episode read-back API to check current state before writing. The skip-reason check relies on the Phase A/A_sync index values. `--force-update` has no effect on the Pocket Casts provider.
+**Skip-reason check**: before writing, the provider compares the desired play state against the indexed current state (`entry.currentState`/`entry.currentPos` populated from Phase A1, A2, or the sync overlay). If Pocket Casts is already at or ahead of the desired state, the episode is logged as `already_played` or `already_ahead` and no API call is made — matching the Overcast write path's behaviour. Pass `--force-update` to bypass this check and write unconditionally.
 
 ---
 

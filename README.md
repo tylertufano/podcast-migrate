@@ -81,8 +81,6 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **`--since` for Overcast and Pocket Casts sources** — Overcast's OPML export includes a `userUpdatedDate` attribute per episode; Pocket Casts' `sync/update` endpoint accepts a real `lastModified` timestamp. Wiring `--since` into these source paths would make incremental syncs faster on all three platforms.
 
-**Pocket Casts pre-write state check** — the Pocket Casts write path cannot read back an episode's current state before writing (no per-episode GET API). The skip-reason check relies on in-memory index values that may not reflect state written by another device since the last sync.
-
 ### Features
 
 **Continuous sync / observe-and-write** — the `observe` command detects Apple Podcasts SQLite changes in real time. Extending it (or adding a `daemon` subcommand) to trigger incremental writes on each detected change would enable true background sync without manual `--since` runs.

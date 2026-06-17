@@ -471,11 +471,10 @@ func TestProvider_SetLibrary_WritesPlayedEpisode(t *testing.T) {
 	}
 }
 
-func TestProvider_SetLibrary_AlwaysWritesRegardlessOfPCState(t *testing.T) {
-	// Pocket Casts does not expose a reliable per-episode read-back API, so the
-	// provider always writes unconditionally — even when the in-progress list
-	// shows the episode as already played. --force-update is effectively the
-	// permanent behaviour for PC targets.
+func TestProvider_SetLibrary_SkipsAlreadySatisfiedEpisodes(t *testing.T) {
+	// When Phase A1 (in-progress list) shows an episode already played in PC
+	// and the source also wants it played, the skip-reason check should fire
+	// and no update call should be made.
 	var updateCalls []map[string]any
 	restore := newFullTestServer(t, testServerConfig{
 		inProgressEpisodes: []map[string]any{
@@ -485,7 +484,7 @@ func TestProvider_SetLibrary_AlwaysWritesRegardlessOfPCState(t *testing.T) {
 				"title":         "Episode One",
 				"published":     "2024-04-10T08:00:00Z",
 				"duration":      3600,
-				"playingStatus": 3, // already played in PC — should still be written
+				"playingStatus": 3, // already played in PC
 				"playedUpTo":    3600,
 				"isDeleted":     false,
 			},
@@ -513,8 +512,9 @@ func TestProvider_SetLibrary_AlwaysWritesRegardlessOfPCState(t *testing.T) {
 	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
 		t.Fatalf("SetLibrary: %v", err)
 	}
-	if len(updateCalls) != 1 {
-		t.Errorf("expected 1 update call (always-write); got %d", len(updateCalls))
+	// PC already has it played → already_played skip → no API call.
+	if len(updateCalls) != 0 {
+		t.Errorf("expected 0 update calls (already satisfied); got %d", len(updateCalls))
 	}
 }
 
@@ -907,10 +907,13 @@ func TestProvider_Name(t *testing.T) {
 
 // ---- sync/update play-state overlay ----
 
-// TestProvider_SetLibrary_SyncOverlay verifies that Phase B-cdn episodes
-// receive accurate play state from /user/sync/update rather than defaulting
-// to PlayingUnplayed. The episode UUID is present in sync state as "played";
-// the update call to PC should carry PlayingPlayed.
+// TestProvider_SetLibrary_SyncOverlay verifies that the /user/sync/update
+// overlay correctly identifies a CDN episode's real play state so that
+// already-satisfied episodes are skipped rather than re-written.
+//
+// Without the overlay, the CDN episode would appear as PlayingUnplayed and
+// the skip-reason check would not fire, causing a redundant write. With the
+// overlay, currentState=played matches the desired state=played → skip.
 func TestProvider_SetLibrary_SyncOverlay(t *testing.T) {
 	var updateCalls []map[string]any
 	restore := newFullTestServer(t, testServerConfig{
@@ -956,15 +959,10 @@ func TestProvider_SetLibrary_SyncOverlay(t *testing.T) {
 		t.Fatalf("SetLibrary: %v", err)
 	}
 
-	if len(updateCalls) != 1 {
-		t.Fatalf("expected 1 update call, got %d", len(updateCalls))
-	}
-	if updateCalls[0]["uuid"] != "ep-sync-1" {
-		t.Errorf("uuid = %v, want ep-sync-1", updateCalls[0]["uuid"])
-	}
-	// The target state (from the source library) is Played — verify PC receives it.
-	if int(updateCalls[0]["status"].(float64)) != pocketcasts.PlayingPlayed {
-		t.Errorf("status = %v, want %d (played)", updateCalls[0]["status"], pocketcasts.PlayingPlayed)
+	// Overlay correctly identified the episode as already-played in PC →
+	// skip-reason fires → no update call should be made.
+	if len(updateCalls) != 0 {
+		t.Fatalf("expected 0 update calls (already satisfied), got %d", len(updateCalls))
 	}
 }
 

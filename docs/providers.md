@@ -192,13 +192,16 @@ The `metadataIdentifier` required as the KVS key is not derivable from episode m
 **Request flow:**
 
 1. `getAll(com.apple.podcasts)` — fetches play state and subscription data for all subscribed feeds (see Subscriptions below). Also populates the `metadataIdentifier` lookup cache.
-2. `getAll(com.apple.upp)` — fetches current server-side versions for all episode keys. Used as `base-version` in subsequent `putAll` calls.
-3. `putAll(com.apple.upp)` — sends all private-feed episodes in a single batched request (chunked at 25 per call). Each entry includes:
+2. `getAll(com.apple.upp)` — fetches current server-side versions **and values** for all episode keys. Used as `base-version` in `putAll` calls; the values are also used for the skip-reason check below.
+3. **Skip-reason check** — before writing each episode, the server-side value from step 2 is lazily decoded (DEFLATE decompress → binary plist → `{bktm, hbpl}`). If `hbpl=true` for a "played" episode, or `bktm ≥ desired − 5s` for an in-progress episode, the episode is logged as `skipped` (`already synced via KVS`) and no `putAll` entry is generated. Pass `--force-update` to bypass.
+4. `putAll(com.apple.upp)` — sends all episodes that passed the skip check in a single batched request (chunked at 25 per call). Each entry includes:
    - `key`: the `metadataIdentifier`
    - `base-version`: server-side version from step 2 (stale local SQLite `Z_OPT` values are always overwritten)
    - `value`: the DEFLATE-compressed binary plist
 
 **Why `base-version` must come from `getAll`:** the server enforces optimistic concurrency — if the submitted `base-version` doesn't match the server's current version, `putAll` returns `status=1198`. Because other devices write to KVS independently, the local SQLite `Z_OPT` value is typically stale.
+
+**Re-runs are safe:** the skip-reason check makes KVS writes idempotent. Re-running a migration after episodes have already been synced produces no writes — only `skipped` log entries.
 
 #### KVS subscriptions — `com.apple.podcasts`
 

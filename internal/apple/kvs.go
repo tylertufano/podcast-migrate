@@ -42,13 +42,23 @@ const (
 // APPLE_KVS_COOKIES env var (preferred) or scanned from known binarycookies
 // files on disk. The APPLE_KVS_DSID env var supplies the DSID when it cannot
 // be extracted from the cookie string.
+// kvsServerState is the decoded play state for one episode from the server's
+// getAll(com.apple.upp) response. Used to skip episodes that are already at
+// the desired play state (idempotency check).
+type kvsServerState struct {
+	HasBeenPlayed   bool
+	BookmarkTimeSec float64
+}
+
 type KVSWriter struct {
-	sqlitePath     string
-	cookieHdr      string // full Cookie: header value
-	dsid           string // iTunes Store account DSID
-	httpClient     *http.Client
-	sessionReady   bool           // true after getAll(com.apple.upp) has been called
-	serverVersions map[string]int // metadataIdentifier → current server version, populated by getAll
+	sqlitePath      string
+	cookieHdr       string // full Cookie: header value
+	dsid            string // iTunes Store account DSID
+	httpClient      *http.Client
+	sessionReady    bool              // true after getAll(com.apple.upp) has been called
+	serverVersions  map[string]int    // metadataIdentifier → current server version, populated by getAll
+	serverRawValues  map[string][]byte          // metadataIdentifier → DEFLATE-compressed inner plist bytes
+	serverPlayStates map[string]kvsServerState  // lazily decoded per-episode play states
 
 	// AllFeeds enables KVS-only mode: episode lookup is not restricted to
 	// ZSTORETRACKID=0 (private/subscriber) episodes. Set by SetKVSOnlyMode.
@@ -212,6 +222,13 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 
 	writeLogHeader(opts.LogWriter)
 
+	// Eagerly fetch current server state so we can skip already-synced episodes.
+	if !opts.DryRun {
+		if iErr := w.initSession(ctx); iErr != nil {
+			fmt.Printf("apple/kvs: session init failed (will write without skip check): %v\n", iErr)
+		}
+	}
+
 	now := time.Since(coreDataEpoch).Seconds()
 	var pending []kvsItemWithMeta
 	dryRunCount := 0
@@ -236,6 +253,18 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 		}
 
 		podTitle := feedToTitle[ep.FeedURL]
+
+		// Skip episodes already at the desired play state on the server.
+		if !opts.ForceUpdate {
+			if serverState, ok := w.checkServerPlayState(ctx, item.MetadataIdentifier); ok {
+				if serverStateCoversDesired(ep, serverState) {
+					writeLogLine(opts.LogWriter, "skipped", podTitle, ep.Title, ep.PubDate,
+						playStateLabel(ep.PlayState, ep.PlayPosition), "—", "already synced via KVS")
+					continue
+				}
+			}
+		}
+
 		applyPlayState(ep, &item, now)
 
 		if opts.DryRun {
@@ -329,6 +358,13 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 	}
 	defer db.Close()
 
+	// Eagerly fetch current server state so resolveEpisodes can skip already-synced episodes.
+	if !opts.DryRun {
+		if iErr := w.initSession(ctx); iErr != nil {
+			fmt.Printf("apple/kvs: session init failed (will write without skip check): %v\n", iErr)
+		}
+	}
+
 	now := time.Since(coreDataEpoch).Seconds()
 
 	// resolveEpisodes categorises each episode into:
@@ -355,6 +391,18 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 				}
 				continue
 			}
+
+			// Skip episodes already at the desired play state on the server.
+			if !opts.ForceUpdate && !opts.DryRun {
+				if serverState, ok := w.checkServerPlayState(ctx, item.MetadataIdentifier); ok {
+					if serverStateCoversDesired(ep, serverState) {
+						writeLogLine(opts.LogWriter, "skipped", podTitle, ep.Title, ep.PubDate,
+							playStateLabel(ep.PlayState, ep.PlayPosition), "—", "already synced via KVS")
+						continue
+					}
+				}
+			}
+
 			applyPlayState(ep, &item, now)
 			if opts.DryRun {
 				fmt.Printf("  [dry-run] kvs: would putAll %q — %q (key=%s)\n",
@@ -869,23 +917,25 @@ func (w *KVSWriter) initSession(ctx context.Context) error {
 	}
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
-	w.serverVersions = parseServerVersions(ctx, respBody)
+	w.serverVersions, w.serverRawValues = parseServerState(ctx, respBody)
+	w.serverPlayStates = make(map[string]kvsServerState) // clear decoded cache on each refresh
 	w.sessionReady = true
 	return nil
 }
 
-// parseServerVersions extracts metadataIdentifier→version pairs from a getAll
-// binary plist response body. Returns an empty map on any parse failure.
-func parseServerVersions(ctx context.Context, body []byte) map[string]int {
-	versions := make(map[string]int)
+// parseServerState extracts metadataIdentifier→version and metadataIdentifier→rawValue
+// pairs from a getAll(com.apple.upp) binary plist response. Returns empty maps on failure.
+func parseServerState(ctx context.Context, body []byte) (versions map[string]int, rawValues map[string][]byte) {
+	versions = make(map[string]int)
+	rawValues = make(map[string][]byte)
 	if len(body) == 0 {
-		return versions
+		return
 	}
 	cmd := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", "-")
 	cmd.Stdin = bytes.NewReader(body)
 	xmlOut, err := cmd.Output()
 	if err != nil {
-		return versions
+		return
 	}
 	s := string(xmlOut)
 
@@ -893,17 +943,17 @@ func parseServerVersions(ctx context.Context, body []byte) map[string]int {
 	const valuesKey = "<key>values</key>"
 	vi := strings.Index(s, valuesKey)
 	if vi == -1 {
-		return versions
+		return
 	}
 	s = s[vi+len(valuesKey):]
 	arrayStart := strings.Index(s, "<array>")
 	arrayEnd := strings.Index(s, "</array>")
 	if arrayStart == -1 || arrayEnd == -1 || arrayEnd <= arrayStart {
-		return versions
+		return
 	}
 	s = s[arrayStart+len("<array>") : arrayEnd]
 
-	// Parse each <dict> block: extract the "key" string and "version" string.
+	// Parse each <dict> block: extract key, version, and value.
 	for {
 		dictStart := strings.Index(s, "<dict>")
 		dictEnd := strings.Index(s, "</dict>")
@@ -921,8 +971,11 @@ func parseServerVersions(ctx context.Context, body []byte) map[string]int {
 		if v, err := strconv.Atoi(verStr); err == nil {
 			versions[metaID] = v
 		}
+		if raw := xmlDataAfter(block, "<key>value</key>"); len(raw) > 0 {
+			rawValues[metaID] = raw
+		}
 	}
-	return versions
+	return
 }
 
 // xmlStringAfter returns the content of the first <string>…</string> element
@@ -938,6 +991,75 @@ func xmlStringAfter(s, tag string) string {
 		return ""
 	}
 	return strings.SplitN(after, "<", 2)[0]
+}
+
+// decodeServerValue decodes a DEFLATE-compressed binary plist (as stored in
+// serverRawValues) into a kvsServerState. The input is the already-base64-decoded
+// compressed bytes returned by xmlDataAfter.
+func decodeServerValue(ctx context.Context, compressed []byte) (kvsServerState, error) {
+	fr := flate.NewReader(bytes.NewReader(compressed))
+	inner, err := io.ReadAll(fr)
+	fr.Close()
+	if err != nil {
+		return kvsServerState{}, fmt.Errorf("deflate: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", "-")
+	cmd.Stdin = bytes.NewReader(inner)
+	xmlOut, err := cmd.Output()
+	if err != nil {
+		return kvsServerState{}, fmt.Errorf("plutil: %w", err)
+	}
+	s := string(xmlOut)
+	var state kvsServerState
+	if idx := strings.Index(s, "<key>hbpl</key>"); idx != -1 {
+		after := strings.TrimSpace(s[idx+len("<key>hbpl</key>"):])
+		state.HasBeenPlayed = strings.HasPrefix(after, "<true/>")
+	}
+	if idx := strings.Index(s, "<key>bktm</key>"); idx != -1 {
+		after := strings.TrimSpace(s[idx+len("<key>bktm</key>"):])
+		after = strings.TrimPrefix(after, "<real>")
+		if valStr := strings.SplitN(after, "<", 2)[0]; valStr != after {
+			if f, pErr := strconv.ParseFloat(valStr, 64); pErr == nil {
+				state.BookmarkTimeSec = f
+			}
+		}
+	}
+	return state, nil
+}
+
+// checkServerPlayState returns the server-side play state for the given
+// metadataIdentifier, lazily decoding the raw plist value on first access.
+// Returns false if no server entry exists for this episode.
+func (w *KVSWriter) checkServerPlayState(ctx context.Context, metaID string) (kvsServerState, bool) {
+	if w.serverPlayStates == nil {
+		return kvsServerState{}, false
+	}
+	if state, ok := w.serverPlayStates[metaID]; ok {
+		return state, true
+	}
+	compressed, ok := w.serverRawValues[metaID]
+	if !ok {
+		return kvsServerState{}, false
+	}
+	state, err := decodeServerValue(ctx, compressed)
+	if err != nil {
+		return kvsServerState{}, false
+	}
+	w.serverPlayStates[metaID] = state
+	return state, true
+}
+
+// serverStateCoversDesired reports whether the server's current play state
+// already satisfies what we want to write, making the write a no-op.
+func serverStateCoversDesired(ep model.EpisodeState, state kvsServerState) bool {
+	switch ep.PlayState {
+	case model.PlayStatePlayed:
+		return state.HasBeenPlayed
+	case model.PlayStateInProgress:
+		desired := ep.PlayPosition.Seconds()
+		return desired > 0 && state.BookmarkTimeSec >= desired-5 && state.BookmarkTimeSec > 0
+	}
+	return false
 }
 
 // kvsBatchSize is the maximum number of episodes per putAll request.

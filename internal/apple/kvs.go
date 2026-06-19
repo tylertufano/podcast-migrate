@@ -44,8 +44,14 @@ type KVSWriter struct {
 	cookieHdr      string // full Cookie: header value
 	dsid           string // iTunes Store account DSID
 	httpClient     *http.Client
-	sessionReady   bool           // true after getAll has been called
+	sessionReady   bool           // true after getAll(com.apple.upp) has been called
 	serverVersions map[string]int // metadataIdentifier → current server version, populated by getAll
+
+	// com.apple.podcasts domain state — populated by initPodcastsDomain.
+	podcastsDomainReady bool
+	podcastsFeeds       map[string]*playStateFeed // feedURL → play state feed
+	subscriptions       []podcastSubscription
+	subVersion          string // version of podcastSubscriptions-2012-09-04
 }
 
 // binaryCookiePaths is the list of paths tried when APPLE_KVS_COOKIES is unset.
@@ -205,7 +211,7 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 			continue
 		}
 
-		item, found, err := lookupPrivateEpisode(ctx, db, ep)
+		item, found, err := w.lookupPrivateEpisode(ctx, db, ep)
 		if err != nil {
 			fmt.Printf("  kvs: lookup failed for %q: %v\n", ep.Title, err)
 			writeLogLine(opts.LogWriter, "error", feedToTitle[ep.FeedURL], ep.Title, ep.PubDate,
@@ -264,7 +270,37 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 // be resolved via the Apple catalog (CatalogPodcastNotInCatalog). Batching is
 // critical: the server's session token is single-use, so a second sequential
 // putAll with the same token returns status 1198.
+//
+// Lookup order for each episode:
+//  1. com.apple.podcasts play state cache (no SQLite required)
+//  2. Local SQLite (GUID, then FeedURL+PubDate, then FeedURL+Title)
+//
+// If a feed is not yet subscribed in Apple Podcasts, it is automatically
+// subscribed before the play state is written.
 func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeState, feedToTitle map[string]string, opts provider.WriteOptions) (int, error) {
+	// Auto-subscribe any unsubscribed private feeds before the write pass.
+	// This ensures metadataIdentifiers exist in the KVS for future lookups.
+	if w.podcastsDomainReady && !opts.DryRun {
+		seen := make(map[string]bool)
+		for _, ep := range episodes {
+			if seen[ep.FeedURL] {
+				continue
+			}
+			seen[ep.FeedURL] = true
+			if !w.IsSubscribed(ep.FeedURL) {
+				title := feedToTitle[ep.FeedURL]
+				if title == "" {
+					title = ep.FeedURL
+				}
+				if subErr := w.Subscribe(ctx, ep.FeedURL, title); subErr != nil {
+					fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
+				} else {
+					fmt.Printf("  kvs: subscribed to %q\n", title)
+				}
+			}
+		}
+	}
+
 	db, err := sql.Open("sqlite", "file:"+w.sqlitePath+"?mode=ro&_journal=off")
 	if err != nil {
 		return 0, fmt.Errorf("kvs: open sqlite: %w", err)
@@ -278,7 +314,7 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 	for _, ep := range episodes {
 		podTitle := feedToTitle[ep.FeedURL]
 
-		item, found, err := lookupPrivateEpisode(ctx, db, ep)
+		item, found, err := w.lookupPrivateEpisode(ctx, db, ep)
 		if err != nil {
 			fmt.Printf("  kvs: lookup failed for %q: %v\n", ep.Title, err)
 			writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
@@ -288,7 +324,7 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 		if !found {
 			writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
 				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-				"not in catalog and not found in local Apple Podcasts DB")
+				"not in catalog; not in local DB or KVS — open Apple Podcasts to index this feed")
 			continue
 		}
 
@@ -346,7 +382,7 @@ func (w *KVSWriter) WriteEpisode(ctx context.Context, ep model.EpisodeState) (bo
 	}
 	defer db.Close()
 
-	item, found, err := lookupPrivateEpisode(ctx, db, ep)
+	item, found, err := w.lookupPrivateEpisode(ctx, db, ep)
 	if err != nil || !found {
 		return found, err
 	}
@@ -367,13 +403,34 @@ type kvsItem struct {
 	TimestampSec       float64 // CoreData epoch seconds
 }
 
-// lookupPrivateEpisode finds the local Apple Podcasts episode that matches ep
-// and returns its KVS metadata. Only private-feed episodes (ZSTORETRACKID=0)
-// with a non-empty ZMETADATAIDENTIFIER are returned.
+// lookupPrivateEpisodeFromKVS checks the cached com.apple.podcasts play state
+// for the episode's metadataIdentifier. Returns a kvsItem with UPPVersion=1
+// (overridden later from serverVersions if the episode exists in com.apple.upp).
+func (w *KVSWriter) lookupPrivateEpisodeFromKVS(ep model.EpisodeState) (kvsItem, bool) {
+	metaID, ok := w.lookupEpisodeViaPlayState(ep.FeedURL, ep.GUID)
+	if !ok {
+		return kvsItem{}, false
+	}
+	return kvsItem{
+		MetadataIdentifier: metaID,
+		UPPVersion:         1, // will be overridden by serverVersions in putAll
+	}, true
+}
+
+// lookupPrivateEpisode finds the Apple Podcasts episode that matches ep and
+// returns its KVS metadata. Only private-feed episodes (ZSTORETRACKID=0) with
+// a non-empty ZMETADATAIDENTIFIER are returned.
 //
-// Matching priority: GUID → FeedURL+PubDate (within 1 day) → FeedURL+Title.
-func lookupPrivateEpisode(ctx context.Context, db *sql.DB, ep model.EpisodeState) (kvsItem, bool, error) {
-	// Attempt GUID match first (exact, fast).
+// Lookup order:
+//  1. com.apple.podcasts play state cache (no SQLite, fast)
+//  2. Local SQLite: GUID → FeedURL+PubDate (within 1 day) → FeedURL+Title
+func (w *KVSWriter) lookupPrivateEpisode(ctx context.Context, db *sql.DB, ep model.EpisodeState) (kvsItem, bool, error) {
+	// Fast path: check the KVS play state we already fetched.
+	if item, ok := w.lookupPrivateEpisodeFromKVS(ep); ok {
+		return item, true, nil
+	}
+
+	// Fall back to local SQLite. GUID match first (exact, fast).
 	if ep.GUID != "" {
 		item, found, err := scanKVSRow(db.QueryRowContext(ctx, `
 			SELECT e.ZMETADATAIDENTIFIER,
@@ -494,15 +551,22 @@ func (w *KVSWriter) setKVSHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", "Podcasts/1.1.0 (Macintosh; OS X 27.0; 26A5353q) AppleWebKit/2625.1.18.11.5 AMS/1 (dt:1)")
 }
 
-// initSession calls getAll to mirror the native Podcasts app behaviour and to
-// fetch the current server-side version for every key in the domain. These
-// versions are stored in w.serverVersions and used as base-version in putAll,
-// replacing the stale local SQLite Z_OPT values. Without current versions,
-// putAll returns status=1198 whenever another device (e.g. iPhone) has synced
-// since the last Mac DB update.
+// initSession calls getAll for both KVS domains:
+//   - com.apple.upp: fetches current server-side version for every episode key.
+//     These versions replace stale local SQLite Z_OPT values; without them,
+//     putAll returns status=1198 when another device has synced since the last
+//     Mac DB update.
+//   - com.apple.podcasts: fetches per-feed episode play state (including
+//     metadataIdentifier for each episode) and the subscription list. This
+//     allows episode lookup without reading the local SQLite database.
 func (w *KVSWriter) initSession(ctx context.Context) error {
 	if w.sessionReady {
 		return nil
+	}
+	// Best-effort: populate com.apple.podcasts state for SQLite-free episode
+	// lookup. Log but do not fail if this call errors.
+	if err := w.initPodcastsDomain(ctx); err != nil {
+		fmt.Printf("apple/kvs: podcasts domain init failed (will fall back to SQLite): %v\n", err)
 	}
 
 	bodyXML := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +

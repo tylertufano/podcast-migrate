@@ -291,6 +291,62 @@ func TestMerge_OnlyPlayState_SkipsSubscriptions(t *testing.T) {
 	}
 }
 
+func TestMerge_PodcastFilter_LimitsSrcSubscriptions(t *testing.T) {
+	// Source has three podcasts; only one matches the filter.
+	// Destination has one existing subscription not in the src.
+	// After merge: only the matching src podcast + the existing dst podcast.
+	src := &model.Library{
+		Podcasts: []model.Podcast{
+			{Title: "Fresh Air", FeedURL: "https://src.example.com/freshair"},
+			{Title: "Planet Money", FeedURL: "https://src.example.com/planetmoney"},
+			{Title: "Radiolab", FeedURL: "https://src.example.com/radiolab"},
+		},
+	}
+	dst := &model.Library{
+		Podcasts: []model.Podcast{
+			{Title: "My Favorite Murder", FeedURL: "https://dst.example.com/mfm"},
+		},
+	}
+	opts := provider.WriteOptions{PodcastFilter: []string{"fresh air"}}
+	result := merge(src, dst, opts)
+
+	// Want: Fresh Air (matched src) + My Favorite Murder (existing dst, always kept).
+	if len(result.Podcasts) != 2 {
+		titles := make([]string, len(result.Podcasts))
+		for i, p := range result.Podcasts {
+			titles[i] = p.Title
+		}
+		t.Errorf("PodcastFilter: got %d podcasts %v, want 2", len(result.Podcasts), titles)
+	}
+	feedURLs := make(map[string]bool)
+	for _, p := range result.Podcasts {
+		feedURLs[p.FeedURL] = true
+	}
+	if !feedURLs["https://src.example.com/freshair"] {
+		t.Error("Fresh Air (matching src) should be in merged podcasts")
+	}
+	if !feedURLs["https://dst.example.com/mfm"] {
+		t.Error("My Favorite Murder (existing dst) should always be preserved")
+	}
+	if feedURLs["https://src.example.com/planetmoney"] {
+		t.Error("Planet Money (non-matching src) should be excluded")
+	}
+}
+
+func TestMerge_PodcastFilter_EmptyFilter_IncludesAll(t *testing.T) {
+	src := &model.Library{
+		Podcasts: []model.Podcast{
+			{Title: "Fresh Air", FeedURL: "https://a.example.com/rss"},
+			{Title: "Radiolab", FeedURL: "https://b.example.com/rss"},
+		},
+	}
+	opts := provider.WriteOptions{} // no filter
+	result := merge(src, nil, opts)
+	if len(result.Podcasts) != 2 {
+		t.Errorf("no filter: got %d podcasts, want 2", len(result.Podcasts))
+	}
+}
+
 func TestMerge_NilDst_UsesSrcOnly(t *testing.T) {
 	src := &model.Library{
 		Podcasts: []model.Podcast{{FeedURL: "https://a.example.com/feed"}},

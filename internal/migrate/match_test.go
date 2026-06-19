@@ -144,6 +144,49 @@ func TestFilterEpisodesByPodcast_CaseInsensitiveFilter(t *testing.T) {
 	}
 }
 
+// ── FilterPodcastsByTitle ─────────────────────────────────────────────────────
+
+func TestFilterPodcastsByTitle_EmptyFilters_ReturnsAll(t *testing.T) {
+	pods := []model.Podcast{
+		{Title: "Fresh Air", FeedURL: "https://a.example.com/rss"},
+		{Title: "Planet Money", FeedURL: "https://b.example.com/rss"},
+	}
+	got := migrate.FilterPodcastsByTitle(pods, nil)
+	if len(got) != 2 {
+		t.Errorf("no filter: got %d, want 2", len(got))
+	}
+}
+
+func TestFilterPodcastsByTitle_FilterByTitle(t *testing.T) {
+	pods := []model.Podcast{
+		{Title: "Fresh Air", FeedURL: "https://a.example.com/rss"},
+		{Title: "Planet Money", FeedURL: "https://b.example.com/rss"},
+		{Title: "Fresh Air Plus", FeedURL: "https://c.example.com/rss"},
+	}
+	got := migrate.FilterPodcastsByTitle(pods, []string{"fresh air"})
+	if len(got) != 2 {
+		t.Errorf("filter 'fresh air': got %d, want 2 (Fresh Air + Fresh Air Plus)", len(got))
+	}
+}
+
+func TestFilterPodcastsByTitle_CaseInsensitive(t *testing.T) {
+	pods := []model.Podcast{{Title: "Fresh Air", FeedURL: "https://a.example.com/rss"}}
+	got := migrate.FilterPodcastsByTitle(pods, []string{"FRESH AIR"})
+	if len(got) != 1 {
+		t.Errorf("case-insensitive filter: got %d, want 1", len(got))
+	}
+}
+
+func TestFilterPodcastsByTitle_NoMatch_ReturnsNone(t *testing.T) {
+	pods := []model.Podcast{
+		{Title: "Fresh Air", FeedURL: "https://a.example.com/rss"},
+	}
+	got := migrate.FilterPodcastsByTitle(pods, []string{"radiolab"})
+	if len(got) != 0 {
+		t.Errorf("no match: got %d, want 0", len(got))
+	}
+}
+
 // ── FuzzyNormalizeTitle ───────────────────────────────────────────────────────
 
 func TestFuzzyNormalizeTitle_SeasonMarkerS01Stripped(t *testing.T) {

@@ -16,11 +16,10 @@ import (
 // denied or the path does not exist) it falls back to an OPML file.
 //
 // Reading:  SQLite (play state + subscriptions) with OPML fallback (subscriptions only).
-// Writing:  Play state is written via the amp-api.podcasts.apple.com web API, which
-//           syncs to all devices (iPhone, iPad, Mac). Web API credentials must be
-//           provided via SetWebAPICredentials before calling SetLibrary.
-//           Subscription writes are not supported (Apple Podcasts has no public write API
-//           for subscriptions; use the GUI to subscribe).
+// Writing:  Play state is written via the amp-api.podcasts.apple.com web API (syncs to
+//           all devices). Subscriptions and private-feed episode play state are written
+//           via Apple's KVS (bookkeeper.itunes.apple.com); credentials are required from
+//           scripts/capture-kvs-creds.sh.
 type Provider struct {
 	sqlitePath string
 	opmlPath   string // optional fallback; empty disables it
@@ -67,13 +66,17 @@ func (p *Provider) SetWebAPICredentials(bearerToken, mediaUserToken string) {
 func (p *Provider) Name() string { return "Apple Podcasts" }
 
 func (p *Provider) Capabilities() provider.Capabilities {
+	var kvsReady bool
+	if p.webAPI != nil {
+		kvsReady = p.webAPI.kvsWriter != nil
+	}
 	return provider.Capabilities{
 		ReadSubscriptions: true,
 		ReadPlayState:     true,
 		// Play state writes require web API credentials.
 		WritePlayState: p.webAPI != nil,
-		// Apple Podcasts has no public subscription write API.
-		WriteSubscriptions: false,
+		// Subscription writes use the KVS path (requires APPLE_KVS_DSID + APPLE_KVS_COOKIES).
+		WriteSubscriptions: kvsReady,
 	}
 }
 
@@ -101,12 +104,13 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 
 // SetLibrary writes episode play state to Apple Podcasts via the web API.
 // Web API credentials must be set via SetWebAPICredentials before calling.
-// Subscription writes are not supported.
+// Subscriptions are written via KVS automatically during play state migration
+// (auto-subscribe); a dedicated --only-subscriptions pass is not yet supported.
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
 	if opts.OnlySubscriptions {
 		return &provider.ErrCapabilityUnsupported{
 			Provider:  p.Name(),
-			Operation: "write subscriptions (Apple Podcasts has no public subscription write API)",
+			Operation: "write subscriptions standalone (subscriptions are auto-written during play state migration when KVS credentials are set; --only-subscriptions is not yet supported for Apple Podcasts)",
 		}
 	}
 

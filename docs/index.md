@@ -14,11 +14,13 @@ A Go CLI tool that migrates podcast subscriptions and episode play state between
 |--------|-------------|:---:|:---:|
 | Apple Podcasts | Overcast | ✓ | ✓ (web API) |
 | Apple Podcasts | Pocket Casts | ✓ | ✓ (web API) |
-| Overcast | Apple Podcasts | — | ✓ (web API) |
+| Overcast | Apple Podcasts | ✓ (KVS) | ✓ (web API) |
 | Overcast | Pocket Casts | ✓ | ✓ (web API) |
 | Pocket Casts | Overcast | ✓ | ✓ (web API) |
-| Pocket Casts | Apple Podcasts | — | ✓ (web API) |
+| Pocket Casts | Apple Podcasts | ✓ (KVS) | ✓ (web API) |
 | Any | OPML file | ✓ | ✓ (extended OPML) |
+
+Apple Podcasts subscription writes require KVS credentials (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`) captured via Proxyman. See [Providers — KVS subscriptions](providers.md#kvs-subscriptions----comapplepodcasts).
 
 ## Quick start
 

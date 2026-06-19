@@ -107,6 +107,30 @@ func FilterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[stri
 	return out
 }
 
+// FilterPodcastsByTitle returns the subset of podcasts whose title contains at
+// least one of the filter strings (case-insensitive). If filters is empty, all
+// podcasts are returned unchanged.
+func FilterPodcastsByTitle(podcasts []model.Podcast, filters []string) []model.Podcast {
+	if len(filters) == 0 {
+		return podcasts
+	}
+	lower := make([]string, len(filters))
+	for i, f := range filters {
+		lower[i] = strings.ToLower(strings.TrimSpace(f))
+	}
+	var out []model.Podcast
+	for _, p := range podcasts {
+		title := strings.ToLower(strings.TrimSpace(p.Title))
+		for _, f := range lower {
+			if f != "" && strings.Contains(title, f) {
+				out = append(out, p)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // FuzzyNormalizeTitle normalises an episode title for approximate cross-feed
 // matching. It:
 //   - lowercases

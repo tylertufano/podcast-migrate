@@ -82,10 +82,13 @@ If you have Apple Podcasts Subscriptions (PSUB) or subscriber-feed episodes, sub
 
 ## Overcast → Apple Podcasts
 
-This direction writes play state via two paths that together cover your entire library, syncing to **all your Apple devices** (iPhone, iPad, Mac, podcasts.apple.com) automatically:
+This direction writes subscriptions and play state via paths that together cover your entire library, syncing to **all your Apple devices** (iPhone, iPad, Mac, podcasts.apple.com) automatically:
 
+- **Subscriptions** (all feeds, including private) → Apple KVS (`bookkeeper.itunes.apple.com`, `com.apple.podcasts` domain)
 - **Catalog episodes** (public RSS feeds) → Apple Podcasts web API (`amp-api.podcasts.apple.com`)
-- **Private/subscriber-feed episodes** (NPR+, Slate+, etc.) → Apple KVS (`bookkeeper.itunes.apple.com`)
+- **Private/subscriber-feed episodes** (NPR+, Slate+, etc.) → Apple KVS (`bookkeeper.itunes.apple.com`, `com.apple.upp` domain)
+
+Subscription writes require KVS credentials. Private-feed play state also requires KVS credentials. If KVS credentials are not set, subscriptions and private-feed play state are skipped — only catalog episode play state is written.
 
 ### Step 1 — Get your Apple tokens (one-time)
 
@@ -162,7 +165,7 @@ The proxy is always restored on exit, even if the script fails. The captured `AP
 
 **Step C — Run the migration**
 
-With KVS credentials set alongside the standard Apple tokens, both paths run automatically in the same command:
+With KVS credentials set alongside the standard Apple tokens, all three paths run automatically in the same command:
 
 ```sh
 export OVERCAST_EMAIL="you@example.com"
@@ -172,19 +175,26 @@ export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
 export APPLE_KVS_DSID="12345678"
 export APPLE_KVS_COOKIES="X-Dsid=12345678; mt-tkn-12345678=ABC...; ..."
 
-podcast-migrate migrate --from overcast --to podcasts --play-state
+podcast-migrate migrate --from overcast --to podcasts
 ```
 
-The tool logs which path each episode used:
+The tool logs each path:
 
 ```
 apple: KVS sync enabled (DSID 12345678) — private-feed episodes will sync via bookkeeper.itunes.apple.com
+  kvs: subscribed to "My Private Feed"
   kvs: synced "NPR Politics Podcast+" — "Episode Title [V]"
   ...
 marked 9 episode(s) as played via Apple Podcasts web API
 ```
 
-**KVS credential expiry:** the captured session cookie is valid for days to weeks. If you see `status=1198` errors, re-capture the `Cookie` header from Proxyman using the same steps above.
+To migrate subscriptions only (no play state):
+
+```sh
+podcast-migrate migrate --from overcast --to podcasts --only-subscriptions
+```
+
+**KVS credential expiry:** the captured session cookie is valid for days to weeks. If you see `status=1198` or `status=-4` errors, re-capture credentials using the steps above.
 
 ### Limit to specific podcasts
 
@@ -275,17 +285,20 @@ export POCKETCASTS_EMAIL="you@example.com"
 export POCKETCASTS_PASSWORD="yourpassword"
 export APPLE_BEARER_TOKEN="eyJhbGci..."
 export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
+# Optional: KVS credentials for subscription writes + private-feed play state
+export APPLE_KVS_DSID="12345678"
+export APPLE_KVS_COOKIES="X-Dsid=12345678; mt-tkn-12345678=ABC...; ..."
 
 # Dry-run first
-podcast-migrate migrate --from pocketcasts --to podcasts \
-  --play-state --dry-run
+podcast-migrate migrate --from pocketcasts --to podcasts --dry-run
 
-# Live run
-podcast-migrate migrate --from pocketcasts --to podcasts \
-  --play-state
+# Live run (subscriptions + play state)
+podcast-migrate migrate --from pocketcasts --to podcasts
 ```
 
-See [Overcast → Apple Podcasts](#overcast--apple-podcasts) for the one-time Apple token capture step. The Pocket Casts source provides complete play history — all episodes Pocket Casts has ever recorded, not just the most recent.
+See [Overcast → Apple Podcasts — Private and subscriber-feed episodes](#private-and-subscriber-feed-episodes-kvs) for the one-time Proxyman setup and credential capture steps. The Pocket Casts source provides complete play history — all episodes Pocket Casts has ever recorded, not just the most recent.
+
+With KVS credentials set, any podcast in your Pocket Casts library not yet subscribed in Apple Podcasts is automatically subscribed before its episodes are synced. Without KVS credentials, only catalog-episode play state is written — subscriptions and private-feed episodes are skipped.
 
 ---
 

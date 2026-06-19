@@ -160,9 +160,13 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 	}
 
 	// --- Subscriptions: union of both sides ---
+	// When PodcastFilter is active, only include matching source podcasts as new
+	// subscriptions. Destination podcasts are always preserved in full — we never
+	// remove existing subscriptions from the destination.
 	if !opts.OnlyPlayState {
+		srcPodcasts := migrate.FilterPodcastsByTitle(src.Podcasts, opts.PodcastFilter)
 		feedSeen := make(map[string]bool)
-		for _, p := range src.Podcasts {
+		for _, p := range srcPodcasts {
 			if !feedSeen[p.FeedURL] {
 				out.Podcasts = append(out.Podcasts, p)
 				feedSeen[p.FeedURL] = true

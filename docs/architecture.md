@@ -63,6 +63,7 @@ podcast-migrate/
 │   │   ├── sqlite.go             SQLiteReader (MTLibrary.sqlite)
 │   │   ├── sqlite_write.go       SQLite write utilities
 │   │   ├── webapi.go             WebAPIWriter (amp-api.podcasts.apple.com)
+│   │   ├── kvs.go                KVSWriter (bookkeeper.itunes.apple.com, private feeds)
 │   │   ├── catalog.go            CatalogClient (iTunes Search + amp-api episodes)
 │   │   └── opml.go               OPMLReader (subscriptions fallback)
 │   ├── overcast/
@@ -228,7 +229,7 @@ Apple Podcasts stores its database at:
 ~/Library/Group Containers/243LU875E5.groups.com.apple.podcasts/Documents/MTLibrary.sqlite
 ```
 
-Key tables: `ZMTPODCAST`, `ZMTEPISODE`. CoreData epoch: **2001-01-01 UTC** (all timestamps are seconds since this date).
+Key tables: `ZMTPODCAST`, `ZMTEPISODE`, `ZMTUPPMETADATA`. CoreData epoch: **2001-01-01 UTC** (all timestamps are seconds since this date).
 
 | Column | Meaning |
 |---|---|
@@ -242,5 +243,18 @@ Key tables: `ZMTPODCAST`, `ZMTEPISODE`. CoreData epoch: **2001-01-01 UTC** (all 
 | `ZPRICETYPE` | `PSUB` or `PLUS` for Apple Podcasts Subscription episodes |
 
 **macOS 27+:** `ZDURATION` was removed from `ZMTEPISODE`. The reader probes for its existence at runtime and falls back to `NULL` gracefully.
+
+### `ZMTUPPMETADATA`
+
+Stores UPP (User Play Progress) metadata — the local mirror of the KVS state for each episode. Used by `KVSWriter` to look up episode identifiers for private-feed episodes.
+
+| Column | Meaning |
+|---|---|
+| `ZMETADATAIDENTIFIER` | The KVS key — a hex string unique per episode, used as the `key` field in `putAll` requests |
+| `Z_OPT` | CoreData optimistic lock counter — the local version, which may lag the server's version if other devices have synced. `KVSWriter` always fetches the live server version via `getAll` before writing; `Z_OPT` is used only as a fallback when the key is absent from the `getAll` response |
+| `ZHASBEENPLAYED` | 1 = played |
+| `ZPLAYCOUNT` | Total play count |
+| `ZBOOKMARKTIME` | Current playback position in seconds (0 = not started or fully played) |
+| `ZTIMESTAMP` | CoreData epoch timestamp of the last state change |
 
 **TCC restriction:** macOS Transparency Consent and Control blocks processes other than the user's own shell from reading the Podcasts group container. `podcast-migrate` runs as the user and therefore has access; IDE extensions and background processes may not.

@@ -36,11 +36,19 @@ const DefaultRequestDelay = 500 * time.Millisecond
 //     valid ~90 days, same for all users)
 //   - MediaUserToken: the media-user-token header value (user-specific,
 //     identifies the Apple Account)
+//
+// When kvsWriter is set, private/subscriber-feed episodes that cannot be
+// resolved via the catalog fall back to the KVS putAll path.
 type WebAPIWriter struct {
 	bearerToken    string
 	mediaUserToken string
 	httpClient     *http.Client
+	kvsWriter      *KVSWriter // optional; handles private-feed episodes
 }
+
+// SetKVSFallback registers a KVSWriter to handle private/subscriber-feed
+// episodes (ZSTORETRACKID=0) that cannot be resolved via the Apple catalog.
+func (w *WebAPIWriter) SetKVSFallback(kvs *KVSWriter) { w.kvsWriter = kvs }
 
 // NewWebAPIWriter returns a writer that uses the Apple Podcasts web API.
 // bearerToken and mediaUserToken are obtained from a logged-in podcasts.apple.com
@@ -82,6 +90,12 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 	notInCatalog := 0  // podcast not found in Apple catalog
 	notMatched := 0    // podcast found but episode not matched
 
+	// Private-feed episodes (CatalogPodcastNotInCatalog) are collected here and
+	// sent in a single WriteBatch call after the catalog loop. The KVS session
+	// token is single-use, so batching is required — sequential WriteEpisode
+	// calls with the same token fail after the first with status 1198.
+	var kvsEpisodes []model.EpisodeState
+
 	for _, ep := range episodes {
 		if ep.FromDestination {
 			continue
@@ -105,10 +119,17 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 
 		switch status {
 		case CatalogPodcastNotInCatalog:
-			notInCatalog++
-			writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-				"podcast not found in Apple catalog (private or unindexed feed)")
+			// Private or subscriber feed — queue for KVS batch write below.
+			// All private-feed episodes are batched into one putAll call because
+			// the session token is single-use: sequential calls fail with 1198.
+			if w.kvsWriter != nil {
+				kvsEpisodes = append(kvsEpisodes, ep)
+			} else {
+				notInCatalog++
+				writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
+					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+					"podcast not found in Apple catalog (private or unindexed feed)")
+			}
 			continue
 
 		case CatalogEpisodeNotMatched:
@@ -196,6 +217,15 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 			return marked, ctx.Err()
 		case <-time.After(requestDelay):
 		}
+	}
+
+	// Flush private-feed episodes via a single KVS putAll.
+	if len(kvsEpisodes) > 0 {
+		kvsMarked, err := w.kvsWriter.WriteBatch(ctx, kvsEpisodes, feedToTitle, opts)
+		if err != nil {
+			fmt.Printf("apple/kvs: batch write failed: %v\n", err)
+		}
+		marked += kvsMarked
 	}
 
 	if skippedPlayed > 0 {

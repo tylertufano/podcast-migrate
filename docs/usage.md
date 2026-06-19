@@ -82,7 +82,10 @@ If you have Apple Podcasts Subscriptions (PSUB) or subscriber-feed episodes, sub
 
 ## Overcast → Apple Podcasts
 
-This direction writes play state via the Apple Podcasts web API, syncing to **all your Apple devices** (iPhone, iPad, Mac, podcasts.apple.com) automatically — no iCloud delay, no need to open the app.
+This direction writes play state via two paths that together cover your entire library, syncing to **all your Apple devices** (iPhone, iPad, Mac, podcasts.apple.com) automatically:
+
+- **Catalog episodes** (public RSS feeds) → Apple Podcasts web API (`amp-api.podcasts.apple.com`)
+- **Private/subscriber-feed episodes** (NPR+, Slate+, etc.) → Apple KVS (`bookkeeper.itunes.apple.com`)
 
 ### Step 1 — Get your Apple tokens (one-time)
 
@@ -124,7 +127,64 @@ podcast-migrate migrate --from overcast --to podcasts \
   --overcast-source-opml ~/Downloads/overcast.opml --play-state
 ```
 
-**Scope:** Only episodes indexed in the Apple Podcasts catalog (public RSS feeds) can be marked this way. Private or unlisted feeds without a catalog entry are skipped and reported.
+### Private and subscriber-feed episodes (KVS)
+
+Episodes from private feeds (NPR Plus, Slate Plus via supportingcast.fm, independent subscriber feeds, etc.) are not indexed in the Apple catalog and cannot use the web API. They sync via Apple's internal key-value store (KVS), which requires separate credentials — a session cookie captured from a live Apple Podcasts request.
+
+**Step A — One-time Proxyman setup**
+
+1. Install [Proxyman](https://proxyman.io) and enable its system root certificate
+2. In Proxyman, add `bookkeeper.itunes.apple.com` to the SSL proxying list (Proxyman → SSL Proxying → Include)
+
+This only needs to be done once. After that, Proxyman silently captures Apple Podcasts KVS traffic whenever it runs in the background.
+
+**Step B — Capture credentials automatically**
+
+With Proxyman running, use the capture script:
+
+```sh
+# Print export statements to paste into your shell
+./scripts/capture-kvs-creds.sh
+
+# Or evaluate directly
+eval $(./scripts/capture-kvs-creds.sh)
+
+# Or write to .creds file (sourced automatically below)
+./scripts/capture-kvs-creds.sh --write
+```
+
+The script checks Proxyman's current session for `bookkeeper.itunes.apple.com` traffic and extracts credentials from it if present. If no traffic exists, the behavior depends on whether Podcasts is already running:
+
+- **Podcasts is running** — brings it to the foreground to trigger a background sync, then waits.
+- **Podcasts is not running** — disables the Proxyman proxy, launches Podcasts, waits for it to initialize, re-enables the proxy, then waits for the KVS sync. This sequence is required because Apple Podcasts must connect to Apple's servers during startup; if the proxy is active at launch it cannot establish those connections and will not perform a KVS sync afterward.
+
+The proxy is always restored on exit, even if the script fails. The captured `APPLE_KVS_DSID` and `APPLE_KVS_COOKIES` values are ready to use immediately.
+
+**Step C — Run the migration**
+
+With KVS credentials set alongside the standard Apple tokens, both paths run automatically in the same command:
+
+```sh
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
+export APPLE_BEARER_TOKEN="eyJhbGci..."
+export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
+export APPLE_KVS_DSID="12345678"
+export APPLE_KVS_COOKIES="X-Dsid=12345678; mt-tkn-12345678=ABC...; ..."
+
+podcast-migrate migrate --from overcast --to podcasts --play-state
+```
+
+The tool logs which path each episode used:
+
+```
+apple: KVS sync enabled (DSID 12345678) — private-feed episodes will sync via bookkeeper.itunes.apple.com
+  kvs: synced "NPR Politics Podcast+" — "Episode Title [V]"
+  ...
+marked 9 episode(s) as played via Apple Podcasts web API
+```
+
+**KVS credential expiry:** the captured session cookie is valid for days to weeks. If you see `status=1198` errors, re-capture the `Cookie` header from Proxyman using the same steps above.
 
 ### Limit to specific podcasts
 

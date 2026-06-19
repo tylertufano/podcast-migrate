@@ -72,6 +72,17 @@ Source 3 is conditional because Apple Podcasts Subscription (PSUB/PLUS) back-cat
 
 **OPML fallback**: if SQLite is inaccessible (permissions, path doesn't exist, read error), the provider falls back to an Apple Podcasts OPML export. OPML provides subscriptions only — no play state.
 
+### Writing — Two paths
+
+Play state writes use two complementary paths depending on whether an episode is in the Apple catalog:
+
+| Episode type | Identified by | Write path |
+|---|---|---|
+| Public RSS / catalog episode | `ZSTORETRACKID != 0` | `WebAPIWriter` (`amp-api.podcasts.apple.com`) |
+| Private / subscriber-feed episode | `ZSTORETRACKID = 0` | `KVSWriter` (`bookkeeper.itunes.apple.com`) |
+
+`WebAPIWriter` is always required. `KVSWriter` is optional — it activates automatically when `APPLE_KVS_DSID` and `APPLE_KVS_COOKIES` are set.
+
 ### Writing — WebAPIWriter
 
 Writes play state via `amp-api.podcasts.apple.com`. This approach writes to Apple's backend, which syncs to all Apple devices (iPhone, iPad, Mac) through PodcastContentService.
@@ -100,6 +111,74 @@ Writes play state via `amp-api.podcasts.apple.com`. This approach writes to Appl
 4. `markPosition` (PUT `/v1/me/playback/positions/podcast-episodes/<id>`) → write the position. `completed=true, positionMs=0` for fully played; `completed=false, positionMs=N` for in-progress.
 
 **Retry logic**: `markPosition` retries up to 3 times (2s → 4s → 8s exponential backoff) on 5xx and network errors. 4xx client errors are not retried.
+
+### Writing — KVSWriter
+
+Writes play state for private and subscriber-feed episodes (where `ZSTORETRACKID = 0` in the local SQLite) via Apple's UPP key-value store at `bookkeeper.itunes.apple.com`.
+
+This is the same endpoint Apple Podcasts itself uses for cross-device sync of episodes that are not in the public catalog — private RSS feeds, subscriber feeds (NPR Plus, Slate Plus, supportingcast.fm, etc.), and any feed that requires authentication to access.
+
+**Two credentials are required:**
+
+| Variable | Description | How to obtain |
+|---|---|---|
+| `APPLE_KVS_DSID` | iTunes Store account DSID (numeric ID) | Copy the `X-Dsid` header value from any `bookkeeper.itunes.apple.com` request in Proxyman |
+| `APPLE_KVS_COOKIES` | Full `Cookie` header from an active iTunes Store session | Copy the `Cookie` header value from the same request |
+
+**Capturing credentials with the capture script:**
+
+The repo includes `scripts/capture-kvs-creds.sh`, which automates the full capture using Proxyman's CLI (`proxyman-cli export-log`):
+
+```sh
+# One-time Proxyman setup (only needed once):
+# 1. Install Proxyman from https://proxyman.io
+# 2. Trust its root certificate
+# 3. Add bookkeeper.itunes.apple.com to SSL Proxying
+
+# Then capture credentials automatically:
+eval $(./scripts/capture-kvs-creds.sh)
+
+# Or write to .creds file:
+./scripts/capture-kvs-creds.sh --write
+source .creds
+```
+
+The script checks Proxyman's current session for `bookkeeper.itunes.apple.com` traffic. If none exists, it triggers a sync automatically. When Apple Podcasts is not already running, the script disables the Proxyman proxy first, launches Podcasts, waits for it to initialize, then re-enables the proxy — Podcasts must start without the proxy active or it cannot connect to Apple's servers during launch and will not perform a KVS sync afterward. The proxy is always restored on exit. No manual copy-paste required.
+
+To capture manually without the script: open Proxyman, find any `bookkeeper.itunes.apple.com` request, and copy the `Cookie` and `X-Dsid` header values.
+
+**KVS domain and key format:**
+
+- Domain: `com.apple.upp`
+- Key: `ZMTEPISODE.ZMETADATAIDENTIFIER` (a hex string, unique per episode)
+- Value: binary plist `{bktm, hbpl, plct, tstm}` compressed with raw DEFLATE
+
+| Field | Type | Meaning |
+|---|---|---|
+| `bktm` | float64 | Bookmark time in seconds (`0.0` = fully played, `N > 0` = in-progress position) |
+| `hbpl` | bool | Has been played |
+| `plct` | int | Play count |
+| `tstm` | float64 | Timestamp — seconds since CoreData epoch (2001-01-01 UTC) |
+
+**Request flow:**
+
+1. `getAll` (`POST /wa/getAll`) — fetches the current server-side version for every key in `com.apple.upp`. The returned versions are used as `base-version` in the subsequent `putAll`. This step also mirrors the native app's behaviour (it always calls `getAll` before any `putAll`).
+2. `putAll` (`POST /wa/putAll`) — sends all private-feed episodes in a single batched request (chunked at 25 episodes per call if the batch is large). Each entry in the `keys` array includes:
+   - `key`: the `ZMETADATAIDENTIFIER`
+   - `base-version`: the server-side version from `getAll` (stale local SQLite Z_OPT values are overwritten by the server versions)
+   - `value`: the DEFLATE-compressed binary plist
+
+**Why `base-version` must come from `getAll`:** the server enforces optimistic concurrency — if the submitted `base-version` doesn't match the server's current version for that key, `putAll` returns `status=1198`. Because the iPhone and other devices write to KVS independently, the local SQLite `ZMTUPPMETADATA.Z_OPT` value is typically stale. Fetching the live version from `getAll` first ensures the write always succeeds regardless of how many other devices have synced in the meantime.
+
+**Session token behaviour:** the iTunes Store session cookie (`mt-tkn-<DSID>`, e.g. `mt-tkn-78656781`) is refreshed by the server on each successful `getAll`/`putAll` exchange. The tool uses a cookie jar to capture and carry forward any `Set-Cookie` updates automatically. The underlying session (represented by the original captured cookie) is valid for days to weeks before expiring.
+
+**Status codes:**
+
+| Status | Meaning |
+|---|---|
+| `0` | Success |
+| `-2` | Not authenticated (invalid or expired session) |
+| `1198` | Base-version conflict or session expired — re-capture credentials |
 
 ---
 

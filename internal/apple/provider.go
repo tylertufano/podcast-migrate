@@ -47,8 +47,21 @@ func NewProvider(sqlitePath, opmlPath string) *Provider {
 // Apple Podcasts web API instead of directly to SQLite. bearerToken is the
 // Authorization: Bearer value and mediaUserToken is the media-user-token header
 // value, both obtained from a logged-in podcasts.apple.com browser session.
+//
+// KVS sync for private/subscriber-feed episodes activates automatically when
+// APPLE_KVS_DSID and APPLE_KVS_COOKIES are set (capture them once via
+// scripts/capture-kvs-creds.sh). A warning is printed when credentials are
+// absent; catalog episodes are unaffected.
 func (p *Provider) SetWebAPICredentials(bearerToken, mediaUserToken string) {
 	p.webAPI = NewWebAPIWriter(bearerToken, mediaUserToken)
+
+	kvs, err := NewKVSWriter(p.sqlitePath)
+	if err != nil {
+		fmt.Printf("apple: KVS sync unavailable — %v\n  Private/subscriber-feed episodes will not be synced.\n  Set APPLE_KVS_DSID and APPLE_KVS_COOKIES (see scripts/capture-kvs-creds.sh).\n", err)
+		return
+	}
+	p.webAPI.SetKVSFallback(kvs)
+	fmt.Printf("apple: KVS sync enabled (DSID %s) — private-feed episodes will sync via bookkeeper.itunes.apple.com\n", kvs.dsid)
 }
 
 func (p *Provider) Name() string { return "Apple Podcasts" }

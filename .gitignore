@@ -8,3 +8,6 @@ podcast-migrate
 # macOS
 .DS_Store
 dist/
+
+# KVS session credentials (captured via scripts/capture-kvs-creds.sh)
+.creds

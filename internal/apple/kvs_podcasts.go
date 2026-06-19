@@ -456,7 +456,14 @@ func (w *KVSWriter) Subscribe(ctx context.Context, feedURL, title string) error 
 		LastTouchDate:          now,
 		UpdatedDate:            now,
 	})
-	return w.putSubscriptions(ctx)
+	if err := w.putSubscriptions(ctx); err != nil {
+		return err
+	}
+	if w.newlySubscribed == nil {
+		w.newlySubscribed = make(map[string]time.Time)
+	}
+	w.newlySubscribed[feedURL] = now
+	return nil
 }
 
 // Unsubscribe sets subscribed=0 for feedURL in the subscription list.

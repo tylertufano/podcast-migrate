@@ -31,9 +31,12 @@ const (
 )
 
 // KVSWriter pushes episode play state to Apple's UPP key-value store via
-// bookkeeper.itunes.apple.com/putAll. This is the sync path for private and
-// subscriber-feed episodes (ZSTORETRACKID=0) that are not indexed in the Apple
-// catalog and cannot use the amp-api path.
+// bookkeeper.itunes.apple.com/putAll.
+//
+// By default it handles only private/subscriber-feed episodes (ZSTORETRACKID=0)
+// that are not indexed in the Apple catalog. When AllFeeds is true it handles
+// all episodes regardless of catalog status — used when no web API credentials
+// are provided (KVS-only mode).
 //
 // Auth uses iTunes Store session cookies. These are sourced from the
 // APPLE_KVS_COOKIES env var (preferred) or scanned from known binarycookies
@@ -47,11 +50,19 @@ type KVSWriter struct {
 	sessionReady   bool           // true after getAll(com.apple.upp) has been called
 	serverVersions map[string]int // metadataIdentifier → current server version, populated by getAll
 
+	// AllFeeds enables KVS-only mode: episode lookup is not restricted to
+	// ZSTORETRACKID=0 (private/subscriber) episodes. Set by SetKVSOnlyMode.
+	AllFeeds bool
+
 	// com.apple.podcasts domain state — populated by initPodcastsDomain.
 	podcastsDomainReady bool
 	podcastsFeeds       map[string]*playStateFeed // feedURL → play state feed
 	subscriptions       []podcastSubscription
 	subVersion          string // version of podcastSubscriptions-2012-09-04
+
+	// newlySubscribed tracks feeds subscribed during this run (feedURL → time).
+	// Used by WriteBatch to defer episode lookups and retry after Apple indexes.
+	newlySubscribed map[string]time.Time
 }
 
 // binaryCookiePaths is the list of paths tried when APPLE_KVS_COOKIES is unset.
@@ -179,10 +190,12 @@ func applyPlayState(ep model.EpisodeState, item *kvsItem, nowSec float64) {
 	item.TimestampSec = nowSec
 }
 
-// Write is the provider.Writer interface implementation. It finds private-feed
-// episode matches in the local Apple Podcasts DB and pushes all of them via a
-// single putAll request. Catalog episodes (ZSTORETRACKID != 0) are skipped
-// (they are handled by WebAPIWriter via amp-api).
+// Write is the provider.Writer interface implementation. It finds episode
+// matches in the local Apple Podcasts DB and pushes all of them via putAll.
+//
+// When AllFeeds is false (default), only private/subscriber-feed episodes
+// (ZSTORETRACKID=0) are handled; catalog episodes are left to WebAPIWriter.
+// When AllFeeds is true (KVS-only mode), all episodes are handled here.
 //
 // All matched episodes are batched into one HTTP call to work around the
 // server's one-time-use session token: a second putAll with a spent token
@@ -229,7 +242,7 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 			fmt.Printf("  [dry-run] kvs: would putAll %q — %q (key=%s)\n",
 				podTitle, ep.Title, item.MetadataIdentifier)
 			writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—", "kvs (private feed)")
+				playStateLabel(ep.PlayState, ep.PlayPosition), "—", w.kvsLogLabel())
 			dryRunCount++
 			continue
 		}
@@ -260,9 +273,17 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 	for _, p := range pending {
 		fmt.Printf("  kvs: synced %q — %q\n", p.podTitle, p.ep.Title)
 		writeLogLine(opts.LogWriter, "updated", p.podTitle, p.ep.Title, p.ep.PubDate,
-			playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", "kvs (private feed)")
+			playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", w.kvsLogLabel())
 	}
 	return len(pending), nil
+}
+
+// kvsLogLabel returns the sync-method label for log lines.
+func (w *KVSWriter) kvsLogLabel() string {
+	if w.AllFeeds {
+		return "kvs"
+	}
+	return "kvs (private feed)"
 }
 
 // WriteBatch resolves and syncs a slice of episodes via a single putAll request.
@@ -275,8 +296,9 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 //  1. com.apple.podcasts play state cache (no SQLite required)
 //  2. Local SQLite (GUID, then FeedURL+PubDate, then FeedURL+Title)
 //
-// If a feed is not yet subscribed in Apple Podcasts, it is automatically
-// subscribed before the play state is written.
+// Episodes from feeds subscribed during this same run are deferred to a retry
+// pass: Apple Podcasts must fetch and index the feed before episode
+// metadataIdentifiers appear in KVS or SQLite.
 func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeState, feedToTitle map[string]string, opts provider.WriteOptions) (int, error) {
 	// Auto-subscribe any unsubscribed private feeds before the write pass.
 	// This ensures metadataIdentifiers exist in the KVS for future lookups.
@@ -308,65 +330,310 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 	defer db.Close()
 
 	now := time.Since(coreDataEpoch).Seconds()
-	var pending []kvsItemWithMeta
-	dryRunCount := 0
 
-	for _, ep := range episodes {
-		podTitle := feedToTitle[ep.FeedURL]
-
-		item, found, err := w.lookupPrivateEpisode(ctx, db, ep)
-		if err != nil {
-			fmt.Printf("  kvs: lookup failed for %q: %v\n", ep.Title, err)
-			writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
-			continue
+	// resolveEpisodes categorises each episode into:
+	//   pending  — lookup succeeded; ready to write
+	//   deferred — newly subscribed feed; not yet indexed; will retry
+	// Episodes that are neither are logged and dropped here.
+	resolveEpisodes := func(eps []model.EpisodeState) (pending []kvsItemWithMeta, deferred []model.EpisodeState, dryCount int) {
+		for _, ep := range eps {
+			podTitle := feedToTitle[ep.FeedURL]
+			item, found, lookupErr := w.lookupPrivateEpisode(ctx, db, ep)
+			if lookupErr != nil {
+				fmt.Printf("  kvs: lookup failed for %q: %v\n", ep.Title, lookupErr)
+				writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
+					playStateLabel(ep.PlayState, ep.PlayPosition), "—", lookupErr.Error())
+				continue
+			}
+			if !found {
+				if _, isNew := w.newlySubscribed[ep.FeedURL]; isNew && !opts.DryRun {
+					deferred = append(deferred, ep)
+				} else {
+					writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
+						playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+						"not in catalog; not in local DB or KVS — open Apple Podcasts to index this feed")
+				}
+				continue
+			}
+			applyPlayState(ep, &item, now)
+			if opts.DryRun {
+				fmt.Printf("  [dry-run] kvs: would putAll %q — %q (key=%s)\n",
+					podTitle, ep.Title, item.MetadataIdentifier)
+				writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
+					playStateLabel(ep.PlayState, ep.PlayPosition), "—", w.kvsLogLabel())
+				dryCount++
+				continue
+			}
+			pending = append(pending, kvsItemWithMeta{item, ep, podTitle})
 		}
-		if !found {
-			writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
-				"not in catalog; not in local DB or KVS — open Apple Podcasts to index this feed")
-			continue
-		}
-
-		applyPlayState(ep, &item, now)
-
-		if opts.DryRun {
-			fmt.Printf("  [dry-run] kvs: would putAll %q — %q (key=%s)\n",
-				podTitle, ep.Title, item.MetadataIdentifier)
-			writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—", "kvs (private feed)")
-			dryRunCount++
-			continue
-		}
-
-		pending = append(pending, kvsItemWithMeta{item, ep, podTitle})
+		return
 	}
+
+	// flushPending sends a batch via putAll and logs each outcome.
+	flushPending := func(p []kvsItemWithMeta) (int, error) {
+		if len(p) == 0 {
+			return 0, nil
+		}
+
+		// Deduplicate by metadataIdentifier: sending two items with the same key
+		// in a single putAll returns HTTP 500. This happens when the KVS play-state
+		// lookup (pub-date based) maps two source episodes to the same Apple entry.
+		// Keep the one with the higher play state; drop the other.
+		playPriority := func(ep model.EpisodeState) int {
+			switch ep.PlayState {
+			case model.PlayStatePlayed:
+				return 2
+			case model.PlayStateInProgress:
+				return 1
+			default:
+				return 0
+			}
+		}
+		type dedupSlot struct {
+			idx int
+			pri int
+		}
+		seen := make(map[string]dedupSlot)
+		var unique []kvsItemWithMeta
+		for _, pm := range p {
+			pri := playPriority(pm.ep)
+			if slot, exists := seen[pm.item.MetadataIdentifier]; exists {
+				if pri > slot.pri {
+					unique[slot.idx] = pm
+					seen[pm.item.MetadataIdentifier] = dedupSlot{slot.idx, pri}
+				}
+				// else: drop the lower-priority duplicate
+			} else {
+				seen[pm.item.MetadataIdentifier] = dedupSlot{len(unique), pri}
+				unique = append(unique, pm)
+			}
+		}
+		p = unique
+
+		items := make([]kvsItem, len(p))
+		for i, pm := range p {
+			items[i] = pm.item
+		}
+		if putErr := w.putAll(ctx, items); putErr != nil {
+			for _, pm := range p {
+				writeLogLine(opts.LogWriter, "error", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+					playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", putErr.Error())
+			}
+			return 0, fmt.Errorf("kvs: putAll batch failed: %w", putErr)
+		}
+		for _, pm := range p {
+			fmt.Printf("  kvs: synced %q — %q\n", pm.podTitle, pm.ep.Title)
+			writeLogLine(opts.LogWriter, "updated", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+				playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", w.kvsLogLabel())
+		}
+		return len(p), nil
+	}
+
+	// --- First pass ---
+	pending, deferred, dryRunCount := resolveEpisodes(episodes)
 
 	if opts.DryRun {
 		return dryRunCount, nil
 	}
-	if len(pending) == 0 {
-		return 0, nil
+
+	count, err := flushPending(pending)
+	if err != nil {
+		return count, err
+	}
+	if len(pending) > 0 {
+		// Reset session so the deferred putAll (if needed) gets a fresh UPP token.
+		w.sessionReady = false
 	}
 
-	items := make([]kvsItem, len(pending))
-	for i, p := range pending {
-		items[i] = p.item
+	if len(deferred) == 0 {
+		return count, nil
 	}
-	if err := w.putAll(ctx, items); err != nil {
-		for _, p := range pending {
-			writeLogLine(opts.LogWriter, "error", p.podTitle, p.ep.Title, p.ep.PubDate,
-				playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", err.Error())
+
+	// --- Retry pass for newly subscribed feeds ---
+	// Apple Podcasts must fetch the RSS feed and write episode metadata to both
+	// com.apple.podcasts (for metadataIdentifier lookup) AND com.apple.upp
+	// (to establish the base-version for putAll) before we can sync play state.
+	// We bring Podcasts to the foreground to trigger a background sync, then poll
+	// both domains until the episodes are ready to write.
+	const (
+		retryAttempts = 24
+		retryInterval = 5 * time.Second
+	)
+
+	feedTitle := func(feedURL string) string {
+		if t := feedToTitle[feedURL]; t != "" {
+			return t
 		}
-		return 0, fmt.Errorf("kvs: putAll batch failed: %w", err)
+		return feedURL
 	}
 
-	for _, p := range pending {
-		fmt.Printf("  kvs: synced %q — %q\n", p.podTitle, p.ep.Title)
-		writeLogLine(opts.LogWriter, "updated", p.podTitle, p.ep.Title, p.ep.PubDate,
-			playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", "kvs (private feed)")
+	deferredFeeds := make(map[string]struct{})
+	for _, ep := range deferred {
+		deferredFeeds[ep.FeedURL] = struct{}{}
 	}
-	return len(pending), nil
+	fmt.Printf("  kvs: %d episode(s) from %d newly subscribed feed(s) deferred — waiting for Apple Podcasts to index...\n",
+		len(deferred), len(deferredFeeds))
+
+	// Bring Podcasts to the foreground and trigger a full feed refresh (Cmd+R).
+	// Without focus the app rarely syncs; without the refresh it won't fetch
+	// newly subscribed feeds until its next background poll.
+	refreshScript := `tell application "Podcasts" to activate
+delay 0.5
+tell application "System Events"
+	tell process "Podcasts"
+		keystroke "r" using command down
+	end tell
+end tell`
+	if out, oErr := exec.Command("osascript", "-e", refreshScript).CombinedOutput(); oErr != nil {
+		fmt.Printf("  kvs: could not refresh Podcasts app: %v (%s)\n", oErr, strings.TrimSpace(string(out)))
+		fmt.Println("  kvs: open Apple Podcasts manually and press Cmd+R to refresh feeds")
+	} else {
+		fmt.Println("  kvs: opened Apple Podcasts and triggered feed refresh (Cmd+R)")
+	}
+
+	// pendingFlush accumulates resolved episodes across outer iterations.
+	// After a putAll failure we keep items here and retry on the next tick —
+	// the outer loop refreshes both KVS domains (including serverVersions for
+	// UPP base-versions) before each attempt so versions are always current.
+	var pendingFlush []kvsItemWithMeta
+	stillDeferred := deferred
+	noProgressStreak := 0 // ticks with resolved==0 and pendingFlush==0
+	gaveUpEarly := false  // true when we broke out due to no-progress streak
+	everResolved := false // true after at least one episode was resolved
+
+	for attempt := 1; attempt <= retryAttempts; attempt++ {
+		fmt.Printf("  kvs: retry %d/%d (waiting %s)...\n", attempt, retryAttempts, retryInterval)
+		select {
+		case <-ctx.Done():
+			goto deferredDone
+		case <-time.After(retryInterval):
+		}
+
+		// Reset to original cookies at the start of each tick so that any
+		// Set-Cookie state from a prior failed putAll doesn't carry forward.
+		if jar, jarErr := cookiejar.New(nil); jarErr == nil {
+			kvsURL, _ := url.Parse("https://bookkeeper.itunes.apple.com")
+			jar.SetCookies(kvsURL, parseCookieHeader(w.cookieHdr))
+			w.httpClient.Jar = jar
+		}
+
+		// Refresh podcasts domain for episode lookups.
+		w.podcastsDomainReady = false
+		if iErr := w.initPodcastsDomain(ctx); iErr != nil {
+			fmt.Printf("  kvs: podcasts domain refresh failed: %v\n", iErr)
+			continue
+		}
+
+		resolved, nextDeferred, _ := resolveEpisodes(stillDeferred)
+		stillDeferred = nextDeferred
+
+		if len(resolved) > 0 {
+			noProgressStreak = 0
+			everResolved = true
+			indexed := make(map[string]int)
+			for _, pm := range resolved {
+				indexed[pm.ep.FeedURL]++
+			}
+			for feedURL, n := range indexed {
+				fmt.Printf("  kvs: %q indexed — %d episode(s) resolved\n", feedTitle(feedURL), n)
+			}
+			pendingFlush = append(pendingFlush, resolved...)
+		} else if len(pendingFlush) == 0 {
+			if everResolved {
+				fmt.Printf("  kvs: %d episode(s) not found in Apple Podcasts index — may no longer be in the RSS feed\n",
+					len(stillDeferred))
+			} else {
+				fmt.Printf("  kvs: feed not yet indexed in com.apple.podcasts — waiting...\n")
+			}
+		}
+
+		if len(pendingFlush) > 0 {
+			// Re-init the UPP session immediately before each putAll attempt.
+			// The podcasts-domain getAll above already rotated the cookies;
+			// passing that state into getAll(UPP) gives the server a coherent
+			// podcasts→UPP→putAll session chain.
+			w.sessionReady = false
+			if iErr := w.initSession(ctx); iErr != nil {
+				fmt.Printf("  kvs: session refresh failed before flush: %v\n", iErr)
+				continue
+			}
+
+			n, ferr := flushPending(pendingFlush)
+			count += n
+			if ferr == nil {
+				pendingFlush = nil
+			} else {
+				fmt.Printf("  kvs: putAll failed — retrying next tick: %v\n", ferr)
+			}
+		}
+
+		if len(stillDeferred) == 0 && len(pendingFlush) == 0 {
+			break
+		}
+
+		// If we've made at least one successful flush but haven't resolved any
+		// new episodes for several ticks, the remaining episodes are likely no
+		// longer in the feed's RSS and won't appear in the Apple Podcasts index.
+		if count > 0 && len(resolved) == 0 && len(pendingFlush) == 0 {
+			noProgressStreak++
+			if noProgressStreak >= 3 {
+				gaveUpEarly = true
+				break
+			}
+		}
+	}
+
+deferredDone:
+	// Episodes that resolved but whose putAll never succeeded after all retries.
+	if len(pendingFlush) > 0 {
+		unwrittenFeeds := make(map[string]struct{})
+		for _, pm := range pendingFlush {
+			unwrittenFeeds[pm.ep.FeedURL] = struct{}{}
+		}
+		fmt.Printf("\nkvs: %d episode(s) resolved but could not be written — UPP entries may still be propagating.\n",
+			len(pendingFlush))
+		fmt.Println("Re-run with:")
+		for feedURL := range unwrittenFeeds {
+			fmt.Printf("  --podcast %q\n", feedTitle(feedURL))
+		}
+		fmt.Println()
+	}
+
+	// Log episodes that still couldn't be resolved.
+	if len(stillDeferred) > 0 {
+		unindexedFeeds := make(map[string]struct{})
+		for _, ep := range stillDeferred {
+			unindexedFeeds[ep.FeedURL] = struct{}{}
+		}
+		if gaveUpEarly {
+			// We already synced some episodes from this feed, but the remaining
+			// ones couldn't be matched. They're likely no longer in the RSS.
+			for _, ep := range stillDeferred {
+				podTitle := feedTitle(ep.FeedURL)
+				writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
+					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+					"not found in Apple Podcasts index — may no longer be in the RSS feed")
+			}
+			fmt.Printf("\nkvs: %d episode(s) skipped — not found in Apple Podcasts (likely removed from the RSS feed).\n",
+				len(stillDeferred))
+		} else {
+			for _, ep := range stillDeferred {
+				podTitle := feedTitle(ep.FeedURL)
+				writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
+					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+					"newly subscribed feed not yet indexed — re-run after opening Apple Podcasts")
+			}
+			fmt.Printf("\nkvs: %d episode(s) from %d feed(s) not yet indexed by Apple Podcasts.\n",
+				len(stillDeferred), len(unindexedFeeds))
+			fmt.Println("Open Apple Podcasts and wait for it to refresh, then re-run with:")
+			for feedURL := range unindexedFeeds {
+				fmt.Printf("  --podcast %q\n", feedTitle(feedURL))
+			}
+			fmt.Println()
+		}
+	}
+
+	return count, nil
 }
 
 // WriteEpisode looks up a single episode and pushes its play state to the KVS.
@@ -413,7 +680,7 @@ func (w *KVSWriter) lookupPrivateEpisodeFromKVS(ep model.EpisodeState) (kvsItem,
 	}
 	return kvsItem{
 		MetadataIdentifier: metaID,
-		UPPVersion:         1, // will be overridden by serverVersions in putAll
+		UPPVersion:         0, // 0 = new entry; overridden by serverVersions if already in com.apple.upp
 	}, true
 }
 
@@ -430,6 +697,13 @@ func (w *KVSWriter) lookupPrivateEpisode(ctx context.Context, db *sql.DB, ep mod
 		return item, true, nil
 	}
 
+	// In KVS-only mode all episodes are in scope; otherwise restrict to
+	// private/subscriber-feed episodes (ZSTORETRACKID=0).
+	trackFilter := "AND (e.ZSTORETRACKID IS NULL OR e.ZSTORETRACKID = 0)\n\t\t\t"
+	if w.AllFeeds {
+		trackFilter = ""
+	}
+
 	// Fall back to local SQLite. GUID match first (exact, fast).
 	if ep.GUID != "" {
 		item, found, err := scanKVSRow(db.QueryRowContext(ctx, `
@@ -443,8 +717,7 @@ func (w *KVSWriter) lookupPrivateEpisode(ctx context.Context, db *sql.DB, ep mod
 			JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 			LEFT JOIN ZMTUPPMETADATA u ON u.ZMETADATAIDENTIFIER = e.ZMETADATAIDENTIFIER
 			WHERE e.ZMETADATAIDENTIFIER IS NOT NULL
-			  AND (e.ZSTORETRACKID IS NULL OR e.ZSTORETRACKID = 0)
-			  AND p.ZSUBSCRIBED = 1
+			  `+trackFilter+`AND p.ZSUBSCRIBED = 1
 			  AND e.ZGUID = ?
 			LIMIT 1`, ep.GUID))
 		if err != nil {
@@ -469,8 +742,7 @@ func (w *KVSWriter) lookupPrivateEpisode(ctx context.Context, db *sql.DB, ep mod
 			JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 			LEFT JOIN ZMTUPPMETADATA u ON u.ZMETADATAIDENTIFIER = e.ZMETADATAIDENTIFIER
 			WHERE e.ZMETADATAIDENTIFIER IS NOT NULL
-			  AND (e.ZSTORETRACKID IS NULL OR e.ZSTORETRACKID = 0)
-			  AND p.ZSUBSCRIBED = 1
+			  `+trackFilter+`AND p.ZSUBSCRIBED = 1
 			  AND p.ZFEEDURL LIKE ? || '%'
 			  AND ABS(COALESCE(e.ZPUBDATE, 0) - ?) < 86400
 			LIMIT 1`, ep.FeedURL, pubDateSec))
@@ -495,8 +767,7 @@ func (w *KVSWriter) lookupPrivateEpisode(ctx context.Context, db *sql.DB, ep mod
 			JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 			LEFT JOIN ZMTUPPMETADATA u ON u.ZMETADATAIDENTIFIER = e.ZMETADATAIDENTIFIER
 			WHERE e.ZMETADATAIDENTIFIER IS NOT NULL
-			  AND (e.ZSTORETRACKID IS NULL OR e.ZSTORETRACKID = 0)
-			  AND p.ZSUBSCRIBED = 1
+			  `+trackFilter+`AND p.ZSUBSCRIBED = 1
 			  AND p.ZFEEDURL LIKE ? || '%'
 			  AND LOWER(TRIM(e.ZTITLE)) = LOWER(TRIM(?))
 			LIMIT 1`, ep.FeedURL, ep.Title))
@@ -597,7 +868,7 @@ func (w *KVSWriter) initSession(ctx context.Context) error {
 		return fmt.Errorf("getAll HTTP %d", resp.StatusCode)
 	}
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
 	w.serverVersions = parseServerVersions(ctx, respBody)
 	w.sessionReady = true
 	return nil

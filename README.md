@@ -14,13 +14,15 @@ Episode matching uses a four-strategy cascade (feed URL + pub date → feed URL 
 
 | Provider | Read subscriptions | Read play state | Write subscriptions | Write play state |
 |---|:---:|:---:|:---:|:---:|
-| Apple Podcasts | ✅ | ✅ | ✅ (KVS¹ → syncs to all devices) | ✅ (web API + KVS → syncs to all devices) |
-| Overcast | ✅ | ✅ | ✅ (OPML + auto on play-state write²) | ✅ (unofficial web API) |
-| Pocket Casts | ✅ | ✅ complete history | ✅ (auto on play-state write²) | ✅ (unofficial web API) |
+| Apple Podcasts | ✅ | ✅ | ✅ (KVS¹ → syncs to all devices) | ✅ (web API + KVS² or KVS-only³ → syncs to all devices) |
+| Overcast | ✅ | ✅ | ✅ (OPML + auto on play-state write⁴) | ✅ (unofficial web API) |
+| Pocket Casts | ✅ | ✅ complete history | ✅ (auto on play-state write⁴) | ✅ (unofficial web API) |
 | OPML | ✅ | ✅ (extended format) | ✅ | ✅ (extended format) |
 
 ¹ Apple subscription writes require KVS credentials (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`) captured via Proxyman. Subscriptions are written automatically during migration; `--only-subscriptions` is not yet supported for Apple Podcasts.
-² Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
+² **Web API + KVS (recommended)**: Bearer token + `media-user-token` handle public-catalog episodes via `amp-api`; KVS handles private/subscriber-feed episodes. Public feeds resolve immediately without waiting for local indexing.
+³ **KVS-only**: Set only `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` — no web API tokens needed. All episodes sync via KVS. Pre-existing subscriptions resolve immediately from the local SQLite DB; newly subscribed feeds wait for Apple Podcasts to index them first.
+⁴ Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
 
 ## Installation
 
@@ -54,11 +56,20 @@ podcast-migrate migrate --from podcasts --to overcast \
   --play-state --since 48h
 
 # Sync play state Overcast → Apple Podcasts (syncs to iPhone, iPad, Mac)
-# Overcast credentials auto-fetch the source OPML — no manual export needed
+# Option A: web API + KVS (recommended — public feeds resolve without waiting)
 export OVERCAST_EMAIL="you@example.com"
 export OVERCAST_PASSWORD="yourpassword"
 export APPLE_BEARER_TOKEN="eyJhbGci..."
 export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
+export APPLE_KVS_DSID="12345678"          # required for private feeds + subscriptions
+export APPLE_KVS_COOKIES="X-Dsid=..."
+podcast-migrate migrate --from overcast --to podcasts --play-state
+
+# Option B: KVS-only (simpler — no web API tokens needed)
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
+export APPLE_KVS_DSID="12345678"
+export APPLE_KVS_COOKIES="X-Dsid=..."
 podcast-migrate migrate --from overcast --to podcasts --play-state
 ```
 
@@ -68,7 +79,7 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **Unofficial APIs** — Overcast and Pocket Casts write paths use undocumented internal endpoints that those services haven't publicly committed to. They work as of the current release but may break without notice. Always `--dry-run` before a live migration.
 
-**Apple token expiry** — the Bearer token required to write play state to Apple Podcasts is a short-lived JWT (~90 days). Re-capture it from browser DevTools if you get `401` errors. See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for the one-time capture steps.
+**Apple token expiry** — the Bearer token for the web API path is a short-lived JWT (~90 days). Re-capture it from browser DevTools if you get `401` errors. If you'd rather avoid managing these tokens, use KVS-only mode (just `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`). See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for details on both modes.
 
 **Apple subscriber and internal feeds** — `internal://` feeds (Apple-exclusive shows) and JWT-authenticated subscriber feed URLs (NPR+, Slate+ via supportingcast.fm, etc.) are excluded from subscription exports. When migrating *to* Apple Podcasts with KVS credentials set, subscriptions to private feeds are written automatically and their episodes are synced via KVS (see [Providers](https://tylertufano.github.io/podcast-migrate/providers) for setup). Without KVS credentials, private-feed subscriptions and episodes are skipped.
 

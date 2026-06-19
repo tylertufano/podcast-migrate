@@ -211,12 +211,18 @@ func migrateCmd() *cobra.Command {
 				}
 			}
 
-			// If Apple web API credentials are provided, configure the destination
-			// provider (or source, in case someone pipes apple→apple) to use the
-			// web API for play state writes instead of direct SQLite manipulation.
-			if appleBearerToken != "" && appleMediaUserToken != "" {
-				if ap, ok := dst.(*apple.Provider); ok {
+			// Configure write credentials for Apple Podcasts destination.
+			// Web API (bearer + media-user-token) is preferred: catalog episodes
+			// resolve immediately without needing local indexing. If those tokens
+			// are absent, fall back to KVS-only mode (all episodes via KVS),
+			// which requires Apple Podcasts to index each feed first.
+			if ap, ok := dst.(*apple.Provider); ok {
+				if appleBearerToken != "" && appleMediaUserToken != "" {
 					ap.SetWebAPICredentials(appleBearerToken, appleMediaUserToken)
+				} else {
+					// KVS-only mode: silently succeeds (prints its own banner) or
+					// silently fails (error surfaces at write time if --play-state).
+					_ = ap.SetKVSOnlyMode()
 				}
 			}
 

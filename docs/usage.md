@@ -82,15 +82,18 @@ If you have Apple Podcasts Subscriptions (PSUB) or subscriber-feed episodes, sub
 
 ## Overcast → Apple Podcasts
 
-This direction writes subscriptions and play state via paths that together cover your entire library, syncing to **all your Apple devices** (iPhone, iPad, Mac, podcasts.apple.com) automatically:
+This direction writes subscriptions and play state syncing to **all your Apple devices** (iPhone, iPad, Mac, podcasts.apple.com) automatically. Two credential modes are supported — choose the one that fits your setup:
 
-- **Subscriptions** (all feeds, including private) → Apple KVS (`bookkeeper.itunes.apple.com`, `com.apple.podcasts` domain)
-- **Catalog episodes** (public RSS feeds) → Apple Podcasts web API (`amp-api.podcasts.apple.com`)
-- **Private/subscriber-feed episodes** (NPR+, Slate+, etc.) → Apple KVS (`bookkeeper.itunes.apple.com`, `com.apple.upp` domain)
+| Mode | What you need | Trade-off |
+|---|---|---|
+| **Web API + KVS** (recommended) | Bearer token + media-user-token + KVS cookie | Public feeds resolve instantly via Apple's catalog; best for large libraries |
+| **KVS-only** | KVS cookie only | Simpler — no web API tokens to manage; newly subscribed feeds wait for Apple Podcasts to index them |
 
-Subscription writes require KVS credentials. Private-feed play state also requires KVS credentials. If KVS credentials are not set, subscriptions and private-feed play state are skipped — only catalog episode play state is written.
+---
 
-### Step 1 — Get your Apple tokens (one-time)
+### Option A — Web API + KVS (recommended)
+
+#### Step 1 — Get your Apple tokens (one-time)
 
 1. Open [podcasts.apple.com](https://podcasts.apple.com) in your browser and sign in
 2. Open DevTools (⌥⌘I in Safari, F12 in Chrome) → **Network** tab
@@ -102,70 +105,23 @@ Subscription writes require KVS credentials. Private-feed play state also requir
 
 The Bearer token expires in ~90 days; re-capture it the same way if you get `401` errors. The `media-user-token` lasts longer but also expires eventually.
 
-### Step 2 — Run the migration
-
-With Overcast credentials set, the tool fetches and caches your extended OPML automatically — no manual export needed:
-
-```sh
-export OVERCAST_EMAIL="you@example.com"
-export OVERCAST_PASSWORD="yourpassword"
-export APPLE_BEARER_TOKEN="eyJhbGci..."
-export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
-
-# Dry-run first
-podcast-migrate migrate --from overcast --to podcasts \
-  --play-state --dry-run
-
-# Live run
-podcast-migrate migrate --from overcast --to podcasts \
-  --play-state
-```
-
-The source OPML is cached for 24 hours under `~/Library/Caches/podcast-migrate/overcast-source.opml`. Use `--clear-source-opml-cache` to force a fresh download, or `--overcast-save-source-opml` to save a copy (defaults to `~/Downloads/overcast.opml` when given without a value).
-
-If you prefer to supply an OPML file you downloaded manually, pass it with `--overcast-source-opml`:
-
-```sh
-podcast-migrate migrate --from overcast --to podcasts \
-  --overcast-source-opml ~/Downloads/overcast.opml --play-state
-```
-
-### Private and subscriber-feed episodes (KVS)
-
-Episodes from private feeds (NPR Plus, Slate Plus via supportingcast.fm, independent subscriber feeds, etc.) are not indexed in the Apple catalog and cannot use the web API. They sync via Apple's internal key-value store (KVS), which requires separate credentials — a session cookie captured from a live Apple Podcasts request.
-
-**Step A — One-time Proxyman setup**
+#### Step 2 — Capture KVS credentials (one-time, needed for subscriptions + private feeds)
 
 1. Install [Proxyman](https://proxyman.io) and enable its system root certificate
 2. In Proxyman, add `bookkeeper.itunes.apple.com` to the SSL proxying list (Proxyman → SSL Proxying → Include)
 
-This only needs to be done once. After that, Proxyman silently captures Apple Podcasts KVS traffic whenever it runs in the background.
-
-**Step B — Capture credentials automatically**
-
-With Proxyman running, use the capture script:
+Then run the capture script:
 
 ```sh
-# Print export statements to paste into your shell
-./scripts/capture-kvs-creds.sh
-
-# Or evaluate directly
 eval $(./scripts/capture-kvs-creds.sh)
-
-# Or write to .creds file (sourced automatically below)
-./scripts/capture-kvs-creds.sh --write
+# or: ./scripts/capture-kvs-creds.sh --write && source .creds
 ```
 
-The script checks Proxyman's current session for `bookkeeper.itunes.apple.com` traffic and extracts credentials from it if present. If no traffic exists, the behavior depends on whether Podcasts is already running:
+The script checks Proxyman's current session for `bookkeeper.itunes.apple.com` traffic. If none exists, it triggers a sync automatically. The proxy is always restored on exit.
 
-- **Podcasts is running** — brings it to the foreground to trigger a background sync, then waits.
-- **Podcasts is not running** — disables the Proxyman proxy, launches Podcasts, waits for it to initialize, re-enables the proxy, then waits for the KVS sync. This sequence is required because Apple Podcasts must connect to Apple's servers during startup; if the proxy is active at launch it cannot establish those connections and will not perform a KVS sync afterward.
+KVS credentials are valid for days to weeks. Re-run the capture script if you see `status=1198` or `status=-4` errors.
 
-The proxy is always restored on exit, even if the script fails. The captured `APPLE_KVS_DSID` and `APPLE_KVS_COOKIES` values are ready to use immediately.
-
-**Step C — Run the migration**
-
-With KVS credentials set alongside the standard Apple tokens, all three paths run automatically in the same command:
+#### Step 3 — Run the migration
 
 ```sh
 export OVERCAST_EMAIL="you@example.com"
@@ -175,17 +131,66 @@ export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
 export APPLE_KVS_DSID="12345678"
 export APPLE_KVS_COOKIES="X-Dsid=12345678; mt-tkn-12345678=ABC...; ..."
 
-podcast-migrate migrate --from overcast --to podcasts
+# Dry-run first
+podcast-migrate migrate --from overcast --to podcasts --play-state --dry-run
+
+# Live run
+podcast-migrate migrate --from overcast --to podcasts --play-state
 ```
 
-The tool logs each path:
+The tool logs each sync path:
 
 ```
 apple: KVS sync enabled (DSID 12345678) — private-feed episodes will sync via bookkeeper.itunes.apple.com
   kvs: subscribed to "My Private Feed"
   kvs: synced "NPR Politics Podcast+" — "Episode Title [V]"
   ...
-marked 9 episode(s) as played via Apple Podcasts web API
+marked 47 episode(s) as played via Apple Podcasts web API
+```
+
+---
+
+### Option B — KVS-only (no web API tokens)
+
+All episodes — public and private — sync via KVS. Episodes from podcasts already subscribed in Apple Podcasts resolve immediately from the local SQLite database. Episodes from newly subscribed feeds wait for Apple Podcasts to index the feed before syncing (the tool triggers a feed refresh automatically and retries for up to 2 minutes).
+
+#### Step 1 — Capture KVS credentials
+
+Same as Option A Step 2 above.
+
+#### Step 2 — Run the migration
+
+```sh
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
+export APPLE_KVS_DSID="12345678"
+export APPLE_KVS_COOKIES="X-Dsid=12345678; mt-tkn-12345678=ABC...; ..."
+
+podcast-migrate migrate --from overcast --to podcasts --play-state
+```
+
+The tool detects that no web API tokens are set and activates KVS-only mode automatically:
+
+```
+apple: KVS sync enabled (DSID 12345678) — all episodes will sync via bookkeeper.itunes.apple.com
+  kvs: subscribed to "My Podcast"
+  kvs: "my podcast" indexed — 12 episode(s) resolved
+  kvs: synced "My Podcast" — "Episode Title [V]"
+  ...
+marked 47 episode(s) via Apple KVS
+```
+
+---
+
+### Common options
+
+The source OPML is cached for 24 hours under `~/Library/Caches/podcast-migrate/overcast-source.opml`. Use `--clear-source-opml-cache` to force a fresh download, or `--overcast-save-source-opml` to save a copy (defaults to `~/Downloads/overcast.opml` when given without a value).
+
+To supply an OPML file you downloaded manually:
+
+```sh
+podcast-migrate migrate --from overcast --to podcasts \
+  --overcast-source-opml ~/Downloads/overcast.opml --play-state
 ```
 
 To migrate subscriptions only (no play state):
@@ -193,8 +198,6 @@ To migrate subscriptions only (no play state):
 ```sh
 podcast-migrate migrate --from overcast --to podcasts --only-subscriptions
 ```
-
-**KVS credential expiry:** the captured session cookie is valid for days to weeks. If you see `status=1198` or `status=-4` errors, re-capture credentials using the steps above.
 
 ### Limit to specific podcasts
 
@@ -280,25 +283,33 @@ podcast-migrate migrate --from podcasts --to pocketcasts \
 
 ## Pocket Casts → Apple Podcasts
 
+The Pocket Casts source provides complete play history — all episodes Pocket Casts has ever recorded, not just the most recent. The same two credential modes apply as in [Overcast → Apple Podcasts](#overcast--apple-podcasts).
+
+**Option A — Web API + KVS (recommended):**
+
 ```sh
 export POCKETCASTS_EMAIL="you@example.com"
 export POCKETCASTS_PASSWORD="yourpassword"
 export APPLE_BEARER_TOKEN="eyJhbGci..."
 export APPLE_MEDIA_USER_TOKEN="0.Apgf..."
-# Optional: KVS credentials for subscription writes + private-feed play state
 export APPLE_KVS_DSID="12345678"
 export APPLE_KVS_COOKIES="X-Dsid=12345678; mt-tkn-12345678=ABC...; ..."
 
-# Dry-run first
-podcast-migrate migrate --from pocketcasts --to podcasts --dry-run
-
-# Live run (subscriptions + play state)
 podcast-migrate migrate --from pocketcasts --to podcasts
 ```
 
-See [Overcast → Apple Podcasts — Private and subscriber-feed episodes](#private-and-subscriber-feed-episodes-kvs) for the one-time Proxyman setup and credential capture steps. The Pocket Casts source provides complete play history — all episodes Pocket Casts has ever recorded, not just the most recent.
+**Option B — KVS-only (no web API tokens):**
 
-With KVS credentials set, any podcast in your Pocket Casts library not yet subscribed in Apple Podcasts is automatically subscribed before its episodes are synced. Without KVS credentials, only catalog-episode play state is written — subscriptions and private-feed episodes are skipped.
+```sh
+export POCKETCASTS_EMAIL="you@example.com"
+export POCKETCASTS_PASSWORD="yourpassword"
+export APPLE_KVS_DSID="12345678"
+export APPLE_KVS_COOKIES="X-Dsid=12345678; mt-tkn-12345678=ABC...; ..."
+
+podcast-migrate migrate --from pocketcasts --to podcasts
+```
+
+See [Overcast → Apple Podcasts — Option A](#option-a--web-api--kvs-recommended) for the one-time Proxyman setup and KVS credential capture steps. With KVS credentials set, any podcast in your Pocket Casts library not yet subscribed in Apple Podcasts is automatically subscribed before its episodes are synced.
 
 ---
 

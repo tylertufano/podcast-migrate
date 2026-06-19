@@ -15,7 +15,7 @@ nav_order: 5
 | Read subscriptions | ✓ |
 | Read play state | ✓ |
 | Write subscriptions | ✓ (KVS, when `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` are set) |
-| Write play state | ✓ (web API, when credentials are set) |
+| Write play state | ✓ (web API + KVS, or KVS-only — see below) |
 
 ### Reading — SQLiteReader
 
@@ -72,9 +72,13 @@ Source 3 is conditional because Apple Podcasts Subscription (PSUB/PLUS) back-cat
 
 **OPML fallback**: if SQLite is inaccessible (permissions, path doesn't exist, read error), the provider falls back to an Apple Podcasts OPML export. OPML provides subscriptions only — no play state.
 
-### Writing — Three paths
+### Writing — Two modes
 
-Writes are split across three paths depending on the operation and whether the episode is in the Apple catalog:
+Play state writes work in one of two modes depending on which credentials are provided:
+
+#### Mode A — Web API + KVS (recommended)
+
+Set `APPLE_BEARER_TOKEN` + `APPLE_MEDIA_USER_TOKEN` (required) and optionally `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`:
 
 | Operation | Path | Endpoint |
 |---|---|---|
@@ -82,7 +86,20 @@ Writes are split across three paths depending on the operation and whether the e
 | Play state — private/subscriber-feed episode | `KVSWriter` (`com.apple.upp`) | `bookkeeper.itunes.apple.com` |
 | Subscriptions | `KVSWriter` (`com.apple.podcasts`) | `bookkeeper.itunes.apple.com` |
 
-`WebAPIWriter` is always required for play state. `KVSWriter` is optional — it activates automatically when `APPLE_KVS_DSID` and `APPLE_KVS_COOKIES` are set, and unlocks both private-feed play state writes and subscription management.
+Public-catalog episodes resolve via Apple's global catalog API without needing the local Apple Podcasts app to index the feed first. KVS credentials are optional in this mode — without them, private-feed play state and subscription writes are skipped.
+
+#### Mode B — KVS-only
+
+Set only `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` (no web API tokens required):
+
+| Operation | Path | Endpoint |
+|---|---|---|
+| Play state — all episodes (public and private) | `KVSWriter` (`com.apple.upp`) | `bookkeeper.itunes.apple.com` |
+| Subscriptions | `KVSWriter` (`com.apple.podcasts`) | `bookkeeper.itunes.apple.com` |
+
+All episodes use the same KVS path. Episodes from podcasts that were already subscribed in Apple Podcasts resolve immediately from the local SQLite database (`ZMTEPISODE.ZMETADATAIDENTIFIER`). Episodes from newly subscribed feeds wait for Apple Podcasts to index the feed before their `metadataIdentifier` is available — the same deferred retry loop used for private feeds in Mode A.
+
+**Trade-off:** KVS-only requires no web API token management, but large migrations where many feeds are newly subscribed will take longer as Apple Podcasts indexes each one. The web API mode resolves all catalog episodes immediately regardless of local indexing status.
 
 ### Writing — WebAPIWriter
 

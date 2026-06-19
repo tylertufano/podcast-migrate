@@ -286,6 +286,38 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 		return 0, nil
 	}
 
+	// Deduplicate by metadataIdentifier before putAll — two items with the same
+	// key in a single request returns HTTP 500. Keep the higher-priority play state.
+	playPriority := func(ep model.EpisodeState) int {
+		switch ep.PlayState {
+		case model.PlayStatePlayed:
+			return 2
+		case model.PlayStateInProgress:
+			return 1
+		default:
+			return 0
+		}
+	}
+	type dedupSlot struct {
+		idx int
+		pri int
+	}
+	dedupSeen := make(map[string]dedupSlot)
+	var unique []kvsItemWithMeta
+	for _, pm := range pending {
+		pri := playPriority(pm.ep)
+		if slot, exists := dedupSeen[pm.item.MetadataIdentifier]; exists {
+			if pri > slot.pri {
+				unique[slot.idx] = pm
+				dedupSeen[pm.item.MetadataIdentifier] = dedupSlot{slot.idx, pri}
+			}
+		} else {
+			dedupSeen[pm.item.MetadataIdentifier] = dedupSlot{len(unique), pri}
+			unique = append(unique, pm)
+		}
+	}
+	pending = unique
+
 	// Single putAll for all matched episodes — one token, one round-trip.
 	items := make([]kvsItem, len(pending))
 	for i, p := range pending {

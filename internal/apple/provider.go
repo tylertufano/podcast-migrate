@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/model"
@@ -103,6 +104,9 @@ func (p *Provider) Capabilities() provider.Capabilities {
 }
 
 func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, errors.New("apple: Apple Podcasts is only available on macOS")
+	}
 	if _, err := os.Stat(p.sqlitePath); err == nil {
 		r := NewSQLiteReader(p.sqlitePath)
 		if !p.sinceTime.IsZero() {
@@ -129,6 +133,9 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 // In KVS-only mode, requires SetKVSOnlyMode to have been called.
 // Subscriptions are auto-written via KVS in both modes when credentials allow.
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("apple: Apple Podcasts is only available on macOS")
+	}
 	if opts.OnlySubscriptions {
 		return &provider.ErrCapabilityUnsupported{
 			Provider:  p.Name(),

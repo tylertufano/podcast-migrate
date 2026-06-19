@@ -24,6 +24,10 @@ Episode matching uses a four-strategy cascade (feed URL + pub date → feed URL 
 ³ **KVS-only**: Set only `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` — no web API tokens needed. All episodes sync via KVS. Pre-existing subscriptions resolve immediately from the local SQLite DB; newly subscribed feeds wait for Apple Podcasts to index them first.
 ⁴ Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
 
+## Platform support
+
+All providers that use HTTP APIs (Overcast, Pocket Casts, OPML) work on macOS, Linux, and Windows. The Apple Podcasts provider — reading from the local SQLite database and writing via KVS — requires macOS.
+
 ## Installation
 
 **Prerequisites:** Go 1.26+

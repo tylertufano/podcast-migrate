@@ -104,25 +104,27 @@ func (p *Provider) Capabilities() provider.Capabilities {
 }
 
 func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
-	if runtime.GOOS != "darwin" {
-		return nil, errors.New("apple: Apple Podcasts is only available on macOS")
-	}
-	if _, err := os.Stat(p.sqlitePath); err == nil {
-		r := NewSQLiteReader(p.sqlitePath)
-		if !p.sinceTime.IsZero() {
-			r.SetSinceTime(p.sinceTime)
-			fmt.Printf("apple: delta mode — reading episodes modified since %s\n",
-				p.sinceTime.Local().Format("2006-01-02 15:04:05"))
+	if runtime.GOOS == "darwin" {
+		if _, err := os.Stat(p.sqlitePath); err == nil {
+			r := NewSQLiteReader(p.sqlitePath)
+			if !p.sinceTime.IsZero() {
+				r.SetSinceTime(p.sinceTime)
+				fmt.Printf("apple: delta mode — reading episodes modified since %s\n",
+					p.sinceTime.Local().Format("2006-01-02 15:04:05"))
+			}
+			lib, err := r.Read(ctx)
+			if err == nil {
+				return lib, nil
+			}
+			// SQLite read failed — log and fall through to OPML if available.
+			fmt.Fprintf(os.Stderr, "apple: SQLite read failed (%v), falling back to OPML\n", err)
 		}
-		lib, err := r.Read(ctx)
-		if err == nil {
-			return lib, nil
-		}
-		// SQLite read failed — log and fall through to OPML if available.
-		fmt.Fprintf(os.Stderr, "apple: SQLite read failed (%v), falling back to OPML\n", err)
 	}
 
 	if p.opmlPath == "" {
+		if runtime.GOOS != "darwin" {
+			return nil, errors.New("apple: Apple Podcasts is only available on macOS")
+		}
 		return nil, errors.New("apple: SQLite database not accessible and no OPML fallback path provided")
 	}
 	return NewOPMLReader(p.opmlPath).Read(ctx)
@@ -133,9 +135,6 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 // In KVS-only mode, requires SetKVSOnlyMode to have been called.
 // Subscriptions are auto-written via KVS in both modes when credentials allow.
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
-	if runtime.GOOS != "darwin" {
-		return errors.New("apple: Apple Podcasts is only available on macOS")
-	}
 	if opts.OnlySubscriptions {
 		return &provider.ErrCapabilityUnsupported{
 			Provider:  p.Name(),
@@ -153,6 +152,10 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 			"    Set APPLE_KVS_DSID and APPLE_KVS_COOKIES (see scripts/capture-kvs-creds.sh).\n" +
 			"    All episodes sync via KVS; feeds not yet indexed by Apple Podcasts wait for\n" +
 			"    the app to refresh before their episodes can be written.")
+	}
+
+	if runtime.GOOS != "darwin" {
+		return errors.New("apple: Apple Podcasts is only available on macOS")
 	}
 
 	// KVS-only mode: all episodes go through KVS.

@@ -14,12 +14,13 @@ Episode matching uses a four-strategy cascade (feed URL + pub date → feed URL 
 
 | Provider | Read subscriptions | Read play state | Write subscriptions | Write play state |
 |---|:---:|:---:|:---:|:---:|
-| Apple Podcasts | ✅ | ✅ | — | ✅ (web API + KVS → syncs to all devices) |
-| Overcast | ✅ | ✅ | ✅ (OPML + auto on play-state write¹) | ✅ (unofficial web API) |
-| Pocket Casts | ✅ | ✅ complete history | ✅ (auto on play-state write¹) | ✅ (unofficial web API) |
+| Apple Podcasts | ✅ | ✅ | ✅ (KVS¹ → syncs to all devices) | ✅ (web API + KVS → syncs to all devices) |
+| Overcast | ✅ | ✅ | ✅ (OPML + auto on play-state write²) | ✅ (unofficial web API) |
+| Pocket Casts | ✅ | ✅ complete history | ✅ (auto on play-state write²) | ✅ (unofficial web API) |
 | OPML | ✅ | ✅ (extended format) | ✅ | ✅ (extended format) |
 
-¹ Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
+¹ Apple subscription writes require KVS credentials (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`) captured via Proxyman. Subscriptions are written automatically during migration; `--only-subscriptions` is not yet supported for Apple Podcasts.
+² Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
 
 ## Installation
 
@@ -69,7 +70,7 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **Apple token expiry** — the Bearer token required to write play state to Apple Podcasts is a short-lived JWT (~90 days). Re-capture it from browser DevTools if you get `401` errors. See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for the one-time capture steps.
 
-**Apple subscriber and internal feeds** — `internal://` feeds (Apple-exclusive shows) and JWT-authenticated subscriber feed URLs (NPR+, Slate+ via supportingcast.fm, etc.) are excluded from subscription exports. Episodes from these private feeds are synced to Apple Podcasts via the KVS path (see [Providers](https://tylertufano.github.io/podcast-migrate/providers) for setup). Without KVS credentials they are skipped.
+**Apple subscriber and internal feeds** — `internal://` feeds (Apple-exclusive shows) and JWT-authenticated subscriber feed URLs (NPR+, Slate+ via supportingcast.fm, etc.) are excluded from subscription exports. When migrating *to* Apple Podcasts with KVS credentials set, subscriptions to private feeds are written automatically and their episodes are synced via KVS (see [Providers](https://tylertufano.github.io/podcast-migrate/providers) for setup). Without KVS credentials, private-feed subscriptions and episodes are skipped.
 
 **Apple KVS session expiry** — the iTunes Store session cookies required for KVS writes must be captured from a live Apple Podcasts request via a proxy tool (Proxyman). They last days to weeks before expiring; re-capture them the same way when you see `status=1198` errors. See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for the capture steps.
 

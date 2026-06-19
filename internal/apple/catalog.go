@@ -407,6 +407,11 @@ func (c *CatalogClient) fetchEpisodePage(
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		// Apple returns 404 when the offset is past the end of the episode list
+		// (code 40403 "No related resources"). Treat as end-of-results.
+		return nil, 0, nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, 0, fmt.Errorf("catalog: fetch episodes page %d: HTTP %d: %s",

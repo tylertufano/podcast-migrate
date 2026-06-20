@@ -219,10 +219,8 @@ func migrateCmd() *cobra.Command {
 			if ap, ok := dst.(*apple.Provider); ok {
 				if appleBearerToken != "" && appleMediaUserToken != "" {
 					ap.SetWebAPICredentials(appleBearerToken, appleMediaUserToken)
-				} else {
-					// KVS-only mode: silently succeeds (prints its own banner) or
-					// silently fails (error surfaces at write time if --play-state).
-					_ = ap.SetKVSOnlyMode()
+				} else if err := ap.SetKVSOnlyMode(); err != nil {
+					return err
 				}
 			}
 

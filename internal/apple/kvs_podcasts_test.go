@@ -202,7 +202,7 @@ func TestKVSPodcastsDomainLive(t *testing.T) {
 		prevCount := len(kvs.subscriptions)
 
 		// Subscribe.
-		if err := kvs.Subscribe(ctx, testFeed, testTitle); err != nil {
+		if _, err := kvs.Subscribe(ctx, testFeed, testTitle); err != nil {
 			t.Fatalf("Subscribe: %v", err)
 		}
 		t.Logf("Subscribed to test feed; sub version now: %q  total subs: %d", kvs.subVersion, len(kvs.subscriptions))

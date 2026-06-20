@@ -109,6 +109,13 @@ type WriteOptions struct {
 	// both are normalised before comparison). Repeatable via --feed-map on the
 	// CLI using "SRC_URL=DST_URL" pairs.
 	FeedMap map[string]string
+
+	// SubscriptionsAddedOut, when non-nil, is incremented once for each
+	// subscription that was actually newly created during SetLibrary (i.e.
+	// it was not already present at the destination). Providers that do not
+	// track this at the write site may leave it untouched, in which case the
+	// engine falls back to its own pre-computed estimate.
+	SubscriptionsAddedOut *int
 }
 
 // ConflictStrategy selects which side wins when both provider and library have state.

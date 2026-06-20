@@ -187,9 +187,13 @@ func (p *Provider) setLibraryWebAPI(ctx context.Context, lib *model.Library, opt
 					if title == "" {
 						title = pod.FeedURL
 					}
-					if subErr := kvs.Subscribe(ctx, pod.FeedURL, title); subErr != nil {
+					isNew, subErr := kvs.Subscribe(ctx, pod.FeedURL, title)
+					if subErr != nil {
 						fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
-					} else {
+					} else if isNew {
+						if opts.SubscriptionsAddedOut != nil {
+							*opts.SubscriptionsAddedOut++
+						}
 						fmt.Printf("  kvs: subscribed to %q\n", title)
 					}
 				}
@@ -232,9 +236,13 @@ func (p *Provider) setLibraryKVSOnly(ctx context.Context, lib *model.Library, op
 				if title == "" {
 					title = pod.FeedURL
 				}
-				if subErr := kvs.Subscribe(ctx, pod.FeedURL, title); subErr != nil {
+				isNew, subErr := kvs.Subscribe(ctx, pod.FeedURL, title)
+				if subErr != nil {
 					fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
-				} else {
+				} else if isNew {
+					if opts.SubscriptionsAddedOut != nil {
+						*opts.SubscriptionsAddedOut++
+					}
 					fmt.Printf("  kvs: subscribed to %q\n", title)
 				}
 			}

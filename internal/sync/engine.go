@@ -102,46 +102,8 @@ func (e *Engine) Run(ctx context.Context, opts provider.WriteOptions) (*Result, 
 		PaywalledEpisodesIncluded: srcLib.PaywalledEpisodesIncluded,
 		SkippedInternalPodcasts:  srcLib.SkippedInternalPodcasts,
 	}
-	// Only count subscriptions added when the destination can actually receive them.
-	// Destinations like Apple Podcasts report WriteSubscriptions=false and have no
-	// subscription write path — counting would produce a misleadingly large number.
-	//
-	// Count only source podcasts that:
-	//   1. Match the active podcast filter (if any) — so --podcast "xyz" doesn't
-	//      report all N source podcasts as new subscriptions.
-	//   2. Are not already present at the destination (by feed URL).
 	if dstCaps.WriteSubscriptions {
-		dstFeeds := make(map[string]bool)
-		if dstLib != nil {
-			for _, p := range dstLib.Podcasts {
-				if p.FeedURL != "" {
-					dstFeeds[p.FeedURL] = true
-				}
-			}
-		}
-		lowerFilters := make([]string, len(opts.PodcastFilter))
-		for i, f := range opts.PodcastFilter {
-			lowerFilters[i] = strings.ToLower(strings.TrimSpace(f))
-		}
-		for _, p := range srcLib.Podcasts {
-			if p.FeedURL == "" || dstFeeds[p.FeedURL] {
-				continue
-			}
-			if len(lowerFilters) > 0 {
-				title := strings.ToLower(strings.TrimSpace(p.Title))
-				matched := false
-				for _, f := range lowerFilters {
-					if f != "" && strings.Contains(title, f) {
-						matched = true
-						break
-					}
-				}
-				if !matched {
-					continue
-				}
-			}
-			res.SubscriptionsAdded++
-		}
+		opts.SubscriptionsAddedOut = &res.SubscriptionsAdded
 	}
 
 	if err := e.dst.SetLibrary(ctx, merged, opts); err != nil {

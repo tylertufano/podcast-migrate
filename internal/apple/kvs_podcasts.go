@@ -421,23 +421,24 @@ func (w *KVSWriter) IsSubscribed(feedURL string) bool {
 	return false
 }
 
-// Subscribe adds feedURL to the subscription list. If already subscribed,
-// returns nil without writing. Writes the updated list to the KVS.
-func (w *KVSWriter) Subscribe(ctx context.Context, feedURL, title string) error {
+// Subscribe adds feedURL to the subscription list. Returns true if a new
+// subscription was created (or an unsubscribed entry was re-enabled), false
+// if the feed was already subscribed. Writes the updated list to the KVS.
+func (w *KVSWriter) Subscribe(ctx context.Context, feedURL, title string) (bool, error) {
 	if err := w.initPodcastsDomain(ctx); err != nil {
-		return err
+		return false, err
 	}
 	// Already subscribed — no-op.
 	for i, s := range w.subscriptions {
 		if s.FeedURL == feedURL {
 			if s.Subscribed == 1 {
-				return nil
+				return false, nil
 			}
 			// Was unsubscribed — flip it back.
 			w.subscriptions[i].Subscribed = 1
 			w.subscriptions[i].UpdatedDate = time.Now().UTC()
 			w.subscriptions[i].LastTouchDate = time.Now().UTC()
-			return w.putSubscriptions(ctx)
+			return true, w.putSubscriptions(ctx)
 		}
 	}
 
@@ -457,13 +458,13 @@ func (w *KVSWriter) Subscribe(ctx context.Context, feedURL, title string) error 
 		UpdatedDate:            now,
 	})
 	if err := w.putSubscriptions(ctx); err != nil {
-		return err
+		return false, err
 	}
 	if w.newlySubscribed == nil {
 		w.newlySubscribed = make(map[string]time.Time)
 	}
 	w.newlySubscribed[feedURL] = now
-	return nil
+	return true, nil
 }
 
 // Unsubscribe sets subscribed=0 for feedURL in the subscription list.

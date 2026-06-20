@@ -414,9 +414,13 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 				if title == "" {
 					title = ep.FeedURL
 				}
-				if subErr := w.Subscribe(ctx, ep.FeedURL, title); subErr != nil {
+				isNew, subErr := w.Subscribe(ctx, ep.FeedURL, title)
+				if subErr != nil {
 					fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
-				} else {
+				} else if isNew {
+					if opts.SubscriptionsAddedOut != nil {
+						*opts.SubscriptionsAddedOut++
+					}
 					fmt.Printf("  kvs: subscribed to %q\n", title)
 				}
 			}

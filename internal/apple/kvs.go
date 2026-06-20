@@ -996,10 +996,11 @@ func parseServerState(ctx context.Context, body []byte) (versions map[string]int
 		s = s[dictEnd+len("</dict>"):]
 
 		metaID := xmlStringAfter(block, "<key>key</key>")
-		verStr := xmlStringAfter(block, "<key>version</key>")
-		if metaID == "" || verStr == "" {
+		if metaID == "" {
 			continue
 		}
+		// version is stored as <integer> in the plist response, not <string>.
+		verStr := xmlIntegerAfter(block, "<key>version</key>")
 		if v, err := strconv.Atoi(verStr); err == nil {
 			versions[metaID] = v
 		}
@@ -1020,6 +1021,21 @@ func xmlStringAfter(s, tag string) string {
 	after := strings.TrimSpace(s[i+len(tag):])
 	after = strings.TrimPrefix(after, "<string>")
 	if after == s[i+len(tag):] { // no <string> prefix found
+		return ""
+	}
+	return strings.SplitN(after, "<", 2)[0]
+}
+
+// xmlIntegerAfter returns the content of the first <integer>…</integer> element
+// that follows the literal tag within s.
+func xmlIntegerAfter(s, tag string) string {
+	i := strings.Index(s, tag)
+	if i == -1 {
+		return ""
+	}
+	after := strings.TrimSpace(s[i+len(tag):])
+	after = strings.TrimPrefix(after, "<integer>")
+	if after == strings.TrimSpace(s[i+len(tag):]) { // no <integer> prefix found
 		return ""
 	}
 	return strings.SplitN(after, "<", 2)[0]

@@ -397,6 +397,21 @@ func (m *mockProvider) GetLibrary(_ context.Context) (*model.Library, error) {
 func (m *mockProvider) SetLibrary(_ context.Context, lib *model.Library, opts provider.WriteOptions) error {
 	m.written = lib
 	m.writtenOpts = opts
+	if opts.SubscriptionsAddedOut != nil {
+		existing := make(map[string]bool)
+		if m.lib != nil {
+			for _, p := range m.lib.Podcasts {
+				if p.FeedURL != "" {
+					existing[p.FeedURL] = true
+				}
+			}
+		}
+		for _, p := range lib.Podcasts {
+			if p.FeedURL != "" && !existing[p.FeedURL] {
+				*opts.SubscriptionsAddedOut++
+			}
+		}
+	}
 	return m.setErr
 }
 

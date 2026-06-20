@@ -194,12 +194,11 @@ fi
 
 if [ "$WRITE_MODE" = true ]; then
   {
-    printf 'APPLE_KVS_DSID=%s\n' "$DSID"
-    printf "APPLE_KVS_COOKIES='%s'\n" "$COOKIE_HDR"
+    printf 'export APPLE_KVS_DSID=%s\n' "$DSID"
+    printf "export APPLE_KVS_COOKIES='%s'\n" "$COOKIE_HDR"
   } > "$CREDS_FILE"
   echo "✓ Credentials written to $CREDS_FILE" >&2
   echo "  Source them with: source $CREDS_FILE" >&2
-  echo "  Or: set -a && source $CREDS_FILE && set +a" >&2
 else
   echo ""
   echo "export APPLE_KVS_DSID=\"$DSID\""

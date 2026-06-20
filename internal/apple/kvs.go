@@ -56,7 +56,7 @@ type KVSWriter struct {
 	dsid            string // iTunes Store account DSID
 	httpClient      *http.Client
 	sessionReady    bool              // true after getAll(com.apple.upp) has been called
-	serverVersions  map[string]int    // metadataIdentifier → current server version, populated by getAll
+	serverVersions   map[string]int             // metadataIdentifier → current server version, populated by getAll
 	serverRawValues  map[string][]byte          // metadataIdentifier → DEFLATE-compressed inner plist bytes
 	serverPlayStates map[string]kvsServerState  // lazily decoded per-episode play states
 
@@ -323,7 +323,8 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 	for i, p := range pending {
 		items[i] = p.item
 	}
-	if err := w.putAll(ctx, items); err != nil {
+	conflicts, err := w.putAll(ctx, items)
+	if err != nil {
 		for _, p := range pending {
 			writeLogLine(opts.LogWriter, "error", p.podTitle, p.ep.Title, p.ep.PubDate,
 				playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", err.Error())
@@ -331,12 +332,50 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 		return 0, err
 	}
 
+	count := 0
+	var needsRetry []kvsItemWithMeta
 	for _, p := range pending {
+		if _, wasConflict := conflicts[p.item.MetadataIdentifier]; wasConflict {
+			// Server already has this key at a newer version (status=1198).
+			// Check whether its current state covers our desired state.
+			if serverState, ok := w.checkServerPlayState(ctx, p.item.MetadataIdentifier); ok &&
+				serverStateCoversDesired(p.ep, serverState) {
+				writeLogLine(opts.LogWriter, "skipped", p.podTitle, p.ep.Title, p.ep.PubDate,
+					playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", "already synced via KVS")
+				continue
+			}
+			// Server has the key but at an insufficient play state — retry with
+			// the correct base-version (now populated from the conflict response).
+			needsRetry = append(needsRetry, p)
+			continue
+		}
 		fmt.Printf("  kvs: synced %q — %q\n", p.podTitle, p.ep.Title)
 		writeLogLine(opts.LogWriter, "updated", p.podTitle, p.ep.Title, p.ep.PubDate,
 			playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", w.kvsLogLabel())
+		count++
 	}
-	return len(pending), nil
+
+	if len(needsRetry) > 0 {
+		retryItems := make([]kvsItem, len(needsRetry))
+		for i, p := range needsRetry {
+			retryItems[i] = p.item
+		}
+		if _, retryErr := w.putAll(ctx, retryItems); retryErr != nil {
+			for _, p := range needsRetry {
+				writeLogLine(opts.LogWriter, "error", p.podTitle, p.ep.Title, p.ep.PubDate,
+					playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", retryErr.Error())
+			}
+		} else {
+			for _, p := range needsRetry {
+				fmt.Printf("  kvs: synced %q — %q\n", p.podTitle, p.ep.Title)
+				writeLogLine(opts.LogWriter, "updated", p.podTitle, p.ep.Title, p.ep.PubDate,
+					playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", w.kvsLogLabel())
+				count++
+			}
+		}
+	}
+
+	return count, nil
 }
 
 // kvsLogLabel returns the sync-method label for log lines.
@@ -494,19 +533,52 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 		for i, pm := range p {
 			items[i] = pm.item
 		}
-		if putErr := w.putAll(ctx, items); putErr != nil {
+		conflicts, putErr := w.putAll(ctx, items)
+		if putErr != nil {
 			for _, pm := range p {
 				writeLogLine(opts.LogWriter, "error", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
 					playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", putErr.Error())
 			}
 			return 0, fmt.Errorf("kvs: putAll batch failed: %w", putErr)
 		}
+		count := 0
+		var needsRetry []kvsItemWithMeta
 		for _, pm := range p {
+			if _, wasConflict := conflicts[pm.item.MetadataIdentifier]; wasConflict {
+				if serverState, ok := w.checkServerPlayState(ctx, pm.item.MetadataIdentifier); ok &&
+					serverStateCoversDesired(pm.ep, serverState) {
+					writeLogLine(opts.LogWriter, "skipped", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+						playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", "already synced via KVS")
+					continue
+				}
+				needsRetry = append(needsRetry, pm)
+				continue
+			}
 			fmt.Printf("  kvs: synced %q — %q\n", pm.podTitle, pm.ep.Title)
 			writeLogLine(opts.LogWriter, "updated", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
 				playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", w.kvsLogLabel())
+			count++
 		}
-		return len(p), nil
+		if len(needsRetry) > 0 {
+			retryItems := make([]kvsItem, len(needsRetry))
+			for i, pm := range needsRetry {
+				retryItems[i] = pm.item
+			}
+			if _, retryErr := w.putAll(ctx, retryItems); retryErr != nil {
+				for _, pm := range needsRetry {
+					writeLogLine(opts.LogWriter, "error", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+						playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", retryErr.Error())
+				}
+			} else {
+				for _, pm := range needsRetry {
+					fmt.Printf("  kvs: synced %q — %q\n", pm.podTitle, pm.ep.Title)
+					writeLogLine(opts.LogWriter, "updated", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+						playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", w.kvsLogLabel())
+					count++
+				}
+			}
+		}
+		return count, nil
 	}
 
 	// --- First pass ---
@@ -737,7 +809,8 @@ func (w *KVSWriter) WriteEpisode(ctx context.Context, ep model.EpisodeState) (bo
 	now := time.Since(coreDataEpoch).Seconds()
 	applyPlayState(ep, &item, now)
 
-	return true, w.putAll(ctx, []kvsItem{item})
+	_, err = w.putAll(ctx, []kvsItem{item})
+	return err == nil, err
 }
 
 // kvsItem holds the data needed to build one entry in a putAll request.
@@ -949,15 +1022,16 @@ func (w *KVSWriter) initSession(ctx context.Context) error {
 	}
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
-	w.serverVersions, w.serverRawValues = parseServerState(ctx, respBody)
+	w.serverVersions, w.serverRawValues, _ = parseServerState(ctx, respBody)
 	w.serverPlayStates = make(map[string]kvsServerState) // clear decoded cache on each refresh
 	w.sessionReady = true
 	return nil
 }
 
+
 // parseServerState extracts metadataIdentifier→version and metadataIdentifier→rawValue
 // pairs from a getAll(com.apple.upp) binary plist response. Returns empty maps on failure.
-func parseServerState(ctx context.Context, body []byte) (versions map[string]int, rawValues map[string][]byte) {
+func parseServerState(ctx context.Context, body []byte) (versions map[string]int, rawValues map[string][]byte, domainVersion int) {
 	versions = make(map[string]int)
 	rawValues = make(map[string][]byte)
 	if len(body) == 0 {
@@ -972,6 +1046,13 @@ func parseServerState(ctx context.Context, body []byte) (versions map[string]int
 	s := string(xmlOut)
 
 	// Narrow to the values array to avoid false matches on top-level keys.
+	// Extract domain-version (global sequence counter for this domain).
+	if dvStr := xmlIntegerFieldAfter(s, "<key>domain-version</key>"); dvStr != "" {
+		if dv, err := strconv.Atoi(dvStr); err == nil {
+			domainVersion = dv
+		}
+	}
+
 	const valuesKey = "<key>values</key>"
 	vi := strings.Index(s, valuesKey)
 	if vi == -1 {
@@ -999,8 +1080,7 @@ func parseServerState(ctx context.Context, body []byte) (versions map[string]int
 		if metaID == "" {
 			continue
 		}
-		// version is stored as <integer> in the plist response, not <string>.
-		verStr := xmlIntegerAfter(block, "<key>version</key>")
+		verStr := xmlStringAfter(block, "<key>version</key>")
 		if v, err := strconv.Atoi(verStr); err == nil {
 			versions[metaID] = v
 		}
@@ -1009,6 +1089,21 @@ func parseServerState(ctx context.Context, body []byte) (versions map[string]int
 		}
 	}
 	return
+}
+
+// xmlIntegerFieldAfter returns the content of the first <integer>…</integer>
+// element that follows the literal tag within s (used for top-level plist integers).
+func xmlIntegerFieldAfter(s, tag string) string {
+	i := strings.Index(s, tag)
+	if i == -1 {
+		return ""
+	}
+	after := strings.TrimSpace(s[i+len(tag):])
+	after = strings.TrimPrefix(after, "<integer>")
+	if after == strings.TrimSpace(s[i+len(tag):]) {
+		return ""
+	}
+	return strings.TrimSpace(strings.SplitN(after, "<", 2)[0])
 }
 
 // xmlStringAfter returns the content of the first <string>…</string> element
@@ -1021,21 +1116,6 @@ func xmlStringAfter(s, tag string) string {
 	after := strings.TrimSpace(s[i+len(tag):])
 	after = strings.TrimPrefix(after, "<string>")
 	if after == s[i+len(tag):] { // no <string> prefix found
-		return ""
-	}
-	return strings.SplitN(after, "<", 2)[0]
-}
-
-// xmlIntegerAfter returns the content of the first <integer>…</integer> element
-// that follows the literal tag within s.
-func xmlIntegerAfter(s, tag string) string {
-	i := strings.Index(s, tag)
-	if i == -1 {
-		return ""
-	}
-	after := strings.TrimSpace(s[i+len(tag):])
-	after = strings.TrimPrefix(after, "<integer>")
-	if after == strings.TrimSpace(s[i+len(tag):]) { // no <integer> prefix found
 		return ""
 	}
 	return strings.SplitN(after, "<", 2)[0]
@@ -1120,7 +1200,10 @@ const kvsBatchSize = 25
 // putAll sends all items to the KVS, chunked into groups of kvsBatchSize.
 // It calls initSession (getAll) first to obtain current server-side versions,
 // then overwrites each item's UPPVersion with the server value before sending.
-func (w *KVSWriter) putAll(ctx context.Context, items []kvsItem) error {
+// conflictKeys contains metadataIdentifiers whose writes were rejected with
+// status=1198 (version conflict); the server's current state for those keys is
+// merged into w.serverVersions and w.serverRawValues before returning.
+func (w *KVSWriter) putAll(ctx context.Context, items []kvsItem) (conflictKeys map[string]struct{}, err error) {
 	if err := w.initSession(ctx); err != nil {
 		fmt.Printf("apple/kvs: session init (getAll) failed: %v\n", err)
 	}
@@ -1136,59 +1219,96 @@ func (w *KVSWriter) putAll(ctx context.Context, items []kvsItem) error {
 		if n > len(items) {
 			n = len(items)
 		}
-		if err := w.sendChunk(ctx, items[:n]); err != nil {
-			return err
+		chunkConflicts, chunkErr := w.sendChunk(ctx, items[:n])
+		if chunkErr != nil {
+			return conflictKeys, chunkErr
+		}
+		if len(chunkConflicts) > 0 {
+			if conflictKeys == nil {
+				conflictKeys = make(map[string]struct{})
+			}
+			for k := range chunkConflicts {
+				conflictKeys[k] = struct{}{}
+			}
 		}
 		items = items[n:]
 	}
-	return nil
+	return conflictKeys, nil
 }
 
 // sendChunk sends a single putAll HTTP request for the given items (≤ kvsBatchSize).
-func (w *KVSWriter) sendChunk(ctx context.Context, items []kvsItem) error {
+// On status=1198 it merges the server's current state into w.serverVersions /
+// w.serverRawValues and returns the conflicting keys (not an error).
+func (w *KVSWriter) sendChunk(ctx context.Context, items []kvsItem) (conflictKeys map[string]struct{}, err error) {
 	body, err := buildPutAllBody(items)
 	if err != nil {
-		return fmt.Errorf("build body: %w", err)
+		return nil, fmt.Errorf("build body: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, kvsEndpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 	w.setKVSHeaders(req)
 
 	resp, err := w.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("putAll HTTP: %w", err)
+		return nil, fmt.Errorf("putAll HTTP: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("putAll HTTP %d: %s", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("putAll HTTP %d: %s", resp.StatusCode, respBody)
 	}
 
-	// The response is a binary plist; convert to XML with plutil to check status.
 	cmd := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", "-")
 	cmd.Stdin = bytes.NewReader(respBody)
 	xmlOut, err := cmd.Output()
-	if err == nil && bytes.Contains(xmlOut, []byte("<key>status</key>")) {
-		// Crude parse: check for <integer>-2</integer> adjacent to the status key.
-		s := string(xmlOut)
-		if idx := strings.Index(s, "<key>status</key>"); idx != -1 {
-			after := s[idx+len("<key>status</key>"):]
-			after = strings.TrimSpace(after)
-			if strings.HasPrefix(after, "<integer>") {
-				after = strings.TrimPrefix(after, "<integer>")
-				statusStr := strings.SplitN(after, "<", 2)[0]
-				if statusStr != "0" {
-					return fmt.Errorf("putAll returned status=%s (session may have expired — reopen Apple Podcasts)", statusStr)
-				}
-			}
-		}
+	if err != nil {
+		// plutil failed — response may not be a plist (unexpected but non-fatal).
+		return nil, nil
 	}
 
-	return nil
+	s := string(xmlOut)
+	statusIdx := strings.Index(s, "<key>status</key>")
+	if statusIdx == -1 {
+		return nil, nil
+	}
+	after := strings.TrimSpace(s[statusIdx+len("<key>status</key>"):])
+	if !strings.HasPrefix(after, "<integer>") {
+		return nil, nil
+	}
+	statusStr := strings.TrimSpace(strings.SplitN(strings.TrimPrefix(after, "<integer>"), "<", 2)[0])
+
+	switch statusStr {
+	case "0":
+		return nil, nil
+	case "1198":
+		// Version conflict: the server has these keys at a newer version than our
+		// base-version=0. The response body contains the current server values —
+		// parse them so the caller can check if the server state covers the desired
+		// state (and skip the write) or needs a retry with the correct base-version.
+		conflictVersions, conflictRaws, _ := parseServerState(ctx, respBody)
+		if w.serverVersions == nil {
+			w.serverVersions = make(map[string]int)
+		}
+		if w.serverRawValues == nil {
+			w.serverRawValues = make(map[string][]byte)
+		}
+		conflicts := make(map[string]struct{}, len(conflictVersions))
+		for k, v := range conflictVersions {
+			w.serverVersions[k] = v
+			conflicts[k] = struct{}{}
+		}
+		for k, v := range conflictRaws {
+			w.serverRawValues[k] = v
+		}
+		w.serverPlayStates = make(map[string]kvsServerState) // invalidate decoded cache
+		return conflicts, nil
+	default:
+		return nil, fmt.Errorf("putAll returned status=%s (session may have expired — reopen Apple Podcasts)", statusStr)
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
@@ -324,13 +325,9 @@ func (w *WebAPIWriter) getServerPosition(ctx context.Context, appleEpisodeID int
 // Use completed=true with positionMs=0 to mark as played.
 // Use completed=false with positionMs>0 to set an in-progress position.
 //
-// 5xx responses are retried up to maxMarkRetries times with exponential backoff
-// since Apple's Podcast Cloud Library service occasionally returns transient
-// upstream errors (code 50001).
+// 5xx and network errors are retried via httputil.RetryFunc; Apple's Podcast
+// Cloud Library service occasionally returns transient upstream errors (50001).
 func (w *WebAPIWriter) markPosition(ctx context.Context, appleEpisodeID, positionMs int64, completed bool) error {
-	const maxRetries = 3
-	const retryBaseDelay = 2 * time.Second
-
 	type attributes struct {
 		PositionInMilliseconds int64  `json:"positionInMilliseconds"`
 		RecordedAtTimestamp    string `json:"recordedAtTimestamp"`
@@ -346,18 +343,7 @@ func (w *WebAPIWriter) markPosition(ctx context.Context, appleEpisodeID, positio
 		appleEpisodeID,
 	)
 
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			delay := retryBaseDelay * (1 << (attempt - 1)) // 2s, 4s, 8s
-			fmt.Printf("    retrying in %v (attempt %d/%d)...\n", delay, attempt, maxRetries)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-
+	return httputil.RetryFunc(ctx, func() error {
 		body, err := json.Marshal(payload{
 			Type: "playback-positions",
 			Attributes: attributes{
@@ -385,23 +371,20 @@ func (w *WebAPIWriter) markPosition(ctx context.Context, appleEpisodeID, positio
 
 		resp, err := w.httpClient.Do(req)
 		if err != nil {
-			lastErr = fmt.Errorf("HTTP PUT: %w", err)
-			continue // network error — retry
+			return httputil.NewTransientError(fmt.Errorf("apple/webapi: HTTP PUT: %w", err))
 		}
-
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
 
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
+		}
 		if resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))
-			continue // transient server error — retry
+			return httputil.NewTransientError(fmt.Errorf("apple/webapi: API returned %d: %s", resp.StatusCode, respBody))
 		}
 		if resp.StatusCode >= 400 {
-			return fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody)) // client error — don't retry
+			return fmt.Errorf("apple/webapi: API returned %d: %s", resp.StatusCode, respBody)
 		}
-
-		return nil // success
-	}
-
-	return fmt.Errorf("after %d attempts: %w", maxRetries+1, lastErr)
+		return nil
+	}, httputil.RetryOptions{})
 }

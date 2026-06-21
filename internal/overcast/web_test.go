@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/overcast"
 )
 
@@ -206,7 +207,7 @@ func TestSetProgress_5xxReturnsTransientError(t *testing.T) {
 			if err == nil {
 				t.Fatalf("HTTP %d: expected error, got nil", code)
 			}
-			var te *overcast.TransientError
+			var te *httputil.TransientError
 			if !errors.As(err, &te) {
 				t.Errorf("HTTP %d: expected *TransientError, got %T: %v", code, err, err)
 			}
@@ -226,7 +227,7 @@ func TestSetProgress_4xxReturnsPlainError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 403, got nil")
 	}
-	var te *overcast.TransientError
+	var te *httputil.TransientError
 	if errors.As(err, &te) {
 		t.Errorf("403 should not be a *TransientError (permanent client error)")
 	}
@@ -421,7 +422,7 @@ func TestSearchPodcastITunesID_RateLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected RateLimitError, got nil")
 	}
-	rl, ok := err.(*overcast.RateLimitError)
+	rl, ok := err.(*httputil.RateLimitError)
 	if !ok {
 		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
 	}
@@ -862,7 +863,7 @@ func TestFetchEpisodeNumericID_RateLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 429, got nil")
 	}
-	rl, ok := err.(*overcast.RateLimitError)
+	rl, ok := err.(*httputil.RateLimitError)
 	if !ok {
 		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
 	}
@@ -906,7 +907,7 @@ func TestFetchSubscribedPodcasts_RateLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected RateLimitError for 429, got nil")
 	}
-	rl, ok := err.(*overcast.RateLimitError)
+	rl, ok := err.(*httputil.RateLimitError)
 	if !ok {
 		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
 	}
@@ -927,7 +928,7 @@ func TestFetchExtendedOPML_RateLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected RateLimitError for 429, got nil")
 	}
-	rl, ok := err.(*overcast.RateLimitError)
+	rl, ok := err.(*httputil.RateLimitError)
 	if !ok {
 		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
 	}
@@ -948,7 +949,7 @@ func TestFetchPodcastEpisodes_RateLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected RateLimitError for 429, got nil")
 	}
-	rl, ok := err.(*overcast.RateLimitError)
+	rl, ok := err.(*httputil.RateLimitError)
 	if !ok {
 		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
 	}

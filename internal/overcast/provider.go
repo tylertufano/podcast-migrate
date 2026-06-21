@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
@@ -429,57 +430,9 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			pos = PlayedSentinel
 		}
 
-		// Retry loop: 429 (rate limit) and 5xx/network (transient) errors are
-		// handled independently with separate attempt counters so neither can
-		// exhaust the other's budget. Permanent 4xx errors (other than 429)
-		// break immediately.
-		const maxRateLimitRetries = 3
-		const maxTransientRetries = 3
-		const retryBaseDelay = 2 * time.Second
-
-		var setErr error
-		rateLimitRetries := 0
-		transientRetries := 0
-		for {
-			setErr = SetProgress(ctx, httpClient, numericID, pos)
-			if setErr == nil {
-				break
-			}
-
-			var rl *RateLimitError
-			if errors.As(setErr, &rl) {
-				if rateLimitRetries >= maxRateLimitRetries {
-					break
-				}
-				rateLimitRetries++
-				fmt.Printf("\n  rate limited (429) — pausing %v before retry...\n", rl.Wait)
-				select {
-				case <-ctx.Done():
-					return updated, ctx.Err()
-				case <-time.After(rl.Wait):
-				}
-				continue
-			}
-
-			var te *TransientError
-			if errors.As(setErr, &te) {
-				if transientRetries >= maxTransientRetries {
-					break
-				}
-				transientRetries++
-				delay := retryBaseDelay * (1 << uint(transientRetries-1)) // 2s, 4s, 8s
-				fmt.Printf("    transient error — retrying in %v (attempt %d/%d)...\n",
-					delay, transientRetries, maxTransientRetries)
-				select {
-				case <-ctx.Done():
-					return updated, ctx.Err()
-				case <-time.After(delay):
-				}
-				continue
-			}
-
-			break // permanent error (4xx other than 429) — don't retry
-		}
+		setErr := httputil.RetryFunc(ctx, func() error {
+			return SetProgress(ctx, httpClient, numericID, pos)
+		}, httputil.RetryOptions{})
 		if setErr != nil {
 			fmt.Printf("  [%d/%d] FAILED %q (id=%s): %v\n",
 				updated+apiSkipped+1, toUpdate, ep.Title, numericID, setErr)
@@ -1138,7 +1091,7 @@ func augmentIndexFromPodcastPages(
 
 				id, err := FetchEpisodeNumericID(fetchCtx, client, item.episodeURL)
 				if err != nil {
-					var rl *RateLimitError
+					var rl *httputil.RateLimitError
 					if errors.As(err, &rl) {
 						select {
 						case <-fetchCtx.Done():
@@ -1151,7 +1104,7 @@ func augmentIndexFromPodcastPages(
 					// 5xx / network-level transient error — retry with the
 					// exponential backoff already applied at the top of the loop
 					// (30 s, 60 s, 120 s for attempts 1-3).
-					var te *TransientError
+					var te *httputil.TransientError
 					if errors.As(err, &te) {
 						if attempt < maxFetchRetries-1 {
 							fmt.Printf("  transient error fetching %s (%v) — will retry\n", item.episodeURL, err)
@@ -1323,7 +1276,7 @@ func searchPodcastITunesIDWithRetry(ctx context.Context, client *http.Client, ti
 	if err == nil {
 		return id, nil
 	}
-	var rl *RateLimitError
+	var rl *httputil.RateLimitError
 	if !errors.As(err, &rl) {
 		return "", err
 	}
@@ -1363,7 +1316,7 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client, pag
 			return listings, nil
 		}
 
-		var rl *RateLimitError
+		var rl *httputil.RateLimitError
 		if errors.As(err, &rl) {
 			wait := rl.Wait
 			if attempt == 0 {

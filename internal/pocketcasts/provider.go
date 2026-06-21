@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
@@ -880,8 +881,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			if authEpAvailable {
 				authEps, err := fetchUserEpisodesWithRetry(ctx, client, podUUID, requestDelay)
 				if err != nil {
-					var rl *RateLimitError
-					var te *TransientError
+					var rl *httputil.RateLimitError
+					var te *httputil.TransientError
 					if !errors.As(err, &rl) && !errors.As(err, &te) {
 						// Non-retriable error — authenticated endpoint not available for
 						// this run; skip it for all remaining podcasts.
@@ -1005,12 +1006,6 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	alreadySatisfied := 0
 	notFound := 0
 
-	const (
-		maxRateLimitRetries = 3
-		maxTransientRetries = 3
-		retryBaseDelay      = 2 * time.Second
-	)
-
 	for _, ep := range episodes {
 		if ep.FromDestination || ep.PlayState == model.PlayStateUnplayed || ep.FeedURL == "" {
 			continue
@@ -1054,52 +1049,11 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			}
 		}
 
-		// Retry loop: handles 429 (rate limit) and 5xx/network (transient) errors.
-		var writeErr error
-		rateLimitRetries := 0
-		transientRetries := 0
-		for {
-			writeErr = UpdateEpisodeProgress(ctx, client,
+		writeErr := httputil.RetryFunc(ctx, func() error {
+			return UpdateEpisodeProgress(ctx, client,
 				entry.episodeUUID, entry.podcastUUID,
 				status, positionSec, durationSec)
-			if writeErr == nil {
-				break
-			}
-
-			var rl *RateLimitError
-			if errors.As(writeErr, &rl) {
-				if rateLimitRetries >= maxRateLimitRetries {
-					break
-				}
-				rateLimitRetries++
-				fmt.Printf("\n  rate limited (429) — pausing %v before retry...\n", rl.Wait)
-				select {
-				case <-ctx.Done():
-					return updated, ctx.Err()
-				case <-time.After(rl.Wait):
-				}
-				continue
-			}
-
-			var te *TransientError
-			if errors.As(writeErr, &te) {
-				if transientRetries >= maxTransientRetries {
-					break
-				}
-				transientRetries++
-				delay := retryBaseDelay * (1 << uint(transientRetries-1)) // 2s, 4s, 8s
-				fmt.Printf("    transient error — retrying in %v (attempt %d/%d)...\n",
-					delay, transientRetries, maxTransientRetries)
-				select {
-				case <-ctx.Done():
-					return updated, ctx.Err()
-				case <-time.After(delay):
-				}
-				continue
-			}
-
-			break // permanent error — don't retry
-		}
+		}, httputil.RetryOptions{})
 
 		if writeErr != nil {
 			fmt.Printf("  [%d/%d] FAILED %q: %v\n", updated+apiSkipped+1, toUpdate, ep.Title, writeErr)
@@ -1275,7 +1229,7 @@ func fetchUserEpisodesWithRetry(ctx context.Context, client *http.Client,
 			return eps, nil
 		}
 
-		var rl *RateLimitError
+		var rl *httputil.RateLimitError
 		if errors.As(err, &rl) {
 			if attempt == 0 {
 				fmt.Printf("  rate limited (auth) — waiting %v...\n", rl.Wait)
@@ -1288,7 +1242,7 @@ func fetchUserEpisodesWithRetry(ctx context.Context, client *http.Client,
 			lastErr = err
 			continue
 		}
-		var te *TransientError
+		var te *httputil.TransientError
 		if errors.As(err, &te) {
 			lastErr = err
 			continue
@@ -1323,7 +1277,7 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client,
 			return eps, hasMore, nil
 		}
 
-		var rl *RateLimitError
+		var rl *httputil.RateLimitError
 		if errors.As(err, &rl) {
 			wait := rl.Wait
 			if attempt == 0 {

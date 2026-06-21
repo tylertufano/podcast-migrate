@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/pocketcasts"
 )
 
@@ -35,7 +36,7 @@ func TestRateLimitError_ErrorString_ContainsStatusAndWait(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 429, got nil")
 	}
-	var rl *pocketcasts.RateLimitError
+	var rl *httputil.RateLimitError
 	if !errors.As(err, &rl) {
 		t.Fatalf("expected *RateLimitError, got %T: %v", err, err)
 	}
@@ -68,7 +69,7 @@ func TestTransientError_ErrorString_ContainsCauseMessage(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 500, got nil")
 	}
-	var te *pocketcasts.TransientError
+	var te *httputil.TransientError
 	if !errors.As(err, &te) {
 		t.Fatalf("expected *TransientError, got %T: %v", err, err)
 	}
@@ -95,7 +96,7 @@ func TestTransientError_Unwrap_ReturnsWrappedCause(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 502")
 	}
-	var te *pocketcasts.TransientError
+	var te *httputil.TransientError
 	if !errors.As(err, &te) {
 		t.Fatalf("expected *TransientError, got %T", err)
 	}
@@ -161,7 +162,7 @@ func TestFetchExportFeedURLs_RateLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 429, got nil")
 	}
-	var rl *pocketcasts.RateLimitError
+	var rl *httputil.RateLimitError
 	if !errors.As(err, &rl) {
 		t.Fatalf("expected *RateLimitError, got %T", err)
 	}
@@ -182,7 +183,7 @@ func TestFetchExportFeedURLs_5xx_ReturnsTransientError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 503, got nil")
 	}
-	var te *pocketcasts.TransientError
+	var te *httputil.TransientError
 	if !errors.As(err, &te) {
 		t.Fatalf("expected *TransientError for 5xx, got %T: %v", err, err)
 	}

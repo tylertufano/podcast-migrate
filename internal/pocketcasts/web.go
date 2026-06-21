@@ -33,11 +33,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
+
+	"github.com/tyler/podcast-migrate/internal/httputil"
 )
 
 var pcBaseURL     = "https://api.pocketcasts.com"
@@ -69,25 +70,6 @@ const (
 	PlayingInProgress = 2 // episode partially listened to
 	PlayingPlayed     = 3 // episode listened to completion
 )
-
-// RateLimitError is returned when Pocket Casts responds with HTTP 429.
-// The Wait field holds how long to pause before the next attempt.
-type RateLimitError struct {
-	Wait time.Duration
-}
-
-func (e *RateLimitError) Error() string {
-	return fmt.Sprintf("pocketcasts/web: rate limited (HTTP 429) — retry after %v", e.Wait)
-}
-
-// TransientError is returned when an API call receives a 5xx response or a
-// network-level failure — both of which may succeed on a subsequent attempt.
-type TransientError struct {
-	cause error
-}
-
-func (e *TransientError) Error() string { return e.cause.Error() }
-func (e *TransientError) Unwrap() error { return e.cause }
 
 // bearerTransport injects an Authorization: Bearer header on every outgoing
 // request. It is set as the Transport on the *http.Client returned by Login.
@@ -147,16 +129,6 @@ func (e *APIEpisode) ParsePublishedAt() time.Time {
 		return time.Time{}
 	}
 	return t
-}
-
-// rateLimitWait extracts the Retry-After delay from a 429 response.
-func rateLimitWait(resp *http.Response, defaultWait time.Duration) time.Duration {
-	if ra := resp.Header.Get("Retry-After"); ra != "" {
-		if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs > 0 {
-			return time.Duration(secs) * time.Second
-		}
-	}
-	return defaultWait
 }
 
 // Login authenticates with Pocket Casts and returns an *http.Client whose
@@ -233,10 +205,10 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]APIPod
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/podcast/list returned HTTP %d", resp.StatusCode)}
+		return nil, httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /user/podcast/list returned HTTP %d", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("pocketcasts/web: /user/podcast/list returned HTTP %d: %s",
@@ -289,10 +261,10 @@ func FetchExportFeedURLs(ctx context.Context, client *http.Client, uuids []strin
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /import/export_feed_urls returned HTTP %d", resp.StatusCode)}
+		return nil, httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /import/export_feed_urls returned HTTP %d", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("pocketcasts/web: /import/export_feed_urls returned HTTP %d: %s",
@@ -372,10 +344,10 @@ func FetchInProgressEpisodes(ctx context.Context, client *http.Client) ([]APIEpi
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/in_progress returned HTTP %d", resp.StatusCode)}
+		return nil, httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /user/in_progress returned HTTP %d", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("pocketcasts/web: /user/in_progress returned HTTP %d: %s",
@@ -453,10 +425,10 @@ func FetchPlayedEpisodes(ctx context.Context, client *http.Client) ([]APIEpisode
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/history returned HTTP %d", resp.StatusCode)}
+		return nil, httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /user/history returned HTTP %d", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("pocketcasts/web: /user/history returned HTTP %d: %s",
@@ -549,10 +521,10 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastUUID 
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, false, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, false, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, false, &TransientError{cause: fmt.Errorf("pocketcasts/web: podcast/full returned HTTP %d", resp.StatusCode)}
+		return nil, false, httputil.NewTransientError(fmt.Errorf("pocketcasts/web: podcast/full returned HTTP %d", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("pocketcasts/web: podcast/full returned HTTP %d: %s",
@@ -617,10 +589,10 @@ func FetchUserPodcastEpisodes(ctx context.Context, client *http.Client, podcastU
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, false, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, false, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, false, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/podcast/episodes returned HTTP %d", resp.StatusCode)}
+		return nil, false, httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /user/podcast/episodes returned HTTP %d", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("pocketcasts/web: /user/podcast/episodes returned HTTP %d: %s",
@@ -688,16 +660,16 @@ func FetchSyncUpdate(ctx context.Context, client *http.Client, lastModified int6
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, &TransientError{cause: fmt.Errorf("pocketcasts/web: POST /user/sync/update: %w", err)}
+		return nil, 0, httputil.NewTransientError(fmt.Errorf("pocketcasts/web: POST /user/sync/update: %w", err))
 	}
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, 0, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, 0, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return nil, 0, &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/sync/update returned HTTP %d", resp.StatusCode)}
+		return nil, 0, httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /user/sync/update returned HTTP %d", resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("pocketcasts/web: /user/sync/update returned HTTP %d: %s",
@@ -911,17 +883,17 @@ func UpdateEpisodeProgress(ctx context.Context, client *http.Client,
 	resp, err := client.Do(req)
 	if err != nil {
 		// Network-level failure — transient, caller may retry.
-		return &TransientError{cause: fmt.Errorf("pocketcasts/web: /sync/update_episode: %w", err)}
+		return httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /sync/update_episode: %w", err))
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return &TransientError{cause: fmt.Errorf("pocketcasts/web: /sync/update_episode returned HTTP %d: %s",
-			resp.StatusCode, bodyExcerpt(body))}
+		return httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /sync/update_episode returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(body)))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("pocketcasts/web: /sync/update_episode returned HTTP %d: %s",
@@ -1033,17 +1005,17 @@ func SubscribePodcast(ctx context.Context, client *http.Client, podcastUUID stri
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/podcast/subscribe: %w", err)}
+		return httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /user/podcast/subscribe: %w", err))
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
-		return &TransientError{cause: fmt.Errorf("pocketcasts/web: /user/podcast/subscribe returned HTTP %d: %s",
-			resp.StatusCode, bodyExcerpt(body))}
+		return httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /user/podcast/subscribe returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(body)))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("pocketcasts/web: /user/podcast/subscribe returned HTTP %d: %s",

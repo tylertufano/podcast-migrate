@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/model"
 )
 
@@ -113,38 +114,6 @@ func Login(ctx context.Context, email, password string) (*http.Client, error) {
 	return client, nil
 }
 
-// RateLimitError is returned when Overcast responds with HTTP 429.
-// The Wait field holds how long to pause before the next attempt.
-type RateLimitError struct {
-	Wait time.Duration
-}
-
-func (e *RateLimitError) Error() string {
-	return fmt.Sprintf("overcast/web: rate limited (HTTP 429) — retry after %v", e.Wait)
-}
-
-// TransientError is returned when SetProgress receives a 5xx response or a
-// network-level failure — both of which may succeed on a subsequent attempt.
-// Callers that implement retry logic should detect this type and back off before
-// retrying. Permanent client errors (4xx other than 429) are not wrapped.
-type TransientError struct {
-	cause error
-}
-
-func (e *TransientError) Error() string { return e.cause.Error() }
-func (e *TransientError) Unwrap() error { return e.cause }
-
-// rateLimitWait extracts the Retry-After delay from a 429 response, falling back
-// to defaultWait if the header is absent or unparseable.
-func rateLimitWait(resp *http.Response, defaultWait time.Duration) time.Duration {
-	if ra := resp.Header.Get("Retry-After"); ra != "" {
-		if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs > 0 {
-			return time.Duration(secs) * time.Second
-		}
-	}
-	return defaultWait
-}
-
 // FetchEpisodeNumericID loads an Overcast episode page and extracts the internal
 // numeric ID from the data-item-id HTML attribute. The numeric ID is required by
 // the set_progress endpoint.
@@ -168,12 +137,12 @@ func FetchEpisodeNumericID(ctx context.Context, client *http.Client, episodeURL 
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return "", &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return "", &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
 		// 5xx responses are transient — the server or a proxy is temporarily
 		// unavailable. Wrap as TransientError so callers can retry with backoff.
-		return "", &TransientError{cause: fmt.Errorf("overcast/web: GET %s returned HTTP %d", episodeURL, resp.StatusCode)}
+		return "", httputil.NewTransientError(fmt.Errorf("overcast/web: GET %s returned HTTP %d", episodeURL, resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("overcast/web: GET %s returned HTTP %d", episodeURL, resp.StatusCode)
@@ -223,7 +192,7 @@ func SetProgress(ctx context.Context, client *http.Client, numericID string, pos
 	resp, err := client.Do(req)
 	if err != nil {
 		// Network-level failure (DNS, TCP, timeout) — transient, caller may retry.
-		return &TransientError{cause: fmt.Errorf("overcast/web: set_progress %s: %w", numericID, err)}
+		return httputil.NewTransientError(fmt.Errorf("overcast/web: set_progress %s: %w", numericID, err))
 	}
 
 	// Read up to 4 KB of the body for error diagnostics.
@@ -231,12 +200,12 @@ func SetProgress(ctx context.Context, client *http.Client, numericID string, pos
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode >= 500 {
 		// Server-side error — transient, caller may retry with backoff.
 		excerpt := bodyExcerpt(body)
-		return &TransientError{cause: fmt.Errorf("overcast/web: set_progress %s returned HTTP %d: %s", numericID, resp.StatusCode, excerpt)}
+		return httputil.NewTransientError(fmt.Errorf("overcast/web: set_progress %s returned HTTP %d: %s", numericID, resp.StatusCode, excerpt))
 	}
 	if resp.StatusCode != http.StatusOK {
 		excerpt := bodyExcerpt(body)
@@ -284,7 +253,7 @@ func FetchRawExtendedOPML(ctx context.Context, client *http.Client) ([]byte, err
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("overcast/web: fetch extended OPML: HTTP %d: %s",
@@ -347,7 +316,7 @@ func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, over
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return "", &RateLimitError{Wait: rateLimitWait(resp, 30*time.Second)}
+		return "", &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("overcast/web: search returned HTTP %d", resp.StatusCode)
@@ -448,7 +417,7 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]Subscr
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RateLimitError{Wait: rateLimitWait(resp, 30*time.Second)}
+		return nil, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("overcast/web: /podcasts returned HTTP %d", resp.StatusCode)
@@ -525,7 +494,7 @@ func SubscribeToPodcast(ctx context.Context, client *http.Client, podcastPageURL
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return &RateLimitError{Wait: rateLimitWait(resp, 30*time.Second)}
+		return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("overcast/web: GET %s returned HTTP %d", podcastPageURL, resp.StatusCode)
@@ -581,7 +550,7 @@ func SubscribeToPodcast(ctx context.Context, client *http.Client, podcastPageURL
 	_ = postResp.Body.Close()
 
 	if postResp.StatusCode == http.StatusTooManyRequests {
-		return &RateLimitError{Wait: rateLimitWait(postResp, 30*time.Second)}
+		return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(postResp, 30*time.Second)}
 	}
 	if postResp.StatusCode >= 400 {
 		return fmt.Errorf("overcast/web: subscribe POST to %s returned HTTP %d",
@@ -658,7 +627,7 @@ func FetchPodcastEpisodes(ctx context.Context, client *http.Client, podcastPageU
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, &RateLimitError{Wait: rateLimitWait(resp, 60*time.Second)}
+		return nil, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 60*time.Second)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("overcast/web: GET %s returned HTTP %d", podcastPageURL, resp.StatusCode)

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 )
@@ -203,22 +204,6 @@ func (c *CatalogClient) searchITunes(ctx context.Context, feedURL, podcastTitle 
 
 	searchURL := "https://itunes.apple.com/search?" + q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
-	if err != nil {
-		return 0, false, fmt.Errorf("catalog: iTunes search: %w", err)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return 0, false, fmt.Errorf("catalog: iTunes search: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return 0, false, fmt.Errorf("catalog: iTunes search: HTTP %d: %s", resp.StatusCode, body)
-	}
-
 	var result struct {
 		Results []struct {
 			CollectionId   int64  `json:"collectionId"`
@@ -226,8 +211,35 @@ func (c *CatalogClient) searchITunes(ctx context.Context, feedURL, podcastTitle 
 			CollectionName string `json:"collectionName"`
 		} `json:"results"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, false, fmt.Errorf("catalog: iTunes search: decode: %w", err)
+
+	if err := httputil.RetryFunc(ctx, func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
+		if err != nil {
+			return fmt.Errorf("catalog: iTunes search: %w", err)
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return httputil.NewTransientError(fmt.Errorf("catalog: iTunes search: %w", err))
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
+		}
+		if resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+			return httputil.NewTransientError(fmt.Errorf("catalog: iTunes search: HTTP %d: %s", resp.StatusCode, body))
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+			return fmt.Errorf("catalog: iTunes search: HTTP %d: %s", resp.StatusCode, body)
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return fmt.Errorf("catalog: iTunes search: decode: %w", err)
+		}
+		return nil
+	}, httputil.RetryOptions{}); err != nil {
+		return 0, false, err
 	}
 
 	// Primary: match by normalized feed URL.
@@ -393,31 +405,7 @@ func (c *CatalogClient) fetchEpisodePage(
 		"https://amp-api.podcasts.apple.com/v1/catalog/us/podcasts/%d/episodes?limit=%d&offset=%d&l=en-US",
 		collectionID, limit, offset,
 	)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, 0, fmt.Errorf("catalog: fetch episodes: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.bearerToken)
-	req.Header.Set("Origin", "https://podcasts.apple.com")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, 0, fmt.Errorf("catalog: fetch episodes page %d: %w", offset/limit, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		// Apple returns 404 when the offset is past the end of the episode list
-		// (code 40403 "No related resources"). Treat as end-of-results.
-		return nil, 0, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, 0, fmt.Errorf("catalog: fetch episodes page %d: HTTP %d: %s",
-			offset/limit, resp.StatusCode, body)
-	}
+	pageNum := offset / limit
 
 	var result struct {
 		Data []struct {
@@ -432,8 +420,50 @@ func (c *CatalogClient) fetchEpisodePage(
 			Total int `json:"total"`
 		} `json:"meta"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, 0, fmt.Errorf("catalog: fetch episodes page %d: decode: %w", offset/limit, err)
+	notFound := false
+
+	if err := httputil.RetryFunc(ctx, func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return fmt.Errorf("catalog: fetch episodes: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
+		req.Header.Set("Origin", "https://podcasts.apple.com")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return httputil.NewTransientError(fmt.Errorf("catalog: fetch episodes page %d: %w", pageNum, err))
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound {
+			// Apple returns 404 when the offset is past the end of the episode list
+			// (code 40403 "No related resources"). Treat as end-of-results.
+			notFound = true
+			return nil
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
+		}
+		if resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			return httputil.NewTransientError(fmt.Errorf("catalog: fetch episodes page %d: HTTP %d: %s", pageNum, resp.StatusCode, body))
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			return fmt.Errorf("catalog: fetch episodes page %d: HTTP %d: %s", pageNum, resp.StatusCode, body)
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return fmt.Errorf("catalog: fetch episodes page %d: decode: %w", pageNum, err)
+		}
+		return nil
+	}, httputil.RetryOptions{}); err != nil {
+		return nil, 0, err
+	}
+
+	if notFound {
+		return nil, 0, nil
 	}
 
 	episodes := make([]episodeRaw, 0, len(result.Data))

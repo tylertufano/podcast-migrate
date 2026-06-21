@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/pocketcasts"
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -196,7 +197,7 @@ func TestFetchSubscribedPodcasts_RateLimit(t *testing.T) {
 
 	client := authedClient(t)
 	_, err := pocketcasts.FetchSubscribedPodcasts(context.Background(), client)
-	var rl *pocketcasts.RateLimitError
+	var rl *httputil.RateLimitError
 	if !isRateLimitError(err, &rl) {
 		t.Fatalf("expected RateLimitError, got: %v", err)
 	}
@@ -514,7 +515,7 @@ func TestUpdateEpisodeProgress_RateLimit(t *testing.T) {
 
 	client := authedClient(t)
 	err := pocketcasts.UpdateEpisodeProgress(context.Background(), client, "e", "p", pocketcasts.PlayingPlayed, 100, 100)
-	var rl *pocketcasts.RateLimitError
+	var rl *httputil.RateLimitError
 	if !isRateLimitError(err, &rl) {
 		t.Fatalf("expected RateLimitError, got: %v", err)
 	}
@@ -534,7 +535,7 @@ func TestUpdateEpisodeProgress_TransientError(t *testing.T) {
 
 	client := authedClient(t)
 	err := pocketcasts.UpdateEpisodeProgress(context.Background(), client, "e", "p", pocketcasts.PlayingPlayed, 100, 100)
-	var te *pocketcasts.TransientError
+	var te *httputil.TransientError
 	if !isTransientError(err, &te) {
 		t.Fatalf("expected TransientError for 5xx, got: %v", err)
 	}
@@ -556,7 +557,7 @@ func TestUpdateEpisodeProgress_BadRequest(t *testing.T) {
 		t.Fatal("expected error for 400 response, got nil")
 	}
 	// 400 is a permanent error, not transient.
-	var te *pocketcasts.TransientError
+	var te *httputil.TransientError
 	if errors.As(err, &te) {
 		t.Error("400 should not be wrapped as TransientError")
 	}
@@ -709,7 +710,7 @@ func TestSubscribePodcast_RateLimit(t *testing.T) {
 
 	client := authedClient(t)
 	err := pocketcasts.SubscribePodcast(context.Background(), client, "uuid")
-	var rl *pocketcasts.RateLimitError
+	var rl *httputil.RateLimitError
 	if !isRateLimitError(err, &rl) {
 		t.Fatalf("expected RateLimitError, got: %v", err)
 	}
@@ -903,10 +904,10 @@ func buildWebTestSyncUserEpisode(ep pocketcasts.SyncEpisodeState) []byte {
 
 // ---- helpers ----
 
-func isRateLimitError(err error, target **pocketcasts.RateLimitError) bool {
+func isRateLimitError(err error, target **httputil.RateLimitError) bool {
 	return errors.As(err, target)
 }
 
-func isTransientError(err error, target **pocketcasts.TransientError) bool {
+func isTransientError(err error, target **httputil.TransientError) bool {
 	return errors.As(err, target)
 }

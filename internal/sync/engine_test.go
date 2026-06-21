@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
@@ -1096,19 +1097,19 @@ func TestBuildAutoFeedMap_FuzzyPunctuation_Remaps(t *testing.T) {
 // ---- fuzzyPodcastTitle ----
 
 func TestFuzzyPodcastTitle_PlusSuffix(t *testing.T) {
-	if a, b := fuzzyPodcastTitle("Fresh Air+"), fuzzyPodcastTitle("Fresh Air"); a != b {
+	if a, b := migrate.FuzzyPodcastTitle("Fresh Air+"), migrate.FuzzyPodcastTitle("Fresh Air"); a != b {
 		t.Errorf("Plus suffix: %q vs %q should be equal after normalisation", a, b)
 	}
 }
 
 func TestFuzzyPodcastTitle_PlusTierWordSuffix(t *testing.T) {
-	if a, b := fuzzyPodcastTitle("The Daily Plus"), fuzzyPodcastTitle("The Daily"); a != b {
+	if a, b := migrate.FuzzyPodcastTitle("The Daily Plus"), migrate.FuzzyPodcastTitle("The Daily"); a != b {
 		t.Errorf("Plus word: %q vs %q should be equal after normalisation", a, b)
 	}
 }
 
 func TestFuzzyPodcastTitle_Punctuation(t *testing.T) {
-	if a, b := fuzzyPodcastTitle("Conan O'Brien"), fuzzyPodcastTitle("Conan OBrien"); a != b {
+	if a, b := migrate.FuzzyPodcastTitle("Conan O'Brien"), migrate.FuzzyPodcastTitle("Conan OBrien"); a != b {
 		t.Errorf("apostrophe: %q vs %q should be equal after normalisation", a, b)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
@@ -75,14 +76,14 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 		requestDelay = DefaultRequestDelay
 	}
 
-	feedToTitle := buildFeedToTitleFromLib(lib)
+	feedToTitle := migrate.BuildFeedToTitle(lib)
 	if len(opts.PodcastFilter) > 0 {
 		fmt.Printf("apple/webapi: podcast filter active — limiting to podcasts matching %q\n", opts.PodcastFilter)
 	}
 	fmt.Printf("apple/webapi: request delay: %v between calls\n", requestDelay)
-	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
+	episodes := migrate.FilterEpisodesByPodcast(lib.Episodes, feedToTitle, opts.PodcastFilter)
 
-	writeLogHeader(opts.LogWriter)
+	migrate.WriteLogHeader(opts.LogWriter)
 
 	marked := 0
 	skippedPlayed := 0 // server already has completed=true
@@ -112,8 +113,8 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 		appleID, status, err := catalog.FindEpisode(ctx, ep, feedToTitle, opts.TitleMatchDateTolerance, opts.StrictFeedMatch)
 		if err != nil {
 			fmt.Printf("  warning: catalog lookup failed for %q — %q: %v\n", podTitle, ep.Title, err)
-			writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
+			migrate.WriteLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
+				migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
 			continue
 		}
 
@@ -126,16 +127,16 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 				kvsEpisodes = append(kvsEpisodes, ep)
 			} else {
 				notInCatalog++
-				writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
-					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+				migrate.WriteLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
+					migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—",
 					"podcast not found in Apple catalog (private or unindexed feed)")
 			}
 			continue
 
 		case CatalogEpisodeNotMatched:
 			notMatched++
-			writeLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+			migrate.WriteLogLine(opts.LogWriter, "not_found", podTitle, ep.Title, ep.PubDate,
+				migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—",
 				"episode not matched in Apple catalog")
 			continue
 		}
@@ -149,8 +150,8 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 		if opts.DryRun {
 			fmt.Printf("  [dry-run] would set position via web API: %q — %q (id=%d, completed=%v, pos=%dms)\n",
 				podTitle, ep.Title, appleID, wantCompleted, wantPositionMs)
-			writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—", "")
+			migrate.WriteLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
+				migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", "")
 			marked++
 			continue
 		}
@@ -183,16 +184,16 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 					// Server already has the episode marked as played — nothing to do
 					// regardless of whether we wanted to mark it played or in-progress.
 					skippedPlayed++
-					writeLogLine(opts.LogWriter, "already_played", podTitle, ep.Title, ep.PubDate,
-						playStateLabel(ep.PlayState, ep.PlayPosition), "played", "")
+					migrate.WriteLogLine(opts.LogWriter, "already_played", podTitle, ep.Title, ep.PubDate,
+						migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "played", "")
 					continue
 				}
 				if !wantCompleted && srvPos.recorded && srvPos.positionMs >= wantPositionMs {
 					// We want to set an in-progress position but the server is already
 					// at least as far along — skip to avoid rewinding.
 					skippedAhead++
-					writeLogLine(opts.LogWriter, "already_ahead", podTitle, ep.Title, ep.PubDate,
-						playStateLabel(ep.PlayState, ep.PlayPosition),
+					migrate.WriteLogLine(opts.LogWriter, "already_ahead", podTitle, ep.Title, ep.PubDate,
+						migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition),
 						fmt.Sprintf("in_progress(%s)", (time.Duration(srvPos.positionMs)*time.Millisecond).Round(time.Second)),
 						"server position is at or ahead of source")
 					continue
@@ -203,13 +204,13 @@ func (w *WebAPIWriter) Write(ctx context.Context, lib *model.Library, opts provi
 		if err := w.markPosition(ctx, appleID, wantPositionMs, wantCompleted); err != nil {
 			fmt.Printf("  warning: web API call failed for %q (id=%d): %v\n",
 				ep.Title, appleID, err)
-			writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
+			migrate.WriteLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
+				migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
 			continue
 		}
 
-		writeLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
-			playStateLabel(ep.PlayState, ep.PlayPosition), preWriteLabel, "")
+		migrate.WriteLogLine(opts.LogWriter, "updated", podTitle, ep.Title, ep.PubDate,
+			migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), preWriteLabel, "")
 		marked++
 
 		select {

@@ -177,3 +177,36 @@ func SkipReason(desired model.PlayState, desiredPos time.Duration, current model
 	}
 	return ""
 }
+
+// FuzzyPodcastTitle normalises a podcast title for cross-library matching.
+// It strips paid-tier suffixes ("Plus", "+", "Premium", etc.) via
+// model.NormalizePlusTitle, then applies FuzzyNormalizeTitle (lowercase,
+// strip season markers and punctuation, collapse whitespace).
+//
+// This two-step approach handles both "Pod Save America+" ↔ "Pod Save America"
+// and "O'Brien" ↔ "OBrien" style differences across providers.
+func FuzzyPodcastTitle(title string) string {
+	norm := model.NormalizePlusTitle(title)
+	if norm == "" {
+		norm = title
+	}
+	return FuzzyNormalizeTitle(norm)
+}
+
+// TitleHasWordPrefix reports whether shorter is a word-aligned prefix of longer.
+// Both strings should be the output of FuzzyPodcastTitle (lowercase,
+// space-separated words, no punctuation).
+//
+// Word-aligned means that if shorter is strictly shorter than longer, the
+// character in longer immediately after the prefix must be a space — preventing
+// "pod save america" from matching "breaking news from pod save america" while
+// still allowing "crooked city" to match "crooked city dixon il".
+func TitleHasWordPrefix(longer, shorter string) bool {
+	if !strings.HasPrefix(longer, shorter) {
+		return false
+	}
+	if len(longer) == len(shorter) {
+		return true
+	}
+	return longer[len(shorter)] == ' '
+}

@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
@@ -217,10 +218,10 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 	}
 	defer db.Close()
 
-	feedToTitle := buildFeedToTitleFromLib(lib)
-	episodes := filterLibraryEpisodes(lib.Episodes, feedToTitle, opts.PodcastFilter)
+	feedToTitle := migrate.BuildFeedToTitle(lib)
+	episodes := migrate.FilterEpisodesByPodcast(lib.Episodes, feedToTitle, opts.PodcastFilter)
 
-	writeLogHeader(opts.LogWriter)
+	migrate.WriteLogHeader(opts.LogWriter)
 
 	// Eagerly fetch current server state so we can skip already-synced episodes.
 	if !opts.DryRun {
@@ -244,8 +245,8 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 		item, found, err := w.lookupPrivateEpisode(ctx, db, ep)
 		if err != nil {
 			fmt.Printf("  kvs: lookup failed for %q: %v\n", ep.Title, err)
-			writeLogLine(opts.LogWriter, "error", feedToTitle[ep.FeedURL], ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
+			migrate.WriteLogLine(opts.LogWriter, "error", feedToTitle[ep.FeedURL], ep.Title, ep.PubDate,
+				migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", err.Error())
 			continue
 		}
 		if !found {
@@ -258,8 +259,8 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 		if !opts.ForceUpdate {
 			if serverState, ok := w.checkServerPlayState(ctx, item.MetadataIdentifier); ok {
 				if serverStateCoversDesired(ep, serverState) {
-					writeLogLine(opts.LogWriter, "skipped", podTitle, ep.Title, ep.PubDate,
-						playStateLabel(ep.PlayState, ep.PlayPosition), "—", "already synced via KVS")
+					migrate.WriteLogLine(opts.LogWriter, "skipped", podTitle, ep.Title, ep.PubDate,
+						migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", "already synced via KVS")
 					continue
 				}
 			}
@@ -270,8 +271,8 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 		if opts.DryRun {
 			fmt.Printf("  [dry-run] kvs: would putAll %q — %q (key=%s)\n",
 				podTitle, ep.Title, item.MetadataIdentifier)
-			writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
-				playStateLabel(ep.PlayState, ep.PlayPosition), "—", w.kvsLogLabel())
+			migrate.WriteLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
+				migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", w.kvsLogLabel())
 			dryRunCount++
 			continue
 		}
@@ -326,8 +327,8 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 	conflicts, err := w.putAll(ctx, items)
 	if err != nil {
 		for _, p := range pending {
-			writeLogLine(opts.LogWriter, "error", p.podTitle, p.ep.Title, p.ep.PubDate,
-				playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", err.Error())
+			migrate.WriteLogLine(opts.LogWriter, "error", p.podTitle, p.ep.Title, p.ep.PubDate,
+				migrate.PlayStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", err.Error())
 		}
 		return 0, err
 	}
@@ -340,8 +341,8 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 			// Check whether its current state covers our desired state.
 			if serverState, ok := w.checkServerPlayState(ctx, p.item.MetadataIdentifier); ok &&
 				serverStateCoversDesired(p.ep, serverState) {
-				writeLogLine(opts.LogWriter, "skipped", p.podTitle, p.ep.Title, p.ep.PubDate,
-					playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", "already synced via KVS")
+				migrate.WriteLogLine(opts.LogWriter, "skipped", p.podTitle, p.ep.Title, p.ep.PubDate,
+					migrate.PlayStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", "already synced via KVS")
 				continue
 			}
 			// Server has the key but at an insufficient play state — retry with
@@ -350,8 +351,8 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 			continue
 		}
 		fmt.Printf("  kvs: synced %q — %q\n", p.podTitle, p.ep.Title)
-		writeLogLine(opts.LogWriter, "updated", p.podTitle, p.ep.Title, p.ep.PubDate,
-			playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", w.kvsLogLabel())
+		migrate.WriteLogLine(opts.LogWriter, "updated", p.podTitle, p.ep.Title, p.ep.PubDate,
+			migrate.PlayStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", w.kvsLogLabel())
 		count++
 	}
 
@@ -362,14 +363,14 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 		}
 		if _, retryErr := w.putAll(ctx, retryItems); retryErr != nil {
 			for _, p := range needsRetry {
-				writeLogLine(opts.LogWriter, "error", p.podTitle, p.ep.Title, p.ep.PubDate,
-					playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", retryErr.Error())
+				migrate.WriteLogLine(opts.LogWriter, "error", p.podTitle, p.ep.Title, p.ep.PubDate,
+					migrate.PlayStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", retryErr.Error())
 			}
 		} else {
 			for _, p := range needsRetry {
 				fmt.Printf("  kvs: synced %q — %q\n", p.podTitle, p.ep.Title)
-				writeLogLine(opts.LogWriter, "updated", p.podTitle, p.ep.Title, p.ep.PubDate,
-					playStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", w.kvsLogLabel())
+				migrate.WriteLogLine(opts.LogWriter, "updated", p.podTitle, p.ep.Title, p.ep.PubDate,
+					migrate.PlayStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", w.kvsLogLabel())
 				count++
 			}
 		}
@@ -452,16 +453,16 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 			item, found, lookupErr := w.lookupPrivateEpisode(ctx, db, ep)
 			if lookupErr != nil {
 				fmt.Printf("  kvs: lookup failed for %q: %v\n", ep.Title, lookupErr)
-				writeLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
-					playStateLabel(ep.PlayState, ep.PlayPosition), "—", lookupErr.Error())
+				migrate.WriteLogLine(opts.LogWriter, "error", podTitle, ep.Title, ep.PubDate,
+					migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", lookupErr.Error())
 				continue
 			}
 			if !found {
 				if _, isNew := w.newlySubscribed[ep.FeedURL]; isNew && !opts.DryRun {
 					deferred = append(deferred, ep)
 				} else {
-					writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
-						playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+					migrate.WriteLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
+						migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—",
 						"not in catalog; not in local DB or KVS — open Apple Podcasts to index this feed")
 				}
 				continue
@@ -471,8 +472,8 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 			if !opts.ForceUpdate && !opts.DryRun {
 				if serverState, ok := w.checkServerPlayState(ctx, item.MetadataIdentifier); ok {
 					if serverStateCoversDesired(ep, serverState) {
-						writeLogLine(opts.LogWriter, "skipped", podTitle, ep.Title, ep.PubDate,
-							playStateLabel(ep.PlayState, ep.PlayPosition), "—", "already synced via KVS")
+						migrate.WriteLogLine(opts.LogWriter, "skipped", podTitle, ep.Title, ep.PubDate,
+							migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", "already synced via KVS")
 						continue
 					}
 				}
@@ -482,8 +483,8 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 			if opts.DryRun {
 				fmt.Printf("  [dry-run] kvs: would putAll %q — %q (key=%s)\n",
 					podTitle, ep.Title, item.MetadataIdentifier)
-				writeLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
-					playStateLabel(ep.PlayState, ep.PlayPosition), "—", w.kvsLogLabel())
+				migrate.WriteLogLine(opts.LogWriter, "would_update", podTitle, ep.Title, ep.PubDate,
+					migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—", w.kvsLogLabel())
 				dryCount++
 				continue
 			}
@@ -540,8 +541,8 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 		conflicts, putErr := w.putAll(ctx, items)
 		if putErr != nil {
 			for _, pm := range p {
-				writeLogLine(opts.LogWriter, "error", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
-					playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", putErr.Error())
+				migrate.WriteLogLine(opts.LogWriter, "error", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+					migrate.PlayStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", putErr.Error())
 			}
 			return 0, fmt.Errorf("kvs: putAll batch failed: %w", putErr)
 		}
@@ -551,16 +552,16 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 			if _, wasConflict := conflicts[pm.item.MetadataIdentifier]; wasConflict {
 				if serverState, ok := w.checkServerPlayState(ctx, pm.item.MetadataIdentifier); ok &&
 					serverStateCoversDesired(pm.ep, serverState) {
-					writeLogLine(opts.LogWriter, "skipped", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
-						playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", "already synced via KVS")
+					migrate.WriteLogLine(opts.LogWriter, "skipped", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+						migrate.PlayStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", "already synced via KVS")
 					continue
 				}
 				needsRetry = append(needsRetry, pm)
 				continue
 			}
 			fmt.Printf("  kvs: synced %q — %q\n", pm.podTitle, pm.ep.Title)
-			writeLogLine(opts.LogWriter, "updated", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
-				playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", w.kvsLogLabel())
+			migrate.WriteLogLine(opts.LogWriter, "updated", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+				migrate.PlayStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", w.kvsLogLabel())
 			count++
 		}
 		if len(needsRetry) > 0 {
@@ -570,14 +571,14 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 			}
 			if _, retryErr := w.putAll(ctx, retryItems); retryErr != nil {
 				for _, pm := range needsRetry {
-					writeLogLine(opts.LogWriter, "error", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
-						playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", retryErr.Error())
+					migrate.WriteLogLine(opts.LogWriter, "error", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+						migrate.PlayStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", retryErr.Error())
 				}
 			} else {
 				for _, pm := range needsRetry {
 					fmt.Printf("  kvs: synced %q — %q\n", pm.podTitle, pm.ep.Title)
-					writeLogLine(opts.LogWriter, "updated", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
-						playStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", w.kvsLogLabel())
+					migrate.WriteLogLine(opts.LogWriter, "updated", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+						migrate.PlayStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", w.kvsLogLabel())
 					count++
 				}
 			}
@@ -766,8 +767,8 @@ deferredDone:
 			// ones couldn't be matched. They're likely no longer in the RSS.
 			for _, ep := range stillDeferred {
 				podTitle := feedTitle(ep.FeedURL)
-				writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
-					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+				migrate.WriteLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
+					migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—",
 					"not found in Apple Podcasts index — may no longer be in the RSS feed")
 			}
 			fmt.Printf("\nkvs: %d episode(s) skipped — not found in Apple Podcasts (likely removed from the RSS feed).\n",
@@ -775,8 +776,8 @@ deferredDone:
 		} else {
 			for _, ep := range stillDeferred {
 				podTitle := feedTitle(ep.FeedURL)
-				writeLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
-					playStateLabel(ep.PlayState, ep.PlayPosition), "—",
+				migrate.WriteLogLine(opts.LogWriter, "no_apple_id", podTitle, ep.Title, ep.PubDate,
+					migrate.PlayStateLabel(ep.PlayState, ep.PlayPosition), "—",
 					"newly subscribed feed not yet indexed — re-run after opening Apple Podcasts")
 			}
 			fmt.Printf("\nkvs: %d episode(s) from %d feed(s) not yet indexed by Apple Podcasts.\n",

@@ -255,7 +255,7 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		if pod.FeedURL == "" {
 			continue
 		}
-		if t := fuzzyPodcastTitle(pod.Title); t != "" {
+		if t := migrate.FuzzyPodcastTitle(pod.Title); t != "" {
 			if _, exists := dstTitleToFeed[t]; !exists {
 				dstTitleToFeed[t] = pod.FeedURL
 			}
@@ -306,7 +306,7 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 		if dstFeedNorms[migrate.NormalizeFeedURL(pod.FeedURL)] {
 			continue // direct subscription — no remapping needed
 		}
-		t := fuzzyPodcastTitle(pod.Title)
+		t := migrate.FuzzyPodcastTitle(pod.Title)
 		if t == "" {
 			continue
 		}
@@ -324,7 +324,7 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 			// "Pod Save America" matching "Breaking News from Pod Save America"
 			// (the former appears as a suffix of the latter's fuzzy title).
 			for dstT, dstF := range dstTitleToFeed {
-				if titleHasWordPrefix(dstT, t) || titleHasWordPrefix(t, dstT) {
+				if migrate.TitleHasWordPrefix(dstT, t) || migrate.TitleHasWordPrefix(t, dstT) {
 					dstFeed = dstF
 					break
 				}
@@ -369,39 +369,6 @@ func buildAutoFeedMap(srcLib, dstLib *model.Library) map[string]string {
 	return feedMap
 }
 
-// titleHasWordPrefix reports whether shorter is a word-aligned prefix of longer.
-// Both strings are expected to be the output of fuzzyPodcastTitle (lowercase,
-// space-separated words, no punctuation).
-//
-// "Word-aligned" means that if shorter is strictly shorter than longer, the
-// character in longer immediately after the prefix must be a space — so the
-// match does not land mid-word.  This prevents "pod save america" from matching
-// "breaking news from pod save america" (suffix, not prefix) while still
-// allowing "crooked city" to match "crooked city dixon il" (true prefix with a
-// word boundary after "city").
-func titleHasWordPrefix(longer, shorter string) bool {
-	if !strings.HasPrefix(longer, shorter) {
-		return false
-	}
-	if len(longer) == len(shorter) {
-		return true // exact match
-	}
-	return longer[len(shorter)] == ' '
-}
-
-// fuzzyPodcastTitle normalises a podcast title for cross-library matching.
-// It first strips paid-tier suffixes ("Plus", "+", "Premium", etc.) via
-// model.NormalizePlusTitle, then applies migrate.FuzzyNormalizeTitle (lowercase,
-// strip punctuation, collapse whitespace). The two-step approach handles both
-// "Pod Save America+" ↔ "Pod Save America" and "O'Brien" ↔ "OBrien" style
-// differences.
-func fuzzyPodcastTitle(title string) string {
-	norm := model.NormalizePlusTitle(title)
-	if norm == "" {
-		norm = title
-	}
-	return migrate.FuzzyNormalizeTitle(norm)
-}
 
 // applyFeedMap returns a shallow copy of lib with feed URLs remapped according
 // to feedMap. Both Podcasts and Episodes are remapped so that all downstream

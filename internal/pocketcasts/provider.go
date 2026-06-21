@@ -630,7 +630,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				normTitleToPodUUID[normTitle] = ap.UUID
 			}
 		}
-		if ft := fuzzyPCTitle(ap.Title); ft != "" {
+		if ft := migrate.FuzzyPodcastTitle(ap.Title); ft != "" {
 			if _, exists := fuzzyTitleToPodUUID[ft]; !exists {
 				fuzzyTitleToPodUUID[ft] = ap.UUID
 			}
@@ -844,14 +844,14 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 						}
 						// Pass (b): fuzzy exact, then contains.
 						if podUUID == "" {
-							srcFuzzy := fuzzyPCTitle(srcTitle)
+							srcFuzzy := migrate.FuzzyPodcastTitle(srcTitle)
 							if srcFuzzy != "" {
 								if uuid := fuzzyTitleToPodUUID[srcFuzzy]; uuid != "" {
 									podUUID = uuid
 								}
 								if podUUID == "" && len(srcFuzzy) >= 5 {
 									for pcFuzzy, uuid := range fuzzyTitleToPodUUID {
-										if titleHasWordPrefix(pcFuzzy, srcFuzzy) || titleHasWordPrefix(srcFuzzy, pcFuzzy) {
+										if migrate.TitleHasWordPrefix(pcFuzzy, srcFuzzy) || migrate.TitleHasWordPrefix(srcFuzzy, pcFuzzy) {
 											podUUID = uuid
 											break
 										}
@@ -1360,27 +1360,3 @@ func filterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[stri
 // See migrate.NormalizeFeedURL for full documentation.
 func normalizeFeedURL(raw string) string { return migrate.NormalizeFeedURL(raw) }
 
-// fuzzyPCTitle normalises a PC podcast title for cross-library matching.
-// It chains model.NormalizePlusTitle (strips paid-tier/subscriber suffixes) then
-// migrate.FuzzyNormalizeTitle (lowercase, strip season markers and punctuation).
-// Matches the fuzzyPodcastTitle logic in internal/sync/engine.go.
-func fuzzyPCTitle(title string) string {
-	norm := model.NormalizePlusTitle(title)
-	if norm == "" {
-		norm = title
-	}
-	return migrate.FuzzyNormalizeTitle(norm)
-}
-
-// titleHasWordPrefix mirrors the helper in sync/engine.go.  See that function
-// for the full rationale; in short, it prevents false positives like
-// "pod save america" matching "breaking news from pod save america".
-func titleHasWordPrefix(longer, shorter string) bool {
-	if !strings.HasPrefix(longer, shorter) {
-		return false
-	}
-	if len(longer) == len(shorter) {
-		return true
-	}
-	return longer[len(shorter)] == ' '
-}

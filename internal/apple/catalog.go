@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 )
 
@@ -111,7 +112,7 @@ func (c *CatalogClient) FindEpisode(
 	}
 
 	// Step 3: cascade match — mirrors findInAppleIndex.
-	normFeed := normalizeWriteFeedURL(ep.FeedURL)
+	normFeed := migrate.NormalizeFeedURL(ep.FeedURL)
 	podTitleLower := strings.ToLower(strings.TrimSpace(podcastTitle))
 
 	// Strategy 1: feeddate — same feed URL, exact pub date.
@@ -161,7 +162,7 @@ func (c *CatalogClient) FindEpisode(
 // Uses the iTunes Search API with the podcast title as the search term,
 // then matches by feed URL for disambiguation.
 func (c *CatalogClient) lookupPodcastID(ctx context.Context, feedURL, podcastTitle string) (int64, bool, error) {
-	normFeed := normalizeWriteFeedURL(feedURL)
+	normFeed := migrate.NormalizeFeedURL(feedURL)
 
 	c.podMu.Lock()
 	if cached, ok := c.podcastIDCache[normFeed]; ok {
@@ -192,7 +193,7 @@ func (c *CatalogClient) lookupPodcastID(ctx context.Context, feedURL, podcastTit
 // searchITunes calls the iTunes Search API to find the Apple podcast collectionId
 // for the given feed URL. It searches by podcast title and matches results by feedUrl.
 func (c *CatalogClient) searchITunes(ctx context.Context, feedURL, podcastTitle string) (int64, bool, error) {
-	normFeed := normalizeWriteFeedURL(feedURL)
+	normFeed := migrate.NormalizeFeedURL(feedURL)
 
 	q := url.Values{}
 	q.Set("media", "podcast")
@@ -231,7 +232,7 @@ func (c *CatalogClient) searchITunes(ctx context.Context, feedURL, podcastTitle 
 
 	// Primary: match by normalized feed URL.
 	for _, r := range result.Results {
-		if normalizeWriteFeedURL(r.FeedUrl) == normFeed {
+		if migrate.NormalizeFeedURL(r.FeedUrl) == normFeed {
 			return r.CollectionId, true, nil
 		}
 	}
@@ -318,7 +319,7 @@ func (c *CatalogClient) paginateEpisodes(
 	collectionID int64,
 	feedURL, podcastTitle string,
 ) (map[string]catalogEntry, error) {
-	normFeed := normalizeWriteFeedURL(feedURL)
+	normFeed := migrate.NormalizeFeedURL(feedURL)
 	podTitleLower := strings.ToLower(strings.TrimSpace(podcastTitle))
 
 	index := make(map[string]catalogEntry)

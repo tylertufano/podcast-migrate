@@ -856,9 +856,21 @@ func (w *KVSWriter) lookupPrivateEpisodeFromKVS(ep model.EpisodeState) (kvsItem,
 // returns its KVS metadata. Only private-feed episodes (ZSTORETRACKID=0) with
 // a non-empty ZMETADATAIDENTIFIER are returned.
 //
-// Lookup order:
-//  1. com.apple.podcasts play state cache (no SQLite, fast)
-//  2. Local SQLite: GUID → FeedURL+PubDate (within 1 day) → FeedURL+Title
+// Implemented strategies (migrate.MatchStrategy), in priority order:
+//   - MatchByGUID     — KVS play state cache (fast, no SQLite), then SQLite GUID column.
+//   - MatchByFeedDate — SQLite: feed URL prefix + pub date within ±24 hours.
+//   - MatchByFeedTitle — SQLite: feed URL prefix + case-insensitive exact title.
+//
+// Absent strategies and rationale:
+//   - MatchByTitleDate, MatchByPodDate, MatchByPodTitle: cross-feed matching is
+//     not needed here because private-feed episodes are always tied to a specific
+//     feed URL in SQLite. Catalog episodes (public feeds) are matched separately
+//     by CatalogClient.FindEpisode which implements the full 4-strategy cascade.
+//
+// Note: MatchByFeedTitle uses SQL LOWER(TRIM(...)) = LOWER(TRIM(?)) rather than
+// migrate.FuzzyNormalizeTitle, so season-marker variants ("Ep. 4" vs "S01 Ep. 4")
+// may not match. This is a known accuracy gap; GUID and feeddate cover the vast
+// majority of episodes so the impact is small in practice.
 func (w *KVSWriter) lookupPrivateEpisode(ctx context.Context, db *sql.DB, ep model.EpisodeState) (kvsItem, bool, error) {
 	// Fast path: check the KVS play state we already fetched.
 	if item, ok := w.lookupPrivateEpisodeFromKVS(ep); ok {

@@ -77,11 +77,25 @@ const (
 
 // FindEpisode looks up the Apple catalog episode ID for ep.
 //
+// Implemented strategies (migrate.MatchStrategy), in priority order:
+//   - MatchByFeedDate  — feed URL + exact pub date.
+//   - MatchByFeedTitle — feed URL + episode title, date-tolerance guard applied.
+//   - MatchByPodDate   — podcast title + exact pub date (cross-feed); skipped when
+//     strictFeedMatch is true.
+//   - MatchByPodTitle  — podcast title + episode title, date-tolerance guard applied
+//     (cross-feed); skipped when strictFeedMatch is true.
+//
+// Absent strategies and rationale:
+//   - MatchByGUID: the Apple catalog API (amp-api.podcasts.apple.com) does not
+//     expose episode GUIDs in its episode list response.
+//   - MatchByTitleDate: the catalog has per-podcast episode lists so a podcast-title
+//     anchor (MatchByPodDate/MatchByPodTitle) is both cheaper and higher-precision
+//     than a title-only cross-feed lookup.
+//
 // feedToTitle maps feed URL → lower-cased podcast title (built from the merged
 // library). tolerance is the maximum pub-date gap allowed for title-keyed
 // matches; pass 0 to disable the guard. strictFeedMatch limits matching to
-// strategies 1 and 2 (feed URL-anchored); when false all four strategies are
-// tried including the cross-feed title-based fallbacks (strategies 3 and 4).
+// MatchByFeedDate and MatchByFeedTitle only.
 //
 // Returns the Apple episode ID, a FindEpisodeResult status, and any error.
 func (c *CatalogClient) FindEpisode(

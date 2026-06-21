@@ -533,8 +533,18 @@ func buildEpisodeIndex(lib *model.Library) map[string]model.EpisodeState {
 	return idx
 }
 
-// episodeKey returns a canonical match string for cross-provider deduplication.
-// Priority: GUID → FeedURL+PubDate → FeedURL+NormalizedTitle.
+// episodeKey returns a canonical match key for source-vs-destination episode
+// deduplication during library merge.
+//
+// Implemented strategies (migrate.MatchStrategy), in priority order:
+//   - MatchByGUID     — episode's RSS GUID.
+//   - MatchByFeedDate — feed URL + exact pub date.
+//   - MatchByFeedTitle — feed URL + basic lowercased title (not FuzzyNormalizeTitle).
+//
+// This function is used for deduplication of the merged unified library, not for
+// provider write-path matching. Cross-feed strategies (MatchByTitleDate,
+// MatchByPodDate, MatchByPodTitle) are handled separately by resolveConflictCrossFeed
+// which operates on episodes already identified as cross-feed pairs by the engine.
 func episodeKey(ep model.EpisodeState) string {
 	if ep.GUID != "" {
 		return "guid:" + ep.GUID

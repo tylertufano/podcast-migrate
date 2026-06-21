@@ -1337,9 +1337,17 @@ func fetchPodcastEpisodesWithRetry(ctx context.Context, client *http.Client, pag
 	return nil, lastErr
 }
 
-// findInOvercastIndex looks up an episode by pubDate+feedURL, then title+feedURL
-// (unless strictFeedMatch is true, in which case only the exact-date strategy is tried).
-// Returns the index entry and whether a match was found.
+// findInOvercastIndex matches ep against the Overcast episode index.
+//
+// Implemented strategies (migrate.MatchStrategy), in priority order:
+//   - MatchByFeedDate  — feed URL + exact pub date.
+//   - MatchByFeedTitle — feed URL + fuzzy title; skipped when strictFeedMatch is true.
+//
+// Absent strategies and rationale:
+//   - MatchByGUID: Overcast does not expose episode GUIDs in its web or OPML API.
+//   - MatchByTitleDate, MatchByPodDate, MatchByPodTitle: cross-feed matching is
+//     impractical because Overcast episode IDs are numeric and only discoverable
+//     by scraping the podcast page for a specific feed URL.
 func findInOvercastIndex(index map[string]overcastIndexEntry, ep model.EpisodeState, strictFeedMatch bool) (overcastIndexEntry, bool) {
 	// Normalise the Apple feed URL so it matches the normalised Overcast feed URL
 	// stored in the index, bridging minor differences (http vs https, trailing slash).

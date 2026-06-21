@@ -1145,12 +1145,21 @@ func addToIndex(index map[string]pcIndexEntry, ep *APIEpisode, feedURL string, s
 	}
 }
 
-// findInIndex looks up an episode in the PC index.  Key priority:
-//  1. feed URL + pub date  — exact match including podcast identity.
-//  2. feed URL + fuzzy title — tolerates season-marker variants.
-//  3. fuzzy title + calendar date (no feed URL) — cross-podcast fallback for
-//     episodes that a podcast network cross-posts to multiple feeds and that
+// findInIndex matches ep against the Pocket Casts episode index.
+//
+// Implemented strategies (migrate.MatchStrategy), in priority order:
+//   - MatchByFeedDate  — feed URL + exact pub date.
+//   - MatchByFeedTitle — feed URL + fuzzy-normalised title.
+//   - MatchByTitleDate — fuzzy title + calendar day (no feed URL); cross-feed fallback
+//     for episodes that a podcast network cross-posts to multiple feeds and that
 //     Apple and PC attribute to different shows.
+//
+// Absent strategies and rationale:
+//   - MatchByGUID: Pocket Casts exposes episode UUIDs, not RSS GUIDs; the two
+//     ID spaces are incompatible so GUID-based matching is not possible.
+//   - MatchByPodDate, MatchByPodTitle: Pocket Casts podcast titles are stored
+//     in a separate API call that is not always available at match time.
+//     MatchByTitleDate covers the same cross-feed scenarios with a cheaper lookup.
 func findInIndex(index map[string]pcIndexEntry, ep model.EpisodeState) (pcIndexEntry, bool) {
 	normFeed := normalizeFeedURL(ep.FeedURL)
 	if !ep.PubDate.IsZero() && ep.FeedURL != "" {

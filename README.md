@@ -8,7 +8,7 @@ A command-line tool for migrating podcast subscriptions and episode play state b
 
 podcast-migrate reads your library directly from the source app's local data or API, merges it with whatever the destination already knows, and writes the result. Each podcast service is an interchangeable adapter behind a common `Provider` interface, so adding new services doesn't require changes to the core migration logic.
 
-Episode matching uses a four-strategy cascade (feed URL + pub date → feed URL + title → podcast title + pub date → podcast title + title) with fuzzy title normalization and automatic subscriber feed remapping — so paid-tier feeds like "Fresh Air Plus" route correctly to their public equivalents without any manual configuration.
+Episode matching uses a cascade of up to six strategies (GUID → feed URL + pub date → feed URL + fuzzy title → fuzzy episode title + calendar day → podcast title + pub date → podcast title + fuzzy title) with automatic subscriber feed remapping — so paid-tier feeds like "Fresh Air Plus" route correctly to their public equivalents without any manual configuration. Each provider implements the strategies relevant to its data model; deviations are intentional and documented in `internal/migrate.MatchStrategy`.
 
 ## Supported providers
 
@@ -19,7 +19,7 @@ Episode matching uses a four-strategy cascade (feed URL + pub date → feed URL 
 | Pocket Casts | ✅ | ✅ complete history | ✅ (auto on play-state write⁴) | ✅ (unofficial web API) |
 | OPML | ✅ | ✅ (extended format) | ✅ | ✅ (extended format) |
 
-¹ Apple subscription writes require KVS credentials (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`) captured via Proxyman. Subscriptions are written automatically during migration; `--only-subscriptions` is not yet supported for Apple Podcasts.
+¹ Apple subscription writes require KVS credentials (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`) captured via Proxyman. Subscriptions are written automatically during a play-state migration, or can be written standalone with `--only-subscriptions` (also requires KVS credentials).
 ² **Web API + KVS (recommended)**: Bearer token + `media-user-token` handle public-catalog episodes via `amp-api`; KVS handles private/subscriber-feed episodes. Public feeds resolve immediately without waiting for local indexing.
 ³ **KVS-only**: Set only `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` — no web API tokens needed. All episodes sync via KVS. Pre-existing subscriptions resolve immediately from the local SQLite DB; newly subscribed feeds wait for Apple Podcasts to index them first.
 ⁴ Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
@@ -95,8 +95,6 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 ### Reliability and correctness
 
-**Apple API rate-limit handling** — the Overcast and Pocket Casts write paths both handle HTTP 429 responses with `Retry-After` support. The Apple `amp-api` write path only retries on 5xx and network errors; a 429 response is returned as a permanent error. Adding a `RateLimitError` type and retry budget would make the Apple write path as robust as the others.
-
 **`--since` for Overcast and Pocket Casts sources** — Overcast's OPML export includes a `userUpdatedDate` attribute per episode; Pocket Casts' `sync/update` endpoint accepts a real `lastModified` timestamp. Wiring `--since` into these source paths would make incremental syncs faster on all three platforms.
 
 ### Features
@@ -142,7 +140,8 @@ cmd/            CLI entry points (migrate, export, import, mark-played, observe)
 internal/
   model/        Shared types: Library, Podcast, EpisodeState
   provider/     Provider interface and WriteOptions
-  migrate/      Shared utilities: normalisation, fuzzy title matching, skip-reason logic
+  migrate/      Shared utilities: normalisation, fuzzy title matching, skip-reason logic, MatchStrategy
+  httputil/     Shared HTTP retry: RateLimitError, TransientError, RetryFunc (used by all write providers)
   apple/        Apple Podcasts adapter (SQLite read; catalog API + web API write)
   overcast/     Overcast adapter (OPML read/write; unofficial web API)
   pocketcasts/  Pocket Casts adapter (web API read/write)

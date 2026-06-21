@@ -128,7 +128,7 @@ Writes play state via `amp-api.podcasts.apple.com`. This approach writes to Appl
 3. If server is already at or beyond the desired state (and `ForceUpdate` is false) → skip
 4. `markPosition` (PUT `/v1/me/playback/positions/podcast-episodes/<id>`) → write the position. `completed=true, positionMs=0` for fully played; `completed=false, positionMs=N` for in-progress.
 
-**Retry logic**: `markPosition` retries up to 3 times (2s → 4s → 8s exponential backoff) on 5xx and network errors. 4xx client errors are not retried.
+**Retry logic**: `markPosition` retries up to 3 times on both 429 (rate limit, with `Retry-After` header support) and 5xx/network errors (exponential backoff: 2s → 4s → 8s). 4xx client errors are not retried. The iTunes Search API and `amp-api` catalog paging calls use the same shared retry budget via `internal/httputil.RetryFunc`.
 
 ### Writing — KVSWriter
 

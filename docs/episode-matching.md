@@ -10,17 +10,17 @@ Matching episodes across podcast platforms is the hardest part of this migration
 
 ## Canonical Key Hierarchy
 
-The sync engine matches episodes using a priority cascade. The first strategy to produce a match wins.
+The full set of matching strategies is defined as `migrate.MatchStrategy` in `internal/migrate/match_strategy.go`. Six strategies exist in priority order (highest confidence first). Not all providers implement all strategies — each provider's lookup function documents which strategies it uses and why any are absent.
 
-### Strategy 1: GUID
+### Strategy 1 (`MatchByGUID`): GUID
 
 ```
 key = "guid:" + episode.GUID
 ```
 
-An RSS `<guid>` is the most stable identifier. Used only when both sides have a GUID for the same episode. Not applicable for Overcast (which stores `overcastId` in the GUID field, not the RSS GUID).
+An RSS `<guid>` is the most stable identifier. Used only when both sides have a GUID for the same episode. Not applicable for Overcast (which stores `overcastId` in the GUID field, not the RSS GUID) or the Apple catalog API (which does not expose episode GUIDs).
 
-### Strategy 2: Feed URL + Publication Date
+### Strategy 2 (`MatchByFeedDate`): Feed URL + Publication Date
 
 ```
 key = "feeddate:" + normalizeFeedURL(feedURL) + "|" + pubDate.UTC().RFC3339
@@ -28,25 +28,43 @@ key = "feeddate:" + normalizeFeedURL(feedURL) + "|" + pubDate.UTC().RFC3339
 
 Both sides must agree on the feed URL (after normalization) and the exact UTC timestamp. This is the primary strategy for Overcast and Pocket Casts, where pub dates are usually reliable.
 
-### Strategy 3: Feed URL + Title
+### Strategy 3 (`MatchByFeedTitle`): Feed URL + Title
 
 ```
 key = "feedtitle:" + normalizeFeedURL(feedURL) + "|" + fuzzyNormalizeTitle(title)
 ```
 
-Used when pub dates differ but the episode belongs to the same feed. `FuzzyNormalizeTitle` strips season markers (`S01`, `Season 1`) and punctuation, so "The Retrievals - Ep. 4" and "The Retrievals S01 - Ep. 4" produce the same key.
+Used when pub dates differ but the episode belongs to the same feed. `FuzzyNormalizeTitle` strips season markers (`S01`, `Season 1`) and punctuation, so "The Retrievals - Ep. 4" and "The Retrievals S01 - Ep. 4" produce the same key. Overcast can opt out via `--strict-feed-match`.
 
-### Strategy 4: Cross-Feed (by normalised podcast title + date)
+### Strategy 4 (`MatchByTitleDate`): Fuzzy Title + Calendar Day
 
 ```
-key = "xfeed:" + normalizePlusTitle(podcastTitle) + "|" + pubDate.UTC().date
+key = "titledate:" + fuzzyNormalizeTitle(title) + "|" + pubDate.UTC().date
 ```
 
-Used in the sync engine's `merge()` when strategies 1–3 all fail. Matches episodes across different feed URLs when the podcast title normalises to the same base (e.g. "Fresh Air Plus" ↔ "Fresh Air"). Uses day-level date precision (not RFC3339) to tolerate timing differences between early-access and public RSS feeds.
+Cross-feed fallback with no show anchor. Used by Pocket Casts for episodes that a podcast network cross-posts to multiple feeds, where Apple and PC attribute the episode to different shows. Day-level precision tolerates timezone differences between apps.
 
-A `±1-day` window is tried when exact date fails. Off-by-one matches require a fuzzy title agreement to prevent false positives.
+### Strategy 5 (`MatchByPodDate`): Podcast Title + Publication Date
 
-When multiple destination episodes share the same podcast+date bucket (batch releases), `pickBestCrossFeedCandidate` selects the closest fuzzy title match.
+```
+key = "poddate:" + lowerPodcastTitle + "|" + pubDate.UTC().RFC3339
+```
+
+Matches across different feed URLs using the podcast title as the anchor. Used by the Apple catalog write path as a cross-feed fallback (e.g. after a podcast moves hosting providers). Skipped when `--strict-feed-match` is set.
+
+### Strategy 6 (`MatchByPodTitle`): Podcast Title + Fuzzy Episode Title
+
+```
+key = "podtitle:" + lowerPodcastTitle + "|" + fuzzyNormalizeTitle(title)
+```
+
+Lowest-confidence strategy; a date-tolerance guard is applied after the match to reject false positives. Used only by the Apple catalog write path. Skipped when `--strict-feed-match` is set.
+
+---
+
+### Cross-feed merge (sync engine)
+
+The sync engine's `merge()` step handles episodes that strategies 1–3 don't match because both apps attribute the episode to different feed URLs. It uses `normalizePlusTitle(podcastTitle)` to group source and destination podcasts that share the same base title ("Fresh Air Plus" ↔ "Fresh Air"), then matches on pub date within a ±1-day window. Off-by-one date matches require fuzzy title agreement to prevent false positives. When multiple destination episodes share the same podcast+date bucket, `pickBestCrossFeedCandidate` selects the closest fuzzy title match.
 
 ---
 
@@ -73,14 +91,25 @@ The Overcast OPML stores `overcastId` (a numeric string) as the GUID field. This
 
 The `titledate` key handles episodes that podcast networks cross-post to multiple feeds, where Apple and Pocket Casts attribute the episode to different shows.
 
+### Apple KVS index (private-feed write path)
+
+| Key | Strategy | When used |
+|---|---|---|
+| `guid:<guid>` via KVS cache | GUID (play state cache) | Primary — fast, no SQLite |
+| `ZGUID = ?` via SQLite | GUID (SQLite column) | When KVS cache misses |
+| feed URL + pub date within ±24h via SQLite | feeddate | GUID not available |
+| feed URL + case-insensitive title via SQLite | feedtitle | GUID and date unavailable |
+
+Note: the SQLite `feedtitle` match uses `LOWER(TRIM(...))` equality, not `FuzzyNormalizeTitle`, so season-marker variants may not match — GUID and feeddate cover the vast majority of episodes so the impact is small.
+
 ### Apple catalog keys (web API write path)
 
 | Strategy | Key | Flag |
 |---|---|---|
-| 1: feeddate | `feeddate:<normURL>|<RFC3339>` | Always tried |
-| 2: feedtitle | `feedtitle:<normURL>|<title>` | Always tried (with date tolerance) |
-| 3: poddate | `poddate:<podTitle>|<RFC3339>` | Skipped with `--strict-feed-match` |
-| 4: podtitle | `podtitle:<podTitle>|<title>` | Skipped with `--strict-feed-match` |
+| feeddate | `feeddate:<normURL>|<RFC3339>` | Always tried |
+| feedtitle | `feedtitle:<normURL>|<fuzzyTitle>` | Always tried (with date tolerance) |
+| poddate | `poddate:<podTitle>|<RFC3339>` | Skipped with `--strict-feed-match` |
+| podtitle | `podtitle:<podTitle>|<fuzzyTitle>` | Skipped with `--strict-feed-match` |
 
 ---
 
@@ -195,8 +224,8 @@ For Overcast:
 `--title-match-tolerance` (default: 72 hours) limits how far apart two episodes' pub dates can be when matching by title. This prevents false positives between same-named episodes published years apart (e.g. yearly anniversary episodes with the same title).
 
 The guard is applied to:
-- Strategy 2 (feedtitle) in the Overcast and Apple catalog paths
-- Strategy 4 (podtitle) in the Apple catalog path
+- `feedtitle` (`MatchByFeedTitle`) in the Overcast and Apple catalog paths
+- `podtitle` (`MatchByPodTitle`) in the Apple catalog path
 - Cross-feed off-day matching in the sync engine (±1-day candidates require fuzzy title agreement)
 
 Setting `--title-match-tolerance 0` disables the guard (legacy behaviour, accept any date combination).
@@ -206,8 +235,8 @@ Setting `--title-match-tolerance 0` disables the guard (legacy behaviour, accept
 ## `--strict-feed-match`
 
 When `--strict-feed-match` is set, only strategies that agree on the **feed URL** are used:
-- Overcast: only `feeddate` (no `feedtitle` fallback)
-- Apple catalog: only strategies 1 and 2 (no cross-feed `poddate`/`podtitle`)
+- Overcast: only `feeddate` (`feedtitle` fallback disabled)
+- Apple catalog: only `feeddate` and `feedtitle` (`poddate`/`podtitle` cross-feed steps skipped)
 - Overcast extended matching: per-podcast search and subscription steps are skipped
 
 Use this when you want to be certain an episode is only written if its feed URL is unambiguous.

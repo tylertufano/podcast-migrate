@@ -199,6 +199,8 @@ To migrate subscriptions only (no play state):
 podcast-migrate migrate --from overcast --to podcasts --only-subscriptions
 ```
 
+`--only-subscriptions` to Apple Podcasts requires KVS credentials (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`). The same credentials used for play-state migration work here.
+
 ### Limit to specific podcasts
 
 `--podcast` works with any migration direction — pass a case-insensitive substring of the podcast title:

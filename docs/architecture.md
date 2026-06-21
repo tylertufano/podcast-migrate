@@ -57,7 +57,10 @@ podcast-migrate/
 │   │   └── engine.go             Engine.Run: merge + auto-feed-map + write
 │   ├── migrate/
 │   │   ├── match.go              NormalizeFeedURL, FuzzyNormalizeTitle, SkipReason
+│   │   ├── match_strategy.go     MatchStrategy enum — canonical 6-step episode-lookup cascade
 │   │   └── log.go                WriteLogHeader, WriteLogLine, PlayStateLabel
+│   ├── httputil/
+│   │   └── retry.go              RateLimitError, TransientError, RetryFunc (shared by all write providers)
 │   ├── apple/
 │   │   ├── provider.go           Provider: SQLite → web API fallback
 │   │   ├── sqlite.go             SQLiteReader (MTLibrary.sqlite)

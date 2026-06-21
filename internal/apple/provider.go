@@ -136,10 +136,7 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 // Subscriptions are auto-written via KVS in both modes when credentials allow.
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
 	if opts.OnlySubscriptions {
-		return &provider.ErrCapabilityUnsupported{
-			Provider:  p.Name(),
-			Operation: "write subscriptions standalone (subscriptions are auto-written during play state migration when KVS credentials are set; --only-subscriptions is not yet supported for Apple Podcasts)",
-		}
+		return p.setLibrarySubscriptionsOnly(ctx, lib, opts)
 	}
 
 	if p.webAPI == nil && p.kvsOnly == nil {
@@ -259,5 +256,70 @@ func (p *Provider) setLibraryKVSOnly(ctx context.Context, lib *model.Library, op
 		prefix = "[dry-run] "
 	}
 	fmt.Printf("%smarked %d episode(s) via Apple KVS\n", prefix, n)
+	return nil
+}
+
+// setLibrarySubscriptionsOnly runs only the KVS subscribe pass, adding any
+// podcasts from lib that are not yet subscribed in Apple Podcasts. No play
+// state is written. Requires KVS credentials (either via SetKVSOnlyMode or
+// the KVS fallback attached to a web API writer).
+func (p *Provider) setLibrarySubscriptionsOnly(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
+	// Resolve which KVS writer to use.
+	var kvs *KVSWriter
+	switch {
+	case p.kvsOnly != nil:
+		kvs = p.kvsOnly
+	case p.webAPI != nil && p.webAPI.kvsWriter != nil:
+		kvs = p.webAPI.kvsWriter
+	default:
+		return &provider.ErrCapabilityUnsupported{
+			Provider:  p.Name(),
+			Operation: "write subscriptions standalone (requires KVS credentials: set APPLE_KVS_DSID and APPLE_KVS_COOKIES)",
+		}
+	}
+
+	if !kvs.podcastsDomainReady {
+		if iErr := kvs.initPodcastsDomain(ctx); iErr != nil {
+			return fmt.Errorf("apple: podcasts domain init failed: %w", iErr)
+		}
+	}
+	if !kvs.podcastsDomainReady {
+		return fmt.Errorf("apple: podcasts domain not available — check KVS credentials")
+	}
+
+	added := 0
+	for _, pod := range lib.Podcasts {
+		if pod.FeedURL == "" || kvs.IsSubscribed(pod.FeedURL) {
+			continue
+		}
+		title := pod.Title
+		if title == "" {
+			title = pod.FeedURL
+		}
+		if opts.DryRun {
+			fmt.Printf("  [dry-run] kvs: would subscribe to %q\n", title)
+			added++
+			continue
+		}
+		isNew, subErr := kvs.Subscribe(ctx, pod.FeedURL, title)
+		if subErr != nil {
+			fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
+			continue
+		}
+		if isNew {
+			added++
+			fmt.Printf("  kvs: subscribed to %q\n", title)
+		}
+	}
+
+	if opts.SubscriptionsAddedOut != nil {
+		*opts.SubscriptionsAddedOut = added
+	}
+
+	prefix := ""
+	if opts.DryRun {
+		prefix = "[dry-run] "
+	}
+	fmt.Printf("%ssubscribed to %d podcast(s) via Apple KVS\n", prefix, added)
 	return nil
 }

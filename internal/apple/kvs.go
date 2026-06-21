@@ -241,6 +241,9 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 		if ep.PlayState != model.PlayStatePlayed && ep.PlayState != model.PlayStateInProgress {
 			continue
 		}
+		if opts.SubscribedOnly && !w.IsSubscribed(ep.FeedURL) {
+			continue
+		}
 
 		item, found, err := w.lookupPrivateEpisode(ctx, db, ep)
 		if err != nil {
@@ -338,15 +341,17 @@ func (w *KVSWriter) Write(ctx context.Context, lib *model.Library, opts provider
 	for _, p := range pending {
 		if _, wasConflict := conflicts[p.item.MetadataIdentifier]; wasConflict {
 			// Server already has this key at a newer version (status=1198).
-			// Check whether its current state covers our desired state.
-			if serverState, ok := w.checkServerPlayState(ctx, p.item.MetadataIdentifier); ok &&
-				serverStateCoversDesired(p.ep, serverState) {
-				migrate.WriteLogLine(opts.LogWriter, "skipped", p.podTitle, p.ep.Title, p.ep.PubDate,
-					migrate.PlayStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", "already synced via KVS")
-				continue
+			// Check whether its current state covers our desired state, unless
+			// ForceUpdate is set (in which case always retry with the correct
+			// base-version to ensure the server overwrites its current state).
+			if !opts.ForceUpdate {
+				if serverState, ok := w.checkServerPlayState(ctx, p.item.MetadataIdentifier); ok &&
+					serverStateCoversDesired(p.ep, serverState) {
+					migrate.WriteLogLine(opts.LogWriter, "skipped", p.podTitle, p.ep.Title, p.ep.PubDate,
+						migrate.PlayStateLabel(p.ep.PlayState, p.ep.PlayPosition), "—", "already synced via KVS")
+					continue
+				}
 			}
-			// Server has the key but at an insufficient play state — retry with
-			// the correct base-version (now populated from the conflict response).
 			needsRetry = append(needsRetry, p)
 			continue
 		}
@@ -449,6 +454,9 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 	// Episodes that are neither are logged and dropped here.
 	resolveEpisodes := func(eps []model.EpisodeState) (pending []kvsItemWithMeta, deferred []model.EpisodeState, dryCount int) {
 		for _, ep := range eps {
+			if opts.SubscribedOnly && !w.IsSubscribed(ep.FeedURL) {
+				continue
+			}
 			podTitle := feedToTitle[ep.FeedURL]
 			item, found, lookupErr := w.lookupPrivateEpisode(ctx, db, ep)
 			if lookupErr != nil {
@@ -550,11 +558,13 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 		var needsRetry []kvsItemWithMeta
 		for _, pm := range p {
 			if _, wasConflict := conflicts[pm.item.MetadataIdentifier]; wasConflict {
-				if serverState, ok := w.checkServerPlayState(ctx, pm.item.MetadataIdentifier); ok &&
-					serverStateCoversDesired(pm.ep, serverState) {
-					migrate.WriteLogLine(opts.LogWriter, "skipped", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
-						migrate.PlayStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", "already synced via KVS")
-					continue
+				if !opts.ForceUpdate {
+					if serverState, ok := w.checkServerPlayState(ctx, pm.item.MetadataIdentifier); ok &&
+						serverStateCoversDesired(pm.ep, serverState) {
+						migrate.WriteLogLine(opts.LogWriter, "skipped", pm.podTitle, pm.ep.Title, pm.ep.PubDate,
+							migrate.PlayStateLabel(pm.ep.PlayState, pm.ep.PlayPosition), "—", "already synced via KVS")
+						continue
+					}
 				}
 				needsRetry = append(needsRetry, pm)
 				continue

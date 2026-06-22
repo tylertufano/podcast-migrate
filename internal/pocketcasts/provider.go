@@ -761,7 +761,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		// calls in this run.
 		authEpAvailable := true
 
-		added := 0
+		fetched := 0 // episodes processed (auth + CDN passes combined)
 		skipped := 0
 		for normFeed, originalFeedURL := range unmatchedFeeds {
 			podUUID := normFeedToPodUUID[normFeed]
@@ -890,15 +890,14 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 						authEpAvailable = false
 					}
 				} else {
-					beforeAdd := len(index)
 					for _, ep := range authEps {
-						if indexFeedURL == "" {
-							continue
-						}
-						addToIndex(index, &ep, indexFeedURL, "B-auth")
+					if indexFeedURL == "" {
+						continue
 					}
-					added += len(index) - beforeAdd
-					time.Sleep(requestDelay)
+					addToIndex(index, &ep, indexFeedURL, "B-auth")
+					fetched++
+				}
+				time.Sleep(requestDelay)
 				}
 			}
 
@@ -912,7 +911,6 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 					break
 				}
 
-				beforeAdd := len(index)
 				for _, ep := range pageEps {
 					if indexFeedURL == "" || ep.IsDeleted {
 						continue
@@ -924,8 +922,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 						ep.PlayedUpTo = int(se.PlayedUpTo)
 					}
 					addToIndex(index, &ep, indexFeedURL, "B-cdn")
+					fetched++
 				}
-				added += len(index) - beforeAdd
 
 				if !hasMore {
 					break // all pages exhausted
@@ -934,8 +932,8 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			}
 		}
 
-		if added > 0 {
-			fmt.Printf("pocketcasts: Phase B: added %d additional episode(s) to index\n", added)
+		if fetched > 0 {
+			fmt.Printf("pocketcasts: Phase B: indexed %d episode(s) across %d feed(s)\n", fetched, len(unmatchedFeeds)-skipped)
 		}
 		if skipped > 0 {
 			fmt.Printf("pocketcasts: Phase B: %d feed(s) skipped — not subscribed in Pocket Casts\n", skipped)

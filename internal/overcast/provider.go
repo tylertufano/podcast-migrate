@@ -1,6 +1,7 @@
 package overcast
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -42,6 +43,7 @@ type Provider struct {
 	sourceOPMLPath       string // path to Overcast OPML export used by GetLibrary (--overcast-source-opml)
 	matchOPMLPath        string // path to OPML used for write-side episode matching (--overcast-match-opml, optional)
 	exportOPMLPath       string // destination path for generated import file (for subscription writes)
+	skippedOPMLPath      string // if non-empty, write skipped-private-feeds OPML here after a destination write
 	email                string // Overcast account email (enables play state writes and auto-fetch)
 	password             string // Overcast account password
 	clearSourceOPMLCache bool   // if true, bypass the on-disk cache and re-fetch source OPML from the live account
@@ -82,6 +84,42 @@ func (p *Provider) SetMatchOPMLPath(path string) { p.matchOPMLPath = path }
 // SetClearSourceOPMLCache configures GetLibrary to bypass the on-disk source OPML cache
 // and re-fetch from the live account even if a fresh cached copy exists.
 func (p *Provider) SetClearSourceOPMLCache(clear bool) { p.clearSourceOPMLCache = clear }
+
+// SetSkippedOPMLPath configures the path where an OPML of skipped private feeds is written
+// after a destination write. The file is only created when at least one podcast could not be
+// subscribed (no iTunes ID in Overcast search). Pass "" to disable (the default).
+// The default output path when the flag is given without a value is "skipped-private-feeds.opml".
+func (p *Provider) SetSkippedOPMLPath(path string) { p.skippedOPMLPath = path }
+
+// writeSkippedOPML writes an OPML file containing feeds that could not be subscribed
+// automatically (typically private or custom feeds with no iTunes ID). Prints a
+// human-readable summary of what was written and how to import it in Overcast.
+func (p *Provider) writeSkippedOPML(pods []model.Podcast, dryRun bool) {
+	outPath := p.skippedOPMLPath
+	if outPath == "" {
+		outPath = "skipped-private-feeds.opml"
+	}
+	prefix := ""
+	if dryRun {
+		prefix = "[dry-run] "
+	}
+	fmt.Printf("\novercast: %d podcast(s) could not be subscribed automatically (no iTunes ID):\n", len(pods))
+	for _, pod := range pods {
+		fmt.Printf("  • %s (%s)\n", pod.Title, pod.FeedURL)
+	}
+	if dryRun {
+		fmt.Printf("%sWould write skipped-feeds OPML to %s\n", prefix, outPath)
+		fmt.Printf("  To subscribe: Overcast → Settings → Import OPML\n")
+		return
+	}
+	lib := &model.Library{Podcasts: pods}
+	if err := (&OPMLWriter{}).Write(lib, outPath); err != nil {
+		fmt.Printf("overcast: warning: could not write skipped-feeds OPML: %v\n", err)
+		return
+	}
+	fmt.Printf("overcast: skipped-feeds OPML written to %s\n", outPath)
+	fmt.Printf("  To subscribe: Overcast → Settings → Import OPML\n")
+}
 
 // SetSaveSourceOPMLPath configures GetLibrary to write a copy of the fetched source OPML
 // to the given path after downloading it. Has no effect when --overcast-source-opml is set
@@ -214,6 +252,38 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 	return nil
 }
 
+// promptRateLimit is called when repeated HTTP 429 responses exhaust the automatic
+// retry budget. It prints a message, waits the Retry-After period, then prompts the
+// user interactively: continue (optionally increasing requestDelay) or abort.
+// Returns true if the caller should retry, false to abort.
+func promptRateLimit(rl *httputil.RateLimitError, requestDelay *time.Duration) bool {
+	fmt.Printf("\n  overcast: persistent rate limiting — still getting 429 after retries.\n")
+	fmt.Printf("  Waiting %v as requested by server...\n", rl.Wait)
+	time.Sleep(rl.Wait)
+
+	suggested := *requestDelay + 500*time.Millisecond
+	fmt.Printf("  Continue? [Y/n] (current delay %v; press Enter to also increase to %v): ",
+		*requestDelay, suggested)
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
+	line := strings.TrimSpace(strings.ToLower(scanner.Text()))
+
+	if line == "n" || line == "no" {
+		return false
+	}
+	if line == "" || line == "y" || line == "yes" {
+		// Empty Enter = accept the suggested delay increase.
+		if line == "" {
+			*requestDelay = suggested
+			fmt.Printf("  request delay increased to %v\n", *requestDelay)
+		}
+		return true
+	}
+	// Any other input: treat as "yes, no delay change".
+	return true
+}
+
 // doWritePlayState matches lib's episodes against the Overcast matching library,
 // then posts set_progress for each matched episode that has play state.
 //
@@ -321,9 +391,12 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		}
 	}
 	defer idCache.save()
-	added := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch, opts.SubscribedOnly, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache, idCache)
+	added, skippedPrivate := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch, opts.SubscribedOnly, opts.DryRun, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache, idCache)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
+	}
+	if len(skippedPrivate) > 0 {
+		p.writeSkippedOPML(skippedPrivate, opts.DryRun)
 	}
 
 	// 7. In dry-run mode, report what would be written without making any state
@@ -430,9 +503,20 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 			pos = PlayedSentinel
 		}
 
-		setErr := httputil.RetryFunc(ctx, func() error {
-			return SetProgress(ctx, httpClient, numericID, pos)
-		}, httputil.RetryOptions{})
+		var setErr error
+		for {
+			setErr = httputil.RetryFunc(ctx, func() error {
+				return SetProgress(ctx, httpClient, numericID, pos)
+			}, httputil.RetryOptions{})
+			var rl *httputil.RateLimitError
+			if !errors.As(setErr, &rl) {
+				break // success or non-rate-limit error — exit inner loop
+			}
+			// RetryFunc exhausted its 429 budget. Prompt the user.
+			if !promptRateLimit(rl, &requestDelay) {
+				return updated, fmt.Errorf("overcast: aborted due to persistent rate limiting")
+			}
+		}
 		if setErr != nil {
 			fmt.Printf("  [%d/%d] FAILED %q (id=%s): %v\n",
 				updated+apiSkipped+1, toUpdate, ep.Title, numericID, setErr)
@@ -559,14 +643,19 @@ func augmentIndexFromPodcastPages(
 	feedToTitle map[string]string, // Apple feedURL → lowercased podcast title (for title-based fallback)
 	strictFeedMatch bool,
 	subscribedOnly bool,
+	dryRun bool,
 	episodeCacheMaxAge time.Duration,
 	clearEpisodeCache bool,
 	idCache *episodeIDCache,
-) int {
+) (int, []model.Podcast) {
 	// Guard against a zero/negative delay — callers such as tests may pass 0.
 	if requestDelay <= 0 {
 		requestDelay = DefaultRequestDelay
 	}
+
+	// skippedPods collects podcasts that couldn't be subscribed because Overcast
+	// search returned no iTunes ID (typically private/custom feeds).
+	var skippedPods []model.Podcast
 
 	// Build per-feed Apple episode set (only episodes with play state, by feed).
 	appleByFeed := make(map[string][]model.EpisodeState)
@@ -576,7 +665,7 @@ func augmentIndexFromPodcastPages(
 		}
 	}
 	if len(appleByFeed) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	// Build a numeric-ID → play-state index from the OPML matching library so that
@@ -615,7 +704,7 @@ func augmentIndexFromPodcastPages(
 		}
 	}
 	if unmatched == 0 {
-		return 0
+		return 0, nil
 	}
 	fmt.Printf("overcast: extended matching: %d feed(s) have unmatched episodes — resolving via /podcasts page...\n", unmatched)
 
@@ -712,15 +801,35 @@ func augmentIndexFromPodcastPages(
 			hintOvercastID = info.overcastID
 		}
 
-		searchResult, err := searchPodcastWithRetry(ctx, client, appleTitle, hintOvercastID, requestDelay)
-		if err != nil {
-			fmt.Printf("  warning: search failed for %q: %v\n", appleTitle, err)
+		var searchResult PodcastSearchResult
+		searchSkip := false
+		for {
+			var err error
+			searchResult, err = searchPodcastWithRetry(ctx, client, appleTitle, hintOvercastID, requestDelay)
+			if err == nil {
+				break
+			}
+			var rl *httputil.RateLimitError
+			if !errors.As(err, &rl) {
+				fmt.Printf("  warning: search failed for %q: %v\n", appleTitle, err)
+				searchSkip = true
+				break
+			}
+			if !promptRateLimit(rl, &requestDelay) {
+				return 0, skippedPods
+			}
+		}
+		if searchSkip {
 			skippedFeeds++
 			continue
 		}
 		if searchResult.ITunesID == "" {
-			fmt.Printf("  warning: %q not found in Overcast search\n", appleTitle)
+			// Podcast not found in Overcast search — no iTunes ID means we cannot
+			// construct a page URL or subscribe programmatically. Collect it for the
+			// skipped-private-feeds OPML so the user can import it manually.
+			fmt.Printf("  warning: %q not found in Overcast search (no iTunes ID) — will include in skipped-feeds OPML\n", appleTitle)
 			skippedFeeds++
+			skippedPods = append(skippedPods, model.Podcast{FeedURL: feedURL, Title: appleTitle})
 			continue
 		}
 		pageURL := overcastBaseURL + "/itunes" + searchResult.ITunesID
@@ -730,14 +839,19 @@ func augmentIndexFromPodcastPages(
 		// calls for podcasts the account is not subscribed to. AddPodcast posts
 		// directly to /podcasts/add/{overcastID}, bypassing the podcast listing page
 		// and its caching bug (stale Delete button on unsubscribed podcasts).
-		fmt.Printf("  subscribing to %q...\n", appleTitle)
-		if err := AddPodcast(ctx, client, searchResult.OvercastID); err != nil {
-			fmt.Printf("  warning: could not subscribe to %q: %v — play state may not persist\n",
-				appleTitle, err)
+		// In dry-run mode, log intent without posting.
+		if dryRun {
+			fmt.Printf("  [dry-run] would subscribe to %q\n", appleTitle)
 		} else {
-			fmt.Printf("  subscribed to %q\n", appleTitle)
+			fmt.Printf("  subscribing to %q...\n", appleTitle)
+			if err := AddPodcast(ctx, client, searchResult.OvercastID); err != nil {
+				fmt.Printf("  warning: could not subscribe to %q: %v — play state may not persist\n",
+					appleTitle, err)
+			} else {
+				fmt.Printf("  subscribed to %q\n", appleTitle)
+			}
+			time.Sleep(requestDelay)
 		}
-		time.Sleep(requestDelay)
 		feedToPageURL[feedURL] = pageURL
 	}
 
@@ -785,10 +899,26 @@ func augmentIndexFromPodcastPages(
 			}
 			listings = cached.listings
 		} else {
-			fetched, err := fetchPodcastEpisodesWithRetry(ctx, client, pageURL, requestDelay)
-			if err != nil {
-				fmt.Printf("  warning: could not fetch podcast page %s: %v\n", pageURL, err)
-				podPageCache[pageURL] = podPageResult{failed: true}
+			var fetched []PodcastEpisodeListing
+			for {
+				var err error
+				fetched, err = fetchPodcastEpisodesWithRetry(ctx, client, pageURL, requestDelay)
+				if err == nil {
+					break
+				}
+				var rl *httputil.RateLimitError
+				if !errors.As(err, &rl) {
+					fmt.Printf("  warning: could not fetch podcast page %s: %v\n", pageURL, err)
+					podPageCache[pageURL] = podPageResult{failed: true}
+					fetched = nil
+					break
+				}
+				if !promptRateLimit(rl, &requestDelay) {
+					// User aborted; return what we have so far.
+					return 0, skippedPods
+				}
+			}
+			if fetched == nil {
 				continue
 			}
 			time.Sleep(requestDelay)
@@ -950,7 +1080,7 @@ func augmentIndexFromPodcastPages(
 		if added == 0 {
 			fmt.Printf("overcast: extended matching found no additional episodes\n")
 		}
-		return added
+		return added, skippedPods
 	}
 
 	// Step 4: resolve hashes → numeric IDs.
@@ -1017,7 +1147,7 @@ func augmentIndexFromPodcastPages(
 	}
 
 	if len(misses) == 0 {
-		return added
+		return added, skippedPods
 	}
 
 	fmt.Printf("overcast: fetching numeric IDs for %d episode(s) via episode pages (%d workers)...\n",
@@ -1171,7 +1301,7 @@ func augmentIndexFromPodcastPages(
 		}
 	}
 
-	return added
+	return added, skippedPods
 }
 
 // overcastIndexEntry holds the data needed to update an episode's progress in Overcast.

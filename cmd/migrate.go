@@ -36,6 +36,7 @@ func migrateCmd() *cobra.Command {
 		overcastPassword         string
 		overcastClearSourceCache bool   // --clear-source-opml-cache
 		overcastSaveSourceOPML   string // --overcast-save-source-opml
+		overcastSkippedOPML      string // --overcast-skipped-opml
 		conflictStrategy        string
 		requestDelay            time.Duration
 		titleMatchTolerance     time.Duration
@@ -219,6 +220,11 @@ func migrateCmd() *cobra.Command {
 					op.SetMatchOPMLPath(overcastMatchOPML)
 				}
 			}
+			if overcastSkippedOPML != "" {
+				if op, ok := dst.(*overcast.Provider); ok {
+					op.SetSkippedOPMLPath(overcastSkippedOPML)
+				}
+			}
 
 			// Configure write credentials for Apple Podcasts destination.
 			// Web API (bearer + media-user-token) is preferred: catalog episodes
@@ -309,6 +315,11 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&overcastSaveSourceOPML, "overcast-save-source-opml", "",
 		"save a copy of the fetched Overcast source OPML to this path;\n"+
 			"if the flag is given without a value, ~/Downloads/overcast.opml is used")
+	cmd.Flags().StringVar(&overcastSkippedOPML, "overcast-skipped-opml", "",
+		"write an OPML file containing podcasts that could not be subscribed automatically\n"+
+			"(private/custom feeds with no iTunes ID); default path: skipped-private-feeds.opml\n"+
+			"(if the flag is given without a value, skipped-private-feeds.opml is used)")
+	cmd.Flags().Lookup("overcast-skipped-opml").NoOptDefVal = "skipped-private-feeds.opml"
 	cmd.Flags().Lookup("overcast-save-source-opml").NoOptDefVal = filepath.Join(os.Getenv("HOME"), "Downloads", "overcast.opml")
 	cmd.Flags().StringVar(&conflictStrategy, "conflict", "furthest", "conflict resolution: furthest | source | target")
 	cmd.Flags().DurationVar(&requestDelay, "request-delay", 0, "delay between consecutive API requests to Overcast or Apple (default 1s; increase if you hit 429 rate limits)")

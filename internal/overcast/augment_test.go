@@ -83,13 +83,13 @@ var appleEp = model.EpisodeState{
 // ── Early-exit tests (no HTTP) ────────────────────────────────────────────
 
 func TestAugment_EmptyEpisodes_ReturnsZero(t *testing.T) {
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), nil,
 		&model.Library{},
 		nil, // empty
 		map[string]overcastIndexEntry{},
 		0, map[string]string{},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("empty episodes: got %d, want 0", n)
@@ -100,14 +100,14 @@ func TestAugment_AllUnplayed_ReturnsZero(t *testing.T) {
 	eps := []model.EpisodeState{
 		{FeedURL: "https://feeds.example.com/s", PubDate: time.Now(), PlayState: model.PlayStateUnplayed},
 	}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), nil,
 		&model.Library{},
 		eps,
 		map[string]overcastIndexEntry{},
 		0,
 		map[string]string{"https://feeds.example.com/s": "test show"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("all-unplayed: got %d, want 0", n)
@@ -120,14 +120,14 @@ func TestAugment_AllAlreadyIndexed_ReturnsZero(t *testing.T) {
 	key := "feeddate:" + normFeed + "|" + appleEp.PubDate.UTC().Format(time.RFC3339)
 	index := map[string]overcastIndexEntry{key: {numericID: "already-there"}}
 
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), nil,
 		&model.Library{},
 		[]model.EpisodeState{appleEp},
 		index,
 		0,
 		map[string]string{feedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("all-indexed: got %d, want 0", n)
@@ -150,7 +150,7 @@ func TestAugment_StrictFeedMatch_SkipsAllFeeds(t *testing.T) {
 		},
 	})
 
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{appleEp},
@@ -158,7 +158,7 @@ func TestAugment_StrictFeedMatch_SkipsAllFeeds(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		true, // strictFeedMatch
-		false, 0, false, newTestCache(t),
+		false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("strictFeedMatch: got %d, want 0", n)
@@ -182,7 +182,7 @@ func TestAugment_SubscribedOnly_SkipsUnsubscribed(t *testing.T) {
 		},
 	})
 
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{appleEp},
@@ -191,7 +191,7 @@ func TestAugment_SubscribedOnly_SkipsUnsubscribed(t *testing.T) {
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		false,
 		true, // subscribedOnly
-		0, false, newTestCache(t),
+		false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("subscribedOnly with no match: got %d, want 0", n)
@@ -220,14 +220,14 @@ func TestAugment_NormalPath_AddsToIndex(t *testing.T) {
 	})
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{appleEp},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("normal path: got %d entries added, want 1", n)
@@ -263,14 +263,14 @@ func TestAugment_NumericIDShortcut_AddsToIndex(t *testing.T) {
 	})
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{appleEp},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("NumericID shortcut: got %d entries added, want 1", n)
@@ -320,14 +320,14 @@ func TestAugment_PodPageCacheDedup(t *testing.T) {
 		PlayState: model.PlayStatePlayed,
 	}
 
-	augmentIndexFromPodcastPages(
+	_, _ = augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{ep1, ep2},
 		map[string]overcastIndexEntry{},
 		0,
 		map[string]string{feed1: "fresh air", feed2: "fresh air plus"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 
 	if count := atomic.LoadInt32(&listingFetchCount); count != 1 {
@@ -362,14 +362,14 @@ func TestAugment_TitleFallback_MatchesWhenDateMisses(t *testing.T) {
 	}
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{epOffByTwoDays},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("title fallback: got %d entries added, want 1", n)
@@ -401,14 +401,14 @@ func TestAugment_OneDayOffSameTitle_Accepted(t *testing.T) {
 	}
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{epOneDayLater},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("±1 day same title: got %d entries added, want 1 — should accept when titles match", n)
@@ -449,7 +449,7 @@ func TestAugment_OneDayOffSeasonMarkerVariant_Accepted(t *testing.T) {
 	}
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{epNoS01},
@@ -458,7 +458,7 @@ func TestAugment_OneDayOffSeasonMarkerVariant_Accepted(t *testing.T) {
 		// feedToTitle uses "fresh air" to match augPodcastsPageFreshAir →
 		// /itunes12345/fresh-air, which serves listingPageS01 for this test.
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Errorf("±1 day season-marker variant: got %d entries added, want 1 — fuzzy title should accept", n)
@@ -507,14 +507,14 @@ func TestAugment_OneDayOffDifferentTitle_Rejected(t *testing.T) {
 	}
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		&model.Library{},
 		[]model.EpisodeState{epSubscriberExclusive},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
 		t.Errorf("±1 day different title: got %d entries added, want 0 — should reject when titles differ", n)
@@ -555,14 +555,14 @@ func TestAugment_OPMLState_NumericIDShortcut_SeedsCurrentState(t *testing.T) {
 	}
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		overcastLib,
 		[]model.EpisodeState{appleEp},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Fatalf("expected 1 entry added, got %d", n)
@@ -607,14 +607,14 @@ func TestAugment_OPMLState_CacheHitPath_SeedsCurrentState(t *testing.T) {
 	}
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		overcastLib,
 		[]model.EpisodeState{appleEp},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, cache,
+		false, false, false, 0, false, cache,
 	)
 	if n != 1 {
 		t.Fatalf("expected 1 entry added, got %d", n)
@@ -655,14 +655,14 @@ func TestAugment_OPMLState_WorkerPath_SeedsCurrentState(t *testing.T) {
 	}
 
 	index := map[string]overcastIndexEntry{}
-	n := augmentIndexFromPodcastPages(
+	n, _ := augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		overcastLib,
 		[]model.EpisodeState{appleEp},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, newTestCache(t),
+		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
 		t.Fatalf("expected 1 entry added, got %d", n)
@@ -710,14 +710,14 @@ func TestAugment_OPMLState_FurthestWins_CacheAhead(t *testing.T) {
 	}
 
 	index := map[string]overcastIndexEntry{}
-	augmentIndexFromPodcastPages(
+	_, _ = augmentIndexFromPodcastPages(
 		context.Background(), srv.Client(),
 		overcastLib,
 		[]model.EpisodeState{appleEp},
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
-		false, false, 0, false, cache,
+		false, false, false, 0, false, cache,
 	)
 
 	normFeed := normalizeFeedURL(appleEp.FeedURL)

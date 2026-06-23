@@ -1021,13 +1021,13 @@ func augmentIndexFromPodcastPages(
 			// Try to find the episode by the date portion of its UTC pubDate (±1 day tolerance).
 			// pickByDate checks all episodes on a given date and picks the one whose
 			// title is compatible, handling podcasts that publish multiple episodes per day.
-			apDate := ap.PubDate.UTC().Format("2006-01-02")
+			apDate := ap.PubDate.Format("2006-01-02")
 			var matched PodcastEpisodeListing
 			if l, ok := pickByDate(apDate, ap); ok {
 				matched = l
-			} else if l, ok := pickByDate(ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02"), ap); ok {
+			} else if l, ok := pickByDate(ap.PubDate.AddDate(0, 0, -1).Format("2006-01-02"), ap); ok {
 				matched = l
-			} else if l, ok := pickByDate(ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02"), ap); ok {
+			} else if l, ok := pickByDate(ap.PubDate.AddDate(0, 0, 1).Format("2006-01-02"), ap); ok {
 				matched = l
 			}
 			// Fallback: title-based matching when date matching fails.

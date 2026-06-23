@@ -691,6 +691,36 @@ func augmentIndexFromPodcastPages(
 	// Indexed with both exact and Plus-normalised keys (see buildOpmlTitleIndex).
 	opmlByTitle := buildOpmlTitleIndex(overcastLib)
 
+	// Overcast→Overcast short-circuit: when the source is an Overcast OPML export,
+	// each episode's GUID is already the Overcast numeric ID needed for SetProgress.
+	// Pre-seed the index so those episodes don't trigger listing-page fetches.
+	preSeeded := 0
+	for feedURL, eps := range appleByFeed {
+		normFeed := normalizeFeedURL(feedURL)
+		for _, ep := range eps {
+			if !isOvercastNumericID(ep.GUID) {
+				continue
+			}
+			entry := overcastIndexEntry{numericID: ep.GUID}
+			if !ep.PubDate.IsZero() {
+				key := "feeddate:" + normFeed + "|" + ep.PubDate.UTC().Format(time.RFC3339)
+				if _, exists := index[key]; !exists {
+					index[key] = entry
+					preSeeded++
+				}
+			}
+			if ep.Title != "" {
+				key := "feedtitle:" + normFeed + "|" + migrate.FuzzyNormalizeTitle(ep.Title)
+				if _, exists := index[key]; !exists {
+					index[key] = entry
+				}
+			}
+		}
+	}
+	if preSeeded > 0 {
+		fmt.Printf("overcast: %d episode(s) pre-matched from source Overcast IDs (no listing-page fetches needed)\n", preSeeded)
+	}
+
 	// Count feeds that have episodes not yet in the index, for the progress log.
 	unmatched := 0
 	for feedURL, apEps := range appleByFeed {
@@ -1518,6 +1548,22 @@ func filterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[stri
 // normalizeFeedURL returns a canonical form of a podcast feed URL for matching.
 // See migrate.NormalizeFeedURL for full documentation.
 func normalizeFeedURL(raw string) string { return migrate.NormalizeFeedURL(raw) }
+
+// isOvercastNumericID reports whether s looks like an Overcast episode numeric ID:
+// a non-empty string of ASCII digits. Overcast IDs are large integers (e.g.
+// "606972979413"). This is used to detect episodes that came from an Overcast OPML
+// export, where ep.GUID is already the SetProgress numeric ID.
+func isOvercastNumericID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // overcastSkipReason returns "already_played", "already_ahead", or "" based on
 // whether Overcast's current state already satisfies the desired state.

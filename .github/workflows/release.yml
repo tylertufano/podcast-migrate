@@ -5,8 +5,26 @@ on:
     tags: ['v*']
 
 jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release if not exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" > /dev/null 2>&1 \
+            || gh release create "${{ github.ref_name }}" \
+              --repo "${{ github.repository }}" \
+              --generate-notes \
+              --title "${{ github.ref_name }}"
+
   build:
     name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: create-release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -35,7 +53,10 @@ jobs:
             -o podcast-migrate-${{ matrix.suffix }}${{ matrix.ext }} \
             .
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: podcast-migrate-${{ matrix.suffix }}${{ matrix.ext }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            podcast-migrate-${{ matrix.suffix }}${{ matrix.ext }} \
+            --repo "${{ github.repository }}" \
+            --clobber

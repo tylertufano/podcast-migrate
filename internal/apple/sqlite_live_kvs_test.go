@@ -1,3 +1,5 @@
+//go:build darwin
+
 package apple
 
 // Internal tests for SQLiteReader's live KVS read path. Uses package apple

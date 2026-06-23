@@ -963,9 +963,11 @@ func augmentIndexFromPodcastPages(
 			podPageCache[pageURL] = podPageResult{listings: listings}
 		}
 
-		// Build date → listing and URL → listing maps for this podcast page.
+		// Build date → listings and URL → listing maps for this podcast page.
 		// Key is "YYYY-MM-DD"; Overcast pages use day-level precision.
-		dateToListing := make(map[string]PodcastEpisodeListing, len(listings))
+		// Multiple episodes can share a date (e.g. a podcast that publishes two
+		// episodes in the same day) so we store a slice per date.
+		dateToListings := make(map[string][]PodcastEpisodeListing, len(listings))
 		// urlToListing allows O(1) NumericID lookup once we have a URL match.
 		urlToListing := make(map[string]PodcastEpisodeListing, len(listings))
 		// Also build a normalised-title list for fallback matching when date matching fails.
@@ -977,9 +979,7 @@ func augmentIndexFromPodcastPages(
 		}
 		var titleEntries []titleEntry
 		for _, l := range listings {
-			if _, exists := dateToListing[l.DateStr]; !exists {
-				dateToListing[l.DateStr] = l
-			}
+			dateToListings[l.DateStr] = append(dateToListings[l.DateStr], l)
 			urlToListing[l.OvercastURL] = l
 			if l.Title != "" {
 				titleEntries = append(titleEntries, titleEntry{
@@ -989,42 +989,46 @@ func augmentIndexFromPodcastPages(
 			}
 		}
 
+		// pickByDate tries all listings on a given date and returns the one whose
+		// title is compatible with ap (or the first entry when titles are empty).
+		// This handles podcasts that publish multiple episodes on the same day.
+		pickByDate := func(dateStr string, ap model.EpisodeState) (PodcastEpisodeListing, bool) {
+			candidates := dateToListings[dateStr]
+			if len(candidates) == 0 {
+				return PodcastEpisodeListing{}, false
+			}
+			if ap.Title == "" {
+				return candidates[0], true
+			}
+			normAp := migrate.FuzzyNormalizeTitle(ap.Title)
+			for _, c := range candidates {
+				if c.Title == "" {
+					continue
+				}
+				normC := migrate.FuzzyNormalizeTitle(c.Title)
+				if strings.Contains(normAp, normC) || strings.Contains(normC, normAp) {
+					return c, true
+				}
+			}
+			return PodcastEpisodeListing{}, false
+		}
+
 		for _, ap := range apEps {
 			dateKey := "feeddate:" + normFeed + "|" + ap.PubDate.UTC().Format(time.RFC3339)
 			if _, exists := index[dateKey]; exists {
 				continue // already have the numeric ID from OPML
 			}
 			// Try to find the episode by the date portion of its UTC pubDate (±1 day tolerance).
+			// pickByDate checks all episodes on a given date and picks the one whose
+			// title is compatible, handling podcasts that publish multiple episodes per day.
 			apDate := ap.PubDate.UTC().Format("2006-01-02")
 			var matched PodcastEpisodeListing
-			if l, ok := dateToListing[apDate]; ok {
+			if l, ok := pickByDate(apDate, ap); ok {
 				matched = l
-			} else if l, ok := dateToListing[ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02")]; ok {
+			} else if l, ok := pickByDate(ap.PubDate.UTC().AddDate(0, 0, -1).Format("2006-01-02"), ap); ok {
 				matched = l
-			} else if l, ok := dateToListing[ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02")]; ok {
+			} else if l, ok := pickByDate(ap.PubDate.UTC().AddDate(0, 0, 1).Format("2006-01-02"), ap); ok {
 				matched = l
-			}
-			// Guard against ±1-day false positives: when the date didn't match
-			// exactly, verify the titles are compatible before accepting the match.
-			//
-			// The ±1-day tolerance exists for timezone edge cases where the same
-			// episode's pubDate in one RSS feed resolves to a different UTC calendar
-			// day than the other feed's copy. For the same episode the titles must
-			// be identical (or one contained in the other, since Overcast sometimes
-			// prefixes cell text with the podcast name).
-			//
-			// Without this guard, a subscriber-exclusive episode published one day
-			// before a completely different public-feed episode would be falsely
-			// matched via the ±1-day window — e.g. a Crooked Media membership
-			// episode on 2026-04-02 silently maps to the public episode from
-			// 2026-04-03 and marks the wrong episode as played in Overcast.
-			if matched.OvercastURL != "" && matched.DateStr != apDate &&
-				ap.Title != "" && matched.Title != "" {
-				normApple := migrate.FuzzyNormalizeTitle(ap.Title)
-				normOvercast := migrate.FuzzyNormalizeTitle(matched.Title)
-				if !strings.Contains(normApple, normOvercast) && !strings.Contains(normOvercast, normApple) {
-					matched = PodcastEpisodeListing{} // different episode — reject
-				}
 			}
 			// Fallback: title-based matching when date matching fails.
 			// This handles episodes where the pubDate stored in Apple Podcasts doesn't

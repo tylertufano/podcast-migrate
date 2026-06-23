@@ -249,13 +249,17 @@ Key tables: `ZMTPODCAST`, `ZMTEPISODE`, `ZMTUPPMETADATA`. CoreData epoch: **2001
 
 ### `ZMTUPPMETADATA`
 
-Stores UPP (User Play Progress) metadata — the local mirror of the KVS state for each episode. Used by `KVSWriter` to look up episode identifiers for private-feed episodes.
+Stores UPP (User Play Progress) metadata — the local mirror of Apple's KVS sync store (`bookkeeper.itunes.apple.com`). Apple Podcasts reads play state from this table for its UI; `ZMTEPISODE.ZPLAYSTATE` can lag behind when device sync has not yet propagated changes back to the Mac.
+
+`SQLiteReader` uses `ZMTUPPMETADATA` as the **primary** play state source: when a row exists for an episode (keyed on `ZMETADATAIDENTIFIER`), `ZHASBEENPLAYED` and `ZBOOKMARKTIME` take precedence over all `ZMTEPISODE` heuristics. This eliminates false positives where `ZPLAYSTATE=2` locally but KVS says unplayed, and recovers thousands of plays that only KVS knows about.
+
+`KVSWriter` uses `ZMTUPPMETADATA` to look up episode identifiers for private-feed write paths.
 
 | Column | Meaning |
 |---|---|
-| `ZMETADATAIDENTIFIER` | The KVS key — a hex string unique per episode, used as the `key` field in `putAll` requests |
+| `ZMETADATAIDENTIFIER` | The KVS key — a hex string unique per episode, used as the `key` field in `putAll` requests and as the join key with `ZMTEPISODE` |
 | `Z_OPT` | CoreData optimistic lock counter — the local version, which may lag the server's version if other devices have synced. `KVSWriter` always fetches the live server version via `getAll` before writing; `Z_OPT` is used only as a fallback when the key is absent from the `getAll` response |
-| `ZHASBEENPLAYED` | 1 = played |
+| `ZHASBEENPLAYED` | 1 = played (never NULL when a row exists) |
 | `ZPLAYCOUNT` | Total play count |
 | `ZBOOKMARKTIME` | Current playback position in seconds (0 = not started or fully played) |
 | `ZTIMESTAMP` | CoreData epoch timestamp of the last state change |

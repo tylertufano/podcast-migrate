@@ -219,19 +219,21 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		fmt.Printf("apple: ZMTEPISODE.ZDURATION column not found — episode durations will not be populated (macOS schema change)\n")
 	}
 
-	// Fetch all episodes with any evidence of having been played. Apple Podcasts
-	// uses several fields to track play history — no single column is authoritative:
+	// Fetch all episodes with any evidence of having been played.
 	//
+	// ZMTUPPMETADATA (UPP = User Play Progress) is Apple's local mirror of the KVS
+	// sync store (bookkeeper.itunes.apple.com). Apple Podcasts reads play state from
+	// this table for its UI — ZMTEPISODE.ZPLAYSTATE can lag behind when a device sync
+	// has not yet propagated changes back to the Mac. When a ZMTUPPMETADATA row exists
+	// for an episode, it takes precedence over ZMTEPISODE heuristics.
+	//
+	// For episodes without a ZMTUPPMETADATA row, ZMTEPISODE fields are used:
 	//   ZPLAYSTATE != 0  — explicit state set by the app (1=in-progress, 2=played)
 	//   ZPLAYHEAD > 0    — non-zero playback position (in-progress)
 	//   ZPLAYCOUNT > 0   — episode has been played at least once (e.g. played on
 	//                      another device or app; ZPLAYSTATE may still be 0)
 	//   ZLASTDATEPLAYED  — timestamp of last play (set when play completes or syncs
 	//                      from another device; also set when ZPLAYSTATE is 0)
-	//
-	// The Mac Podcasts app shows an episode as "played" when any of these indicate
-	// prior listening, regardless of ZPLAYSTATE. Relying on ZPLAYSTATE alone misses
-	// episodes played on other devices or via iCloud sync.
 	//
 	// ZGUID is selected as nullable: some podcast RSS feeds omit <guid> for
 	// individual episodes and Apple stores NULL in that case. Episodes without a
@@ -247,10 +249,14 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			e.ZLASTDATEPLAYED,
 			e.ZPLAYSTATE,
 			e.ZPLAYCOUNT,
-			e.ZPLAYSTATESOURCE
+			e.ZPLAYSTATESOURCE,
+			u.ZHASBEENPLAYED,
+			u.ZBOOKMARKTIME
 		FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
-		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL)
+		LEFT JOIN ZMTUPPMETADATA u ON u.ZMETADATAIDENTIFIER = e.ZMETADATAIDENTIFIER
+		WHERE (e.ZPLAYSTATE != 0 OR e.ZPLAYHEAD > 0 OR e.ZPLAYCOUNT > 0 OR e.ZLASTDATEPLAYED IS NOT NULL
+		       OR u.ZHASBEENPLAYED = 1 OR u.ZBOOKMARKTIME > 0)
 		  AND (e.ZGUID IS NOT NULL OR (e.ZTITLE IS NOT NULL AND e.ZPUBDATE IS NOT NULL))
 		  AND p.ZSUBSCRIBED = 1
 		  AND p.ZFEEDURL IS NOT NULL
@@ -268,16 +274,18 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 	var out []model.EpisodeState
 	for rows.Next() {
 		var (
-			guid            sql.NullString
-			feedURL         string
-			title           string
-			pubDateRaw      sql.NullFloat64
-			durationSec     sql.NullFloat64
-			playHeadSec     sql.NullFloat64
-			lastPlayedRaw   sql.NullFloat64
-			playState       sql.NullInt64
-			playCount       sql.NullInt64
-			playStateSource sql.NullInt64
+			guid              sql.NullString
+			feedURL           string
+			title             string
+			pubDateRaw        sql.NullFloat64
+			durationSec       sql.NullFloat64
+			playHeadSec       sql.NullFloat64
+			lastPlayedRaw     sql.NullFloat64
+			playState         sql.NullInt64
+			playCount         sql.NullInt64
+			playStateSource   sql.NullInt64
+			uppHasBeenPlayed  sql.NullInt64
+			uppBookmarkTime   sql.NullFloat64
 		)
 		if err := rows.Scan(
 			&guid, &feedURL, &title,
@@ -285,6 +293,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			&playHeadSec, &lastPlayedRaw,
 			&playState, &playCount,
 			&playStateSource,
+			&uppHasBeenPlayed, &uppBookmarkTime,
 		); err != nil {
 			return nil, 0, fmt.Errorf("apple/sqlite: scan episode: %w", err)
 		}
@@ -306,6 +315,27 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		if durationSec.Valid && durationSec.Float64 > 0 {
 			ep.Duration = time.Duration(durationSec.Float64 * float64(time.Second))
 		}
+		// ZMTUPPMETADATA-first: if a UPP row exists, it is the authoritative play state
+		// (Apple Podcasts UI reads from it, not from ZMTEPISODE.ZPLAYSTATE). ZHASBEENPLAYED
+		// is never NULL when a row exists, so uppHasBeenPlayed.Valid is a reliable
+		// row-existence sentinel. ZBOOKMARKTIME stores the playback position in seconds —
+		// the same unit as ZMTEPISODE.ZPLAYHEAD.
+		if uppHasBeenPlayed.Valid {
+			if uppHasBeenPlayed.Int64 == 1 {
+				ep.PlayState = model.PlayStatePlayed
+			} else if uppBookmarkTime.Valid && uppBookmarkTime.Float64 > 0 {
+				ep.PlayState = model.PlayStateInProgress
+				ep.PlayPosition = time.Duration(uppBookmarkTime.Float64 * float64(time.Second))
+			} else {
+				continue // UPP row says unplayed — skip (higher authority than ZMTEPISODE)
+			}
+			if lastPlayedRaw.Valid {
+				ep.LastPlayed = coreDataEpoch.Add(time.Duration(lastPlayedRaw.Float64 * float64(time.Second)))
+			}
+			out = append(out, ep)
+			continue
+		}
+
 		// trustedPlayed reports whether a ZPLAYSTATE=2 row represents genuine
 		// listening rather than Apple's automatic "mark as played" behaviour.
 		//
@@ -368,23 +398,23 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			// ZPLAYCOUNT. Requiring the date field makes "completed but not synced"
 			// distinguishable from "completed then manually unplayed".
 			ep.PlayState = model.PlayStatePlayed
-		case lastPlayedRaw.Valid &&
-			playStateSource.Int64 != 0 &&
-			playStateSource.Int64 != 2 &&
-			playStateSource.Int64 != 6 &&
-			(!playCount.Valid || playCount.Int64 == 0):
-			// ZLASTDATEPLAYED is set and ZPLAYSTATESOURCE carries a non-auto value
-			// (1=manual, 3=completion, 4=device-sync, or similar).
-			// This pattern occurs when an episode was played on another device (e.g.
-			// iPhone) and iCloud synced the play timestamp and source, but not
-			// ZPLAYSTATE or ZPLAYCOUNT.
-			// ZPLAYSTATESOURCE=0 (unset/default) is excluded: Apple also sets
-			// ZLASTDATEPLAYED for non-user events such as background downloads and
-			// iCloud metadata refreshes, leaving ZPLAYSTATESOURCE at 0.
-			// ZPLAYCOUNT>0 is also excluded here (handled by the source=3 case above):
-			// combined with a non-zero source other than 3, that residual count is
-			// indistinguishable from an episode the user listened to and then manually
-			// marked as unplayed (ZPLAYSTATE reset to 0, but count and source retained).
+		case lastPlayedRaw.Valid && playStateSource.Int64 == 4:
+			// ZPLAYSTATESOURCE=4 means "synced from another device". ZLASTDATEPLAYED
+			// being set confirms this is a genuine play event propagated from an iPhone
+			// or iPad. ZPLAYSTATE=0 here is the iCloud sync gap: Apple synced source,
+			// timestamp, and optionally ZPLAYCOUNT to the Mac but not ZPLAYSTATE.
+			// ZPLAYCOUNT may be 0 (only source+timestamp synced) or >0 (count also
+			// synced) — both indicate a real play event on the other device.
+			//
+			// Limiting to source=4 avoids false positives from other sources without a
+			// ZMTUPPMETADATA row:
+			//   source=1 (manual mark): if the user manually marked an episode as
+			//     played, Apple always sets ZPLAYSTATE=2 on the same device; if
+			//     ZPLAYSTATE is still 0 with no UPP row, the mark didn't complete.
+			//   source=3 (completion): handled by the iCloud sync gap case above, which
+			//     requires ZPLAYCOUNT>0 as corroboration. source=3 with ZPLAYCOUNT=0
+			//     and ZPLAYSTATE=0 is too ambiguous without a ZMTUPPMETADATA row.
+			//   source=9 and other unknown values: unknown semantics; skip.
 			ep.PlayState = model.PlayStatePlayed
 		default:
 			// No reliable evidence of genuine playback; skip this episode.

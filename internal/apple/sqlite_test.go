@@ -64,10 +64,21 @@ func setupSQLiteDB(t *testing.T) string {
 		ZPLAYSTATEMANUALLYSET       INTEGER DEFAULT 0,
 		ZLASTUSERMARKEDASPLAYEDDATE REAL,
 		ZPLAYSTATELASTMODIFIEDDATE  REAL,
-		ZSTORETRACKID               INTEGER
+		ZSTORETRACKID               INTEGER,
+		ZMETADATAIDENTIFIER         TEXT
 	)`)
 	if err != nil {
 		t.Fatalf("create ZMTEPISODE: %v", err)
+	}
+
+	_, err = db.Exec(`CREATE TABLE ZMTUPPMETADATA (
+		Z_PK                INTEGER PRIMARY KEY,
+		ZHASBEENPLAYED      INTEGER,
+		ZBOOKMARKTIME       REAL,
+		ZMETADATAIDENTIFIER TEXT
+	)`)
+	if err != nil {
+		t.Fatalf("create ZMTUPPMETADATA: %v", err)
 	}
 
 	insertPodcast := func(pk int, subscribed int, feedURL, title, author, imageURL interface{}) {
@@ -92,6 +103,18 @@ func setupSQLiteDB(t *testing.T) string {
 		)
 		if err != nil {
 			t.Fatalf("insert episode pk=%d: %v", pk, err)
+		}
+	}
+
+	insertUPP := func(pk int, metaID string, hasBeenPlayed int, bookmarkTime float64) {
+		t.Helper()
+		_, err := db.Exec(
+			`INSERT INTO ZMTUPPMETADATA (Z_PK, ZMETADATAIDENTIFIER, ZHASBEENPLAYED, ZBOOKMARKTIME)
+			 VALUES (?,?,?,?)`,
+			pk, metaID, hasBeenPlayed, bookmarkTime,
+		)
+		if err != nil {
+			t.Fatalf("insert UPP pk=%d: %v", pk, err)
 		}
 	}
 
@@ -169,18 +192,18 @@ func setupSQLiteDB(t *testing.T) string {
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 14`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep14: %v", err)
 	}
-	// ep15: iCloud-sync played — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0,
-	//       ZLASTDATEPLAYED set, ZPLAYSTATESOURCE=1 (user/manual action).
-	//       Pattern observed in real Apple Podcasts data for episodes played on an iPhone:
-	//       iCloud synced ZLASTDATEPLAYED and ZPLAYSTATESOURCE to the Mac but not
-	//       ZPLAYSTATE or ZPLAYCOUNT. The non-zero, non-auto ZPLAYSTATESOURCE is the
-	//       discriminator that distinguishes genuine playback from background sync events
-	//       (which leave ZPLAYSTATESOURCE at its default 0).
+	// ep15: KVS mirror (ZMTUPPMETADATA) played — ZPLAYSTATE=0 in ZMTEPISODE but
+	//       ZMTUPPMETADATA.ZHASBEENPLAYED=1. Simulates the common case where an episode
+	//       was played on another device and KVS synced the play state to the Mac's UPP
+	//       table, but ZPLAYSTATE in ZMTEPISODE was never updated (iCloud sync gap).
+	//       Apple Podcasts UI reads ZMTUPPMETADATA, so it shows this episode as played.
+	//       ZMTUPPMETADATA takes precedence over ZMTEPISODE heuristics.
 	//       Must be INCLUDED as PlayStatePlayed.
-	insertEpisode(15, 1, "rss-guid-15", "iCloud Sync Played", 686000000.0, 3600.0, 0, 0, 0.0, 686100000.0, "STDQ")
-	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 1 WHERE Z_PK = 15`); err != nil {
-		t.Fatalf("set ZPLAYSTATESOURCE for ep15: %v", err)
+	insertEpisode(15, 1, "rss-guid-15", "KVS Mirror Played", 686000000.0, 3600.0, 0, 0, 0.0, 686100000.0, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 1, ZMETADATAIDENTIFIER = 'meta-ep15' WHERE Z_PK = 15`); err != nil {
+		t.Fatalf("set fields for ep15: %v", err)
 	}
+	insertUPP(15, "meta-ep15", 1, 0.0)
 	// ep16: subscription back-catalog auto-mark — ZPLAYSTATE=2, ZPLAYSTATESOURCE=2,
 	//       ZLASTDATEPLAYED set (to subscription date), ZPLAYHEAD=0, ZPLAYCOUNT=0.
 	//       Apple marks premium podcast back-catalog as played on first subscription;
@@ -224,6 +247,37 @@ func setupSQLiteDB(t *testing.T) string {
 	insertEpisode(19, 1, "rss-guid-19", "Mobile Completion Sync Gap", 682000000.0, 3600.0, 0, 1, 0.0, 682100000.0, "STDQ")
 	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 3 WHERE Z_PK = 19`); err != nil {
 		t.Fatalf("set ZPLAYSTATESOURCE for ep19: %v", err)
+	}
+	// ep20: ZMTUPPMETADATA-only played — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0,
+	//       ZLASTDATEPLAYED=NULL in ZMTEPISODE (no play evidence at all in ZMTEPISODE),
+	//       but ZMTUPPMETADATA.ZHASBEENPLAYED=1. This tests that the extended WHERE
+	//       clause (OR u.ZHASBEENPLAYED = 1) picks up episodes that ZMTEPISODE would
+	//       entirely miss. Must be INCLUDED as PlayStatePlayed.
+	insertEpisode(20, 1, "rss-guid-20", "ZMTUPPMETADATA Only Played", 681000000.0, 1800.0, 0, 0, 0.0, nil, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZMETADATAIDENTIFIER = 'meta-ep20' WHERE Z_PK = 20`); err != nil {
+		t.Fatalf("set ZMETADATAIDENTIFIER for ep20: %v", err)
+	}
+	insertUPP(20, "meta-ep20", 1, 0.0)
+	// ep21: trustedPlayed BLOCKED by ZMTUPPMETADATA — ZPLAYSTATE=2, ZPLAYSTATESOURCE=1
+	//       in ZMTEPISODE, but ZMTUPPMETADATA.ZHASBEENPLAYED=0. The heuristic alone
+	//       (trustedPlayed) would classify this as played, but ZMTUPPMETADATA has a
+	//       row and says unplayed — so the episode must be EXCLUDED. This is the core
+	//       false-positive fix: ZMTUPPMETADATA overrides ZMTEPISODE.ZPLAYSTATE=2 when
+	//       Apple's KVS (the source of truth for the UI) disagrees.
+	insertEpisode(21, 1, "rss-guid-21", "trustedPlayed Blocked By KVS", 680000000.0, 1800.0, 2, 0, 0.0, nil, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 1, ZMETADATAIDENTIFIER = 'meta-ep21' WHERE Z_PK = 21`); err != nil {
+		t.Fatalf("set fields for ep21: %v", err)
+	}
+	insertUPP(21, "meta-ep21", 0, 0.0)
+	// ep22: device-sync with playcount — ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=1,
+	//       ZLASTDATEPLAYED set, ZPLAYSTATESOURCE=4 (synced from another device), NO
+	//       ZMTUPPMETADATA row. This tests the expanded case 6 heuristic: source=4
+	//       with lastPlayed set is a trusted device-sync event regardless of ZPLAYCOUNT.
+	//       In the real database, 2,129 episodes match this pattern and KVS confirms
+	//       all are played. Must be INCLUDED as PlayStatePlayed.
+	insertEpisode(22, 1, "rss-guid-22", "Device Sync With PlayCount", 679000000.0, 3600.0, 0, 1, 0.0, 679100000.0, "STDQ")
+	if _, err := db.Exec(`UPDATE ZMTEPISODE SET ZPLAYSTATESOURCE = 4 WHERE Z_PK = 22`); err != nil {
+		t.Fatalf("set ZPLAYSTATESOURCE for ep22: %v", err)
 	}
 
 	return path
@@ -456,15 +510,18 @@ func TestSQLiteReader_TotalEpisodeCount(t *testing.T) {
 	// ep9  (shadow played, ZPLAYCOUNT=1, source=0)                        → included
 	// ep13 (manually marked, ZPLAYSTATESOURCE=1)                          → included
 	// ep14 (null GUID, ZPLAYSTATE=2/played)                               → included (title+date matching)
-	// ep15 (iCloud-sync, ZLASTDATEPLAYED+ZPLAYSTATESOURCE=1, ZPLAYCOUNT=0) → included
+	// ep15 (ZMTUPPMETADATA ZHASBEENPLAYED=1)                              → included (KVS mirror)
+	// ep19 (source=3, ZPLAYCOUNT=1, ZLASTDATEPLAYED set — mobile sync gap) → included
+	// ep20 (ZMTUPPMETADATA-only — no ZMTEPISODE play evidence)            → included (KVS mirror)
+	// ep22 (source=4, ZPLAYCOUNT=1, ZLASTDATEPLAYED set)                  → included (device-sync heuristic)
 	// ep5  (null GUID, no play evidence)                                   → excluded (play evidence filter)
 	// ep10 (ZLASTDATEPLAYED only, ZPLAYSTATESOURCE=0/unset)               → excluded
-	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog)           → excluded
-	// ep17 (source=3 + no ZPLAYCOUNT + no ZLASTDATEPLAYED)                     → excluded (uncorroborated)
-	// ep18 (source=3, ZPLAYCOUNT=1, ZLASTDATEPLAYED=NULL — manually unplayed)  → excluded
-	// ep19 (source=3, ZPLAYCOUNT=1, ZLASTDATEPLAYED set — mobile sync gap)     → included
-	if len(lib.Episodes) != 10 {
-		t.Errorf("got %d episodes, want 10", len(lib.Episodes))
+	// ep16 (auto-mark source=2 + ZLASTDATEPLAYED, PLUS back-catalog)      → excluded
+	// ep17 (source=3 + no ZPLAYCOUNT + no ZLASTDATEPLAYED)                → excluded (uncorroborated)
+	// ep18 (source=3, ZPLAYCOUNT=1, ZLASTDATEPLAYED=NULL — manually unplayed) → excluded
+	// ep21 (ZPLAYSTATE=2 but ZMTUPPMETADATA ZHASBEENPLAYED=0)             → excluded (KVS overrides)
+	if len(lib.Episodes) != 12 {
+		t.Errorf("got %d episodes, want 12", len(lib.Episodes))
 	}
 }
 
@@ -560,20 +617,59 @@ func TestSQLiteReader_ManuallyMarkedPlayedIncluded(t *testing.T) {
 	}
 }
 
-func TestSQLiteReader_iCloudSyncPlayedIncluded(t *testing.T) {
-	// ep15: ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0, ZLASTDATEPLAYED set,
-	//       ZPLAYSTATESOURCE=1 (user/manual action, not the unset default 0).
-	// Matches the real-world pattern for "Serial – Nice White Parents" Ep. 2-4:
-	// played on iPhone, iCloud synced ZLASTDATEPLAYED and ZPLAYSTATESOURCE to Mac
-	// but ZPLAYSTATE and ZPLAYCOUNT were not updated. The non-auto ZPLAYSTATESOURCE
-	// distinguishes this from background-sync false-positives (ep10, ZPLAYSTATESOURCE=0).
+func TestSQLiteReader_KVSMirrorPlayedIncluded(t *testing.T) {
+	// ep15: ZPLAYSTATE=0 in ZMTEPISODE but ZMTUPPMETADATA.ZHASBEENPLAYED=1.
+	// The ZMTUPPMETADATA (local KVS mirror) takes precedence over ZMTEPISODE heuristics.
+	// Apple Podcasts UI reads play state from ZMTUPPMETADATA, so this episode IS shown
+	// as played in the UI despite ZMTEPISODE.ZPLAYSTATE=0.
 	lib := readLibrary(t, setupSQLiteDB(t))
 	ep := findEpisode(lib, "rss-guid-15")
 	if ep == nil {
-		t.Fatal("iCloud-sync played episode (rss-guid-15) not found — should be included")
+		t.Fatal("KVS-mirror played episode (rss-guid-15) not found — should be included")
 	}
 	if ep.PlayState != model.PlayStatePlayed {
 		t.Errorf("rss-guid-15 PlayState: got %d, want %d (Played)", ep.PlayState, model.PlayStatePlayed)
+	}
+}
+
+func TestSQLiteReader_KVSMirrorOnlyPlayedIncluded(t *testing.T) {
+	// ep20: NO play evidence in ZMTEPISODE (ZPLAYSTATE=0, ZPLAYHEAD=0, ZPLAYCOUNT=0,
+	//       ZLASTDATEPLAYED=NULL) but ZMTUPPMETADATA.ZHASBEENPLAYED=1.
+	// Tests that the WHERE clause extension (OR u.ZHASBEENPLAYED=1) picks up episodes
+	// that ZMTEPISODE would miss entirely.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	ep := findEpisode(lib, "rss-guid-20")
+	if ep == nil {
+		t.Fatal("ZMTUPPMETADATA-only played episode (rss-guid-20) not found — should be included")
+	}
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("rss-guid-20 PlayState: got %d, want %d (Played)", ep.PlayState, model.PlayStatePlayed)
+	}
+}
+
+func TestSQLiteReader_KVSMirrorUnplayedOverridesTrustedPlayed(t *testing.T) {
+	// ep21: ZPLAYSTATE=2, ZPLAYSTATESOURCE=1 in ZMTEPISODE (trustedPlayed would fire),
+	//       but ZMTUPPMETADATA.ZHASBEENPLAYED=0. KVS says not played; ZMTUPPMETADATA
+	//       takes precedence over ZMTEPISODE.ZPLAYSTATE. Must be EXCLUDED.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	if ep := findEpisode(lib, "rss-guid-21"); ep != nil {
+		t.Errorf("episode blocked by ZMTUPPMETADATA=0 should be excluded, got PlayState=%d", ep.PlayState)
+	}
+}
+
+func TestSQLiteReader_DeviceSyncWithPlayCountIncluded(t *testing.T) {
+	// ep22: ZPLAYSTATE=0, ZPLAYSTATESOURCE=4 (device-sync), ZPLAYCOUNT=1,
+	//       ZLASTDATEPLAYED set, no ZMTUPPMETADATA row.
+	// Tests the expanded case-6 heuristic: source=4 with ZLASTDATEPLAYED is a trusted
+	// device-sync event regardless of ZPLAYCOUNT. The real database has 2,129 episodes
+	// matching this exact pattern, all confirmed played by KVS.
+	lib := readLibrary(t, setupSQLiteDB(t))
+	ep := findEpisode(lib, "rss-guid-22")
+	if ep == nil {
+		t.Fatal("device-sync episode with playcount (rss-guid-22) not found — should be included")
+	}
+	if ep.PlayState != model.PlayStatePlayed {
+		t.Errorf("rss-guid-22 PlayState: got %d, want %d (Played)", ep.PlayState, model.PlayStatePlayed)
 	}
 }
 
@@ -684,7 +780,10 @@ func TestSQLiteReader_MissingDurationColumn(t *testing.T) {
 		ZPLAYSTATE INTEGER DEFAULT 0, ZPLAYCOUNT INTEGER DEFAULT 0,
 		ZPLAYHEAD REAL DEFAULT 0.0, ZLASTDATEPLAYED REAL,
 		ZPRICETYPE TEXT, ZPLAYSTATESOURCE INTEGER DEFAULT 0,
-		ZPLAYSTATELASTMODIFIEDDATE REAL)`)
+		ZPLAYSTATELASTMODIFIEDDATE REAL, ZMETADATAIDENTIFIER TEXT)`)
+	_, _ = db.Exec(`CREATE TABLE ZMTUPPMETADATA (
+		Z_PK INTEGER PRIMARY KEY, ZHASBEENPLAYED INTEGER,
+		ZBOOKMARKTIME REAL, ZMETADATAIDENTIFIER TEXT)`)
 	_, _ = db.Exec(`INSERT INTO ZMTPODCAST VALUES (1, 1, 'https://feeds.example.com/show-a', 'Show A', 'Author', NULL)`)
 	_, _ = db.Exec(`INSERT INTO ZMTEPISODE
 		(Z_PK, ZPODCAST, ZGUID, ZTITLE, ZPUBDATE, ZPLAYSTATE, ZPLAYSTATESOURCE, ZLASTDATEPLAYED)
@@ -757,7 +856,8 @@ func TestSQLiteReader_EpisodeFeedURL_CacheBusterStripped(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	_, _ = db.Exec(`CREATE TABLE ZMTPODCAST (Z_PK INTEGER PRIMARY KEY, ZSUBSCRIBED INTEGER, ZFEEDURL TEXT, ZTITLE TEXT, ZAUTHOR TEXT, ZIMAGEURL TEXT)`)
-	_, _ = db.Exec(`CREATE TABLE ZMTEPISODE (Z_PK INTEGER PRIMARY KEY, Z_OPT INTEGER NOT NULL DEFAULT 1, ZPODCAST INTEGER, ZGUID TEXT, ZTITLE TEXT, ZPUBDATE REAL, ZDURATION REAL, ZPLAYSTATE INTEGER DEFAULT 0, ZPLAYCOUNT INTEGER DEFAULT 0, ZPLAYHEAD REAL DEFAULT 0.0, ZLASTDATEPLAYED REAL, ZPRICETYPE TEXT, ZUNPLAYEDTAB INTEGER DEFAULT 0, ZPLAYSTATESOURCE INTEGER DEFAULT 0, ZPLAYSTATEMANUALLYSET INTEGER DEFAULT 0, ZLASTUSERMARKEDASPLAYEDDATE REAL, ZPLAYSTATELASTMODIFIEDDATE REAL, ZSTORETRACKID INTEGER)`)
+	_, _ = db.Exec(`CREATE TABLE ZMTEPISODE (Z_PK INTEGER PRIMARY KEY, Z_OPT INTEGER NOT NULL DEFAULT 1, ZPODCAST INTEGER, ZGUID TEXT, ZTITLE TEXT, ZPUBDATE REAL, ZDURATION REAL, ZPLAYSTATE INTEGER DEFAULT 0, ZPLAYCOUNT INTEGER DEFAULT 0, ZPLAYHEAD REAL DEFAULT 0.0, ZLASTDATEPLAYED REAL, ZPRICETYPE TEXT, ZUNPLAYEDTAB INTEGER DEFAULT 0, ZPLAYSTATESOURCE INTEGER DEFAULT 0, ZPLAYSTATEMANUALLYSET INTEGER DEFAULT 0, ZLASTUSERMARKEDASPLAYEDDATE REAL, ZPLAYSTATELASTMODIFIEDDATE REAL, ZSTORETRACKID INTEGER, ZMETADATAIDENTIFIER TEXT)`)
+	_, _ = db.Exec(`CREATE TABLE ZMTUPPMETADATA (Z_PK INTEGER PRIMARY KEY, ZHASBEENPLAYED INTEGER, ZBOOKMARKTIME REAL, ZMETADATAIDENTIFIER TEXT)`)
 	// Insert podcast with a ?t= cache-buster in the feed URL.
 	_, _ = db.Exec(`INSERT INTO ZMTPODCAST VALUES (1, 1, 'https://podcast.example.com/feed.xml?t=1749316800000', 'Cache Buster Show', 'Author', NULL)`)
 	// Insert an in-progress episode linked to that podcast.

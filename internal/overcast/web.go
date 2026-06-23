@@ -10,6 +10,7 @@ package overcast
 //   GET  https://overcast.fm/podcasts              — list subscribed podcasts (page paths)
 //   GET  https://overcast.fm/itunes{id}/{slug}     — podcast episode listing
 //   POST https://overcast.fm/login                 — authenticate, get session cookie
+//   POST https://overcast.fm/podcasts/add/{id}     — subscribe to a podcast by Overcast ID
 //   GET  https://overcast.fm/+{hash}               — episode player page (contains data-item-id)
 //   POST https://overcast.fm/podcasts/set_progress/{numericId} — update position
 
@@ -290,36 +291,45 @@ func bodyExcerpt(b []byte) string {
 
 // ---- Extended matching: scrape podcast/episode pages for numeric IDs ----
 
-// SearchPodcastITunesID calls the Overcast search autocomplete JSON endpoint and
-// returns the iTunes ID for the podcast identified by title and/or overcastID.
+// PodcastSearchResult holds the result of a successful search_autocomplete lookup.
+type PodcastSearchResult struct {
+	OvercastID string // Overcast's internal podcast ID (used with /podcasts/add/{id})
+	ITunesID   string // Apple iTunes store ID (used to build the /itunes{id} page URL)
+	Title      string // podcast title as returned by Overcast search
+}
+
+// SearchPodcast calls the Overcast search autocomplete JSON endpoint and returns
+// the best matching podcast result. The overcastID parameter (from the Overcast
+// OPML) is used as a tiebreaker when non-empty.
 //
 // Matching priority:
 //  1. Overcast podcast ID exact match (overcastID field from the OPML)
 //  2. Case-insensitive exact title match
+//  3. Plus-normalised title match ("Fresh Air Plus" == "Fresh Air")
 //
-// Returns "" (no error) when the podcast is not found in the search results.
+// Returns a zero-value result (no error) when not found.
 // Returns *RateLimitError when the server responds with HTTP 429.
 // The client must be authenticated (obtained from Login).
-func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, overcastID string) (string, error) {
+func SearchPodcast(ctx context.Context, client *http.Client, title, overcastID string) (PodcastSearchResult, error) {
 	endpoint := overcastBaseURL + "/podcasts/search_autocomplete?q=" + url.QueryEscape(title)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", fmt.Errorf("overcast/web: build search request: %w", err)
+		return PodcastSearchResult{}, fmt.Errorf("overcast/web: build search request: %w", err)
 	}
 	req.Header.Set("User-Agent", overcastUA)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("overcast/web: GET search: %w", err)
+		return PodcastSearchResult{}, fmt.Errorf("overcast/web: GET search: %w", err)
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return "", &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
+		return PodcastSearchResult{}, &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("overcast/web: search returned HTTP %d", resp.StatusCode)
+		return PodcastSearchResult{}, fmt.Errorf("overcast/web: search returned HTTP %d", resp.StatusCode)
 	}
 
 	var payload struct {
@@ -330,14 +340,14 @@ func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, over
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", fmt.Errorf("overcast/web: parse search response: %w", err)
+		return PodcastSearchResult{}, fmt.Errorf("overcast/web: parse search response: %w", err)
 	}
 
 	// Prefer matching by Overcast podcast ID (unambiguous).
 	if overcastID != "" {
 		for _, r := range payload.Results {
 			if r.ID == overcastID {
-				return r.ITunesID, nil
+				return PodcastSearchResult{OvercastID: r.ID, ITunesID: r.ITunesID, Title: r.Title}, nil
 			}
 		}
 	}
@@ -346,7 +356,7 @@ func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, over
 	titleNorm := strings.ToLower(strings.TrimSpace(title))
 	for _, r := range payload.Results {
 		if strings.ToLower(strings.TrimSpace(r.Title)) == titleNorm {
-			return r.ITunesID, nil
+			return PodcastSearchResult{OvercastID: r.ID, ITunesID: r.ITunesID, Title: r.Title}, nil
 		}
 	}
 
@@ -358,12 +368,53 @@ func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, over
 	if baseTitleNorm != titleNorm {
 		for _, r := range payload.Results {
 			if model.NormalizePlusTitle(r.Title) == baseTitleNorm {
-				return r.ITunesID, nil
+				return PodcastSearchResult{OvercastID: r.ID, ITunesID: r.ITunesID, Title: r.Title}, nil
 			}
 		}
 	}
 
-	return "", nil // not found
+	return PodcastSearchResult{}, nil // not found
+}
+
+// SearchPodcastITunesID is a convenience wrapper around SearchPodcast that
+// returns only the iTunes ID, preserving the original call signature.
+func SearchPodcastITunesID(ctx context.Context, client *http.Client, title, overcastID string) (string, error) {
+	r, err := SearchPodcast(ctx, client, title, overcastID)
+	return r.ITunesID, err
+}
+
+// AddPodcast subscribes to a podcast by POSTing directly to the Overcast add
+// endpoint using the podcast's Overcast internal ID. This bypasses the podcast
+// listing page entirely, avoiding the website's caching bug where unsubscribed
+// podcasts can show a Delete button instead of an Add button.
+//
+// The call is effectively idempotent: re-subscribing an already-subscribed
+// podcast is harmless. The client must be authenticated (obtained from Login).
+func AddPodcast(ctx context.Context, client *http.Client, overcastID string) error {
+	addURL := overcastBaseURL + "/podcasts/add/" + overcastID
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, addURL,
+		strings.NewReader(""))
+	if err != nil {
+		return fmt.Errorf("overcast/web: build add request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", overcastUA)
+	req.Header.Set("Referer", overcastBaseURL+"/podcasts")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("overcast/web: POST %s: %w", addURL, err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("overcast/web: add podcast %s returned HTTP %d", overcastID, resp.StatusCode)
+	}
+	return nil
 }
 
 // SubscribedPodcast holds the page URL and title of one podcast from /podcasts.

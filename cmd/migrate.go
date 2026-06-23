@@ -174,6 +174,15 @@ func migrateCmd() *cobra.Command {
 				}
 			}
 
+			// When Apple is the source and KVS credentials are available, read play
+			// state from the live KVS server (getAll(com.apple.upp)) instead of the
+			// local ZMTUPPMETADATA cache, for more authoritative results.
+			if ap, ok := src.(*apple.Provider); ok {
+				if err := ap.EnableLiveKVSRead(); err != nil {
+					fmt.Fprintf(os.Stderr, "apple: KVS read unavailable (%v) — using local SQLite\n", err)
+				}
+			}
+
 			// --pc-include-unsubscribed: include play history for podcasts the user is
 			// no longer subscribed to in Pocket Casts (off by default).
 			if pcIncludeUnsubscribed {

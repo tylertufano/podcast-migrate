@@ -28,8 +28,10 @@ func DefaultSQLitePath() string {
 // SQLiteReader reads subscriptions and episode states from the Apple Podcasts
 // local SQLite database (MTLibrary.sqlite).
 type SQLiteReader struct {
-	dbPath    string
-	sinceTime time.Time // when set, only episodes modified after this time are returned
+	dbPath           string
+	sinceTime        time.Time             // when set, only episodes modified after this time are returned
+	liveKVSRawValues map[string][]byte     // metadataID → DEFLATE-compressed plist (from live getAll(com.apple.upp))
+	liveKVSDecoded   map[string]kvsServerState // lazily decoded from liveKVSRawValues
 }
 
 func NewSQLiteReader(dbPath string) *SQLiteReader {
@@ -40,6 +42,32 @@ func NewSQLiteReader(dbPath string) *SQLiteReader {
 // ZPLAYSTATELASTMODIFIEDDATE is after t. Episodes with no recorded modification
 // date are excluded. A zero t disables the filter (default).
 func (r *SQLiteReader) SetSinceTime(t time.Time) { r.sinceTime = t }
+
+// SetLiveKVSValues provides raw DEFLATE-compressed plist bytes from a live
+// getAll(com.apple.upp) response, keyed by metadataIdentifier. When set, the
+// reader uses this server-side play state in place of local ZMTUPPMETADATA for
+// any episode that has a ZMETADATAIDENTIFIER. Episodes not present in the map
+// fall through to ZMTEPISODE heuristics unchanged.
+func (r *SQLiteReader) SetLiveKVSValues(rawValues map[string][]byte) {
+	r.liveKVSRawValues = rawValues
+	r.liveKVSDecoded = make(map[string]kvsServerState)
+}
+
+func (r *SQLiteReader) lookupLiveKVS(ctx context.Context, metaID string) (kvsServerState, bool) {
+	if state, ok := r.liveKVSDecoded[metaID]; ok {
+		return state, true
+	}
+	raw, ok := r.liveKVSRawValues[metaID]
+	if !ok {
+		return kvsServerState{}, false
+	}
+	state, err := decodeServerValue(ctx, raw)
+	if err != nil {
+		return kvsServerState{}, false
+	}
+	r.liveKVSDecoded[metaID] = state
+	return state, true
+}
 
 func (r *SQLiteReader) Read(ctx context.Context) (*model.Library, error) {
 	db, err := sql.Open("sqlite", "file:"+r.dbPath+"?mode=ro&_journal=off")
@@ -251,7 +279,8 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			e.ZPLAYCOUNT,
 			e.ZPLAYSTATESOURCE,
 			u.ZHASBEENPLAYED,
-			u.ZBOOKMARKTIME
+			u.ZBOOKMARKTIME,
+			e.ZMETADATAIDENTIFIER
 		FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
 		LEFT JOIN ZMTUPPMETADATA u ON u.ZMETADATAIDENTIFIER = e.ZMETADATAIDENTIFIER
@@ -271,6 +300,10 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 	}
 	defer rows.Close()
 
+	// seenMetaIDs tracks ZMETADATAIDENTIFIER values returned by the main query.
+	// Used by the live KVS second pass to avoid re-processing episodes.
+	seenMetaIDs := make(map[string]bool)
+
 	var out []model.EpisodeState
 	for rows.Next() {
 		var (
@@ -286,6 +319,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			playStateSource   sql.NullInt64
 			uppHasBeenPlayed  sql.NullInt64
 			uppBookmarkTime   sql.NullFloat64
+			metadataID        sql.NullString
 		)
 		if err := rows.Scan(
 			&guid, &feedURL, &title,
@@ -294,8 +328,12 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			&playState, &playCount,
 			&playStateSource,
 			&uppHasBeenPlayed, &uppBookmarkTime,
+			&metadataID,
 		); err != nil {
 			return nil, 0, fmt.Errorf("apple/sqlite: scan episode: %w", err)
+		}
+		if metadataID.Valid && metadataID.String != "" {
+			seenMetaIDs[metadataID.String] = true
 		}
 
 		ep := model.EpisodeState{
@@ -315,19 +353,40 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		if durationSec.Valid && durationSec.Float64 > 0 {
 			ep.Duration = time.Duration(durationSec.Float64 * float64(time.Second))
 		}
-		// ZMTUPPMETADATA-first: if a UPP row exists, it is the authoritative play state
-		// (Apple Podcasts UI reads from it, not from ZMTEPISODE.ZPLAYSTATE). ZHASBEENPLAYED
-		// is never NULL when a row exists, so uppHasBeenPlayed.Valid is a reliable
-		// row-existence sentinel. ZBOOKMARKTIME stores the playback position in seconds —
-		// the same unit as ZMTEPISODE.ZPLAYHEAD.
-		if uppHasBeenPlayed.Valid {
+		// Phase 1: KVS play state — live server if available, local ZMTUPPMETADATA otherwise.
+		// Both sources use the same three-outcome logic: played, in-progress, or skip.
+		// Apple Podcasts reads play state from ZMTUPPMETADATA for its UI, not from
+		// ZMTEPISODE.ZPLAYSTATE, so either source is more authoritative than ZMTEPISODE.
+		if r.liveKVSRawValues != nil && metadataID.Valid && metadataID.String != "" {
+			// Live KVS: look up the server-side play state by metadataIdentifier.
+			// Not present in the map means KVS has no play record → fall through to
+			// ZMTEPISODE heuristics (same as no ZMTUPPMETADATA row).
+			if state, ok := r.lookupLiveKVS(ctx, metadataID.String); ok {
+				if state.HasBeenPlayed {
+					ep.PlayState = model.PlayStatePlayed
+				} else if state.BookmarkTimeSec > 0 {
+					ep.PlayState = model.PlayStateInProgress
+					ep.PlayPosition = time.Duration(state.BookmarkTimeSec * float64(time.Second))
+				} else {
+					continue // live KVS says unplayed — skip (overrides ZMTEPISODE)
+				}
+				if lastPlayedRaw.Valid {
+					ep.LastPlayed = coreDataEpoch.Add(time.Duration(lastPlayedRaw.Float64 * float64(time.Second)))
+				}
+				out = append(out, ep)
+				continue
+			}
+		} else if uppHasBeenPlayed.Valid {
+			// Local ZMTUPPMETADATA: used when live KVS is unavailable. ZHASBEENPLAYED
+			// is never NULL when a row exists, so uppHasBeenPlayed.Valid is a reliable
+			// row-existence sentinel. ZBOOKMARKTIME stores position in seconds.
 			if uppHasBeenPlayed.Int64 == 1 {
 				ep.PlayState = model.PlayStatePlayed
 			} else if uppBookmarkTime.Valid && uppBookmarkTime.Float64 > 0 {
 				ep.PlayState = model.PlayStateInProgress
 				ep.PlayPosition = time.Duration(uppBookmarkTime.Float64 * float64(time.Second))
 			} else {
-				continue // UPP row says unplayed — skip (higher authority than ZMTEPISODE)
+				continue // local ZMTUPPMETADATA says unplayed — skip (overrides ZMTEPISODE)
 			}
 			if lastPlayedRaw.Valid {
 				ep.LastPlayed = coreDataEpoch.Add(time.Duration(lastPlayedRaw.Float64 * float64(time.Second)))
@@ -428,6 +487,72 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
+	}
+
+	// Second pass: when live KVS is active, pick up episodes that are played per
+	// the server but were not returned by the main query (no local play evidence
+	// in ZMTEPISODE or ZMTUPPMETADATA). Skipped when --since is set because delta
+	// sync is about recently-modified episodes and the live KVS carries no
+	// per-episode modification timestamp to filter on.
+	if r.liveKVSRawValues != nil && r.sinceTime.IsZero() {
+		epQuery := `
+			SELECT e.ZGUID, p.ZFEEDURL, e.ZTITLE, e.ZPUBDATE, ` + durationExpr + `, e.ZLASTDATEPLAYED
+			FROM ZMTEPISODE e
+			JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
+			WHERE e.ZMETADATAIDENTIFIER = ?
+			  AND (e.ZGUID IS NOT NULL OR (e.ZTITLE IS NOT NULL AND e.ZPUBDATE IS NOT NULL))
+			  AND p.ZSUBSCRIBED = 1
+			  AND p.ZFEEDURL IS NOT NULL
+			  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
+			  AND p.ZFEEDURL NOT LIKE 'internal://%'
+			LIMIT 1`
+		stmt, stmtErr := db.PrepareContext(ctx, epQuery)
+		if stmtErr == nil {
+			defer stmt.Close()
+			for metaID, raw := range r.liveKVSRawValues {
+				if seenMetaIDs[metaID] {
+					continue
+				}
+				state, err := decodeServerValue(ctx, raw)
+				if err != nil || (!state.HasBeenPlayed && state.BookmarkTimeSec <= 0) {
+					continue
+				}
+				var (
+					guid          sql.NullString
+					feedURL       string
+					title         string
+					pubDateRaw    sql.NullFloat64
+					durSec        sql.NullFloat64
+					lastPlayedRaw sql.NullFloat64
+				)
+				if err := stmt.QueryRowContext(ctx, metaID).Scan(
+					&guid, &feedURL, &title, &pubDateRaw, &durSec, &lastPlayedRaw,
+				); err != nil {
+					continue
+				}
+				ep := model.EpisodeState{
+					GUID:    guid.String,
+					FeedURL: cleanFeedURL(feedURL),
+					Title:   title,
+				}
+				if pubDateRaw.Valid {
+					ep.PubDate = coreDataEpoch.Add(time.Duration(pubDateRaw.Float64 * float64(time.Second)))
+				}
+				if durSec.Valid && durSec.Float64 > 0 {
+					ep.Duration = time.Duration(durSec.Float64 * float64(time.Second))
+				}
+				if state.HasBeenPlayed {
+					ep.PlayState = model.PlayStatePlayed
+				} else {
+					ep.PlayState = model.PlayStateInProgress
+					ep.PlayPosition = time.Duration(state.BookmarkTimeSec * float64(time.Second))
+				}
+				if lastPlayedRaw.Valid {
+					ep.LastPlayed = coreDataEpoch.Add(time.Duration(lastPlayedRaw.Float64 * float64(time.Second)))
+				}
+				out = append(out, ep)
+			}
+		}
 	}
 
 	// Count PSUB/PLUS episodes that are included in the main query (i.e. on

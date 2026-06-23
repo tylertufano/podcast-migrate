@@ -244,14 +244,17 @@ Key tables: `ZMTPODCAST`, `ZMTEPISODE`, `ZMTUPPMETADATA`. CoreData epoch: **2001
 | `ZLASTDATEPLAYED` | Set on completion or iCloud sync |
 | `ZPLAYCOUNT` | Total play count (cross-device) |
 | `ZPRICETYPE` | `PSUB` or `PLUS` for Apple Podcasts Subscription episodes |
+| `ZMETADATAIDENTIFIER` | KVS key — hex string that links this episode to its `ZMTUPPMETADATA` row |
 
 **macOS 27+:** `ZDURATION` was removed from `ZMTEPISODE`. The reader probes for its existence at runtime and falls back to `NULL` gracefully.
 
 ### `ZMTUPPMETADATA`
 
-Stores UPP (User Play Progress) metadata — the local mirror of Apple's KVS sync store (`bookkeeper.itunes.apple.com`). Apple Podcasts reads play state from this table for its UI; `ZMTEPISODE.ZPLAYSTATE` can lag behind when device sync has not yet propagated changes back to the Mac.
+Stores UPP (User Play Progress) metadata — the local mirror of Apple's KVS sync store (`bookkeeper.itunes.apple.com`). Apple Podcasts reads play state from this table for its UI, not from `ZMTEPISODE.ZPLAYSTATE`.
 
-`SQLiteReader` uses `ZMTUPPMETADATA` as the **primary** play state source: when a row exists for an episode (keyed on `ZMETADATAIDENTIFIER`), `ZHASBEENPLAYED` and `ZBOOKMARKTIME` take precedence over all `ZMTEPISODE` heuristics. This eliminates false positives where `ZPLAYSTATE=2` locally but KVS says unplayed, and recovers thousands of plays that only KVS knows about.
+The two tables are updated through independent write paths, so they can permanently disagree even on a fully synced device: episodes played via one code path may only update one table. About 22% of interacted-with episodes have a `ZMTUPPMETADATA` row; for the remaining ~78%, the row is simply absent and `ZMTEPISODE` heuristics are the only source.
+
+`SQLiteReader` uses `ZMTUPPMETADATA` as the **primary** play state source: when a row exists for an episode (keyed on `ZMETADATAIDENTIFIER`), `ZHASBEENPLAYED` and `ZBOOKMARKTIME` take precedence over all `ZMTEPISODE` heuristics. This eliminates false positives where `ZPLAYSTATE=2` but KVS says unplayed, and recovers plays that only KVS recorded.
 
 `KVSWriter` uses `ZMTUPPMETADATA` to look up episode identifiers for private-feed write paths.
 

@@ -32,20 +32,35 @@ nav_order: 5
 
 Apple adds cache-buster `?t=` query parameters to stored feed URLs. These are stripped before the URL is returned so they don't break feed matching in other apps.
 
-**Episode query** (`ZMTEPISODE`): episodes with any evidence of prior listening:
+**Episode query** (`ZMTEPISODE` LEFT JOIN `ZMTUPPMETADATA`): all episodes with any evidence of prior listening, including episodes whose only play record is in the KVS mirror:
 
 ```sql
-WHERE (ZPLAYSTATE != 0 OR ZPLAYHEAD > 0 OR ZPLAYCOUNT > 0 OR ZLASTDATEPLAYED IS NOT NULL)
+LEFT JOIN ZMTUPPMETADATA u ON u.ZMETADATAIDENTIFIER = e.ZMETADATAIDENTIFIER
+WHERE (ZPLAYSTATE != 0 OR ZPLAYHEAD > 0 OR ZPLAYCOUNT > 0 OR ZLASTDATEPLAYED IS NOT NULL
+       OR u.ZHASBEENPLAYED = 1 OR u.ZBOOKMARKTIME > 0)
 ```
 
-**Play state determination** (in priority order):
+**Play state determination — Phase 1: `ZMTUPPMETADATA` (primary)**
+
+`ZMTUPPMETADATA` is the authoritative source when a row exists for an episode. Apple Podcasts reads play state from this table for its UI, not from `ZMTEPISODE.ZPLAYSTATE`. The two tables are updated through independent write paths and can permanently disagree even on a fully synced device — about 22% of interacted-with episodes have a `ZMTUPPMETADATA` row. `ZHASBEENPLAYED` is never NULL when a row exists, so its validity serves as a reliable row-existence sentinel.
+
+| Condition | Result |
+|---|---|
+| Row exists AND `ZHASBEENPLAYED = 1` | `PlayStatePlayed` |
+| Row exists AND `ZBOOKMARKTIME > 0` | `PlayStateInProgress` with the stored position |
+| Row exists AND `ZHASBEENPLAYED = 0` AND `ZBOOKMARKTIME = 0` | **skip** — KVS says unplayed; overrides `ZMTEPISODE` regardless of `ZPLAYSTATE` |
+| No row | Fall through to Phase 2 |
+
+**Play state determination — Phase 2: `ZMTEPISODE` heuristics (fallback)**
+
+For episodes with no `ZMTUPPMETADATA` row, play state is inferred from `ZMTEPISODE` fields in priority order:
 
 1. `ZPLAYHEAD > 0` → `PlayStateInProgress` with the stored position
-2. `ZPLAYSTATE = 2` AND trusted (not auto-marked) → `PlayStatePlayed`
+2. `ZPLAYSTATE = 2` AND trusted source → `PlayStatePlayed`
 3. `ZPLAYSTATE = 1` with no playhead → `PlayStatePlayed` (started, no position stored)
 4. `ZPLAYCOUNT > 0` AND `ZPLAYSTATESOURCE = 0` → `PlayStatePlayed` (iCloud synced count without state)
-5. `ZLASTDATEPLAYED` SET AND `ZPLAYSTATESOURCE = 3` AND `ZPLAYCOUNT > 0` → `PlayStatePlayed` (iCloud sync gap: listened to completion on a mobile device; completion flag did not sync back to Mac but count and timestamp did — see below)
-6. `ZLASTDATEPLAYED` SET AND `ZPLAYSTATESOURCE` is a non-auto value (1, 3, or 4) AND `ZPLAYCOUNT = 0` → `PlayStatePlayed` (played on another device, only timestamp synced)
+5. `ZLASTDATEPLAYED` SET AND `ZPLAYSTATESOURCE = 3` AND `ZPLAYCOUNT > 0` → `PlayStatePlayed` (completion on mobile device; completion flag did not sync back to Mac but count and timestamp did — see below)
+6. `ZLASTDATEPLAYED` SET AND `ZPLAYSTATESOURCE = 4` → `PlayStatePlayed` (synced from another device; `ZPLAYCOUNT` may be 0 or >0 depending on how much iCloud propagated — both indicate a genuine play event)
 7. Otherwise: **skip** (no reliable evidence of genuine playback)
 
 **Trust logic for `ZPLAYSTATESOURCE`:**
@@ -55,13 +70,23 @@ WHERE (ZPLAYSTATE != 0 OR ZPLAYHEAD > 0 OR ZPLAYCOUNT > 0 OR ZLASTDATEPLAYED IS 
 | 1 | Manually marked by user in UI | ✓ Always |
 | 2 | Auto-marked when a newer episode arrived | ✗ Never |
 | 3 | Listened to completion | ✓ Only when `ZPLAYCOUNT > 0` AND `ZLASTDATEPLAYED` is set (case 5) |
-| 4 | Synced from another device | ✓ Always |
+| 4 | Synced from another device | ✓ When `ZLASTDATEPLAYED` is set (case 6) |
 | 6 | Default/initial (also bulk auto-marks) | ✗ Never |
 | 0 | Unset | Conditional (see cases 4 and 6 above) |
 
 Source 3 is conditional because Apple Podcasts Subscription (PSUB/PLUS) back-catalog auto-marks also use source=3 with no play count or date — identical to a genuine completion.
 
-**iCloud sync gap (case 5)**: When an episode is listened to completion on iPhone or iPad, the mobile device records the event (incrementing `ZPLAYCOUNT` and setting `ZLASTDATEPLAYED`) but `ZPLAYSTATE` often remains `0` on the Mac because iCloud does not always propagate the completion flag. Apple also clears `ZLASTDATEPLAYED` when the user manually marks an episode as unplayed (while retaining `ZPLAYCOUNT` and `ZPLAYSTATESOURCE=3`). Requiring `ZLASTDATEPLAYED` to be set makes "completed but not synced" (date present) reliably distinguishable from "completed then manually unplayed" (date cleared). This gap affects a large fraction of episodes played on mobile.
+Source 4 is trusted when `ZLASTDATEPLAYED` is set because that timestamp confirms a real play event was propagated from another device. `ZPLAYCOUNT` being 0 vs. >0 reflects how much data iCloud propagated, not whether the play actually happened.
+
+**iCloud sync gap (case 5)**: When an episode is listened to completion on iPhone or iPad, the mobile device records the event (incrementing `ZPLAYCOUNT` and setting `ZLASTDATEPLAYED`) but `ZPLAYSTATE` often remains `0` on the Mac because iCloud does not always propagate the completion flag. Apple also clears `ZLASTDATEPLAYED` when the user manually marks an episode as unplayed (while retaining `ZPLAYCOUNT` and `ZPLAYSTATESOURCE=3`). Requiring `ZLASTDATEPLAYED` to be set makes "completed but not synced" (date present) reliably distinguishable from "completed then manually unplayed" (date cleared).
+
+**Live KVS read** (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`): when KVS credentials are set and Apple Podcasts is the migration source, the reader calls `getAll(com.apple.upp)` on `bookkeeper.itunes.apple.com` and uses the server-side play state instead of the local `ZMTUPPMETADATA` cache. This gives a more authoritative result when the Mac SQLite database is stale (e.g. the Mac was not opened between a play event and the migration run).
+
+The live KVS read has two phases:
+1. **Main query** (same as without live KVS) — episodes with local play evidence. For each episode that has a `ZMETADATAIDENTIFIER`, the server-side `HasBeenPlayed` / `BookmarkTimeSec` overrides local `ZMTUPPMETADATA`. Episodes not present in the live KVS response fall through to `ZMTEPISODE` heuristics.
+2. **Second pass** — for metadataIdentifiers in the live KVS that were not returned by the main query (no local play evidence at all), `ZMTEPISODE` is queried individually to fetch episode metadata. This picks up plays that exist only on the server and have not yet propagated to the local SQLite cache.
+
+The second pass is skipped when `--since` is active, since delta sync is scoped to recently-modified episodes and the live KVS carries no per-episode modification timestamp.
 
 **Delta sync** (`--since`): filters by three timestamp columns:
 - `ZPLAYSTATELASTMODIFIEDDATE` — updated on state transitions

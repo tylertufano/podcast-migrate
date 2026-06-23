@@ -31,6 +31,7 @@ type Provider struct {
 	opmlPath   string // optional fallback; empty disables it
 	webAPI     *WebAPIWriter
 	kvsOnly    *KVSWriter // set when using KVS without web API (KVS-only mode)
+	kvsReader  *KVSWriter // set by EnableLiveKVSRead; used for reading only
 	sinceTime  time.Time  // when set, only episodes modified after this time are read
 }
 
@@ -88,6 +89,25 @@ func (p *Provider) SetKVSOnlyMode() error {
 	return nil
 }
 
+// EnableLiveKVSRead activates live KVS reading for GetLibrary: instead of
+// using local ZMTUPPMETADATA rows, GetLibrary will call getAll(com.apple.upp)
+// and use the server-side play state for each episode. This gives a more
+// authoritative result when the Mac SQLite cache is stale.
+//
+// Returns nil without doing anything when APPLE_KVS_COOKIES is unset.
+// Returns an error if credentials are present but invalid.
+func (p *Provider) EnableLiveKVSRead() error {
+	if os.Getenv("APPLE_KVS_COOKIES") == "" {
+		return nil
+	}
+	kvs, err := NewKVSWriter(p.sqlitePath)
+	if err != nil {
+		return err
+	}
+	p.kvsReader = kvs
+	return nil
+}
+
 func (p *Provider) Name() string { return "Apple Podcasts" }
 
 func (p *Provider) Capabilities() provider.Capabilities {
@@ -111,6 +131,15 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 				r.SetSinceTime(p.sinceTime)
 				fmt.Printf("apple: delta mode — reading episodes modified since %s\n",
 					p.sinceTime.Local().Format("2006-01-02 15:04:05"))
+			}
+			if p.kvsReader != nil {
+				if sessErr := p.kvsReader.initSession(ctx); sessErr == nil {
+					r.SetLiveKVSValues(p.kvsReader.serverRawValues)
+					fmt.Printf("apple: live KVS play state active (DSID %s) — %d episode records from server\n",
+						p.kvsReader.dsid, len(p.kvsReader.serverRawValues))
+				} else {
+					fmt.Fprintf(os.Stderr, "apple: live KVS read failed (%v) — using local ZMTUPPMETADATA\n", sessErr)
+				}
 			}
 			lib, err := r.Read(ctx)
 			if err == nil {

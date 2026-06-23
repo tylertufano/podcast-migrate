@@ -705,33 +705,33 @@ func augmentIndexFromPodcastPages(
 		// Fall back to search_autocomplete, subscribe, then add to page-fetch list.
 		// Use the overcastID from the OPML as a hint to verify the search result
 		// (empty string is fine — search will fall back to title matching).
-		overcastID := ""
+		hintOvercastID := ""
 		if info, ok := opmlByNormFeed[normFeed]; ok {
-			overcastID = info.overcastID
+			hintOvercastID = info.overcastID
 		} else if info, ok := opmlByTitle[appleTitle]; ok {
-			overcastID = info.overcastID
+			hintOvercastID = info.overcastID
 		}
 
-		iTunesID, err := searchPodcastITunesIDWithRetry(ctx, client, appleTitle, overcastID, requestDelay)
+		searchResult, err := searchPodcastWithRetry(ctx, client, appleTitle, hintOvercastID, requestDelay)
 		if err != nil {
 			fmt.Printf("  warning: search failed for %q: %v\n", appleTitle, err)
 			skippedFeeds++
 			continue
 		}
-		if iTunesID == "" {
+		if searchResult.ITunesID == "" {
 			fmt.Printf("  warning: %q not found in Overcast search\n", appleTitle)
 			skippedFeeds++
 			continue
 		}
-		pageURL := overcastBaseURL + "/itunes" + iTunesID
+		pageURL := overcastBaseURL + "/itunes" + searchResult.ITunesID
 		time.Sleep(requestDelay)
 
 		// Step C: subscribe before writing play state — Overcast discards set_progress
-		// calls for podcasts the account is not subscribed to. SubscribeToPodcast is
-		// idempotent: it returns nil immediately when the podcast is already subscribed
-		// (unsubscribe form detected on the page).
+		// calls for podcasts the account is not subscribed to. AddPodcast posts
+		// directly to /podcasts/add/{overcastID}, bypassing the podcast listing page
+		// and its caching bug (stale Delete button on unsubscribed podcasts).
 		fmt.Printf("  subscribing to %q...\n", appleTitle)
-		if err := SubscribeToPodcast(ctx, client, pageURL); err != nil {
+		if err := AddPodcast(ctx, client, searchResult.OvercastID); err != nil {
 			fmt.Printf("  warning: could not subscribe to %q: %v — play state may not persist\n",
 				appleTitle, err)
 		} else {
@@ -1269,16 +1269,16 @@ func buildOvercastIndex(lib *model.Library) map[string]overcastIndexEntry {
 	return index
 }
 
-// searchPodcastITunesIDWithRetry calls SearchPodcastITunesID with a single 429 retry.
+// searchPodcastWithRetry calls SearchPodcast with a single 429 retry.
 // On rate-limit, it waits the Retry-After period then tries once more.
-func searchPodcastITunesIDWithRetry(ctx context.Context, client *http.Client, title, overcastID string, requestDelay time.Duration) (string, error) {
-	id, err := SearchPodcastITunesID(ctx, client, title, overcastID)
+func searchPodcastWithRetry(ctx context.Context, client *http.Client, title, overcastID string, requestDelay time.Duration) (PodcastSearchResult, error) {
+	r, err := SearchPodcast(ctx, client, title, overcastID)
 	if err == nil {
-		return id, nil
+		return r, nil
 	}
 	var rl *httputil.RateLimitError
 	if !errors.As(err, &rl) {
-		return "", err
+		return PodcastSearchResult{}, err
 	}
 	wait := rl.Wait
 	if wait < requestDelay {
@@ -1287,10 +1287,10 @@ func searchPodcastITunesIDWithRetry(ctx context.Context, client *http.Client, ti
 	fmt.Printf("  rate limited searching for %q — waiting %v...\n", title, wait)
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return PodcastSearchResult{}, ctx.Err()
 	case <-time.After(wait):
 	}
-	return SearchPodcastITunesID(ctx, client, title, overcastID)
+	return SearchPodcast(ctx, client, title, overcastID)
 }
 
 // fetchPodcastEpisodesWithRetry calls FetchPodcastEpisodes with exponential backoff

@@ -109,7 +109,7 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **Apple token auto-extraction** — the Bearer token must currently be captured manually from browser DevTools. The Podcasts app may cache credentials in the macOS Keychain; automatic extraction and renewal would eliminate the only manual step in the Apple write path.
 
-**Overcast auto-subscribe during `--only-subscriptions`** — currently generates an OPML for manual import. The same `SubscribeToPodcast` API call used during play-state writes could be used directly, making the subscriptions-only path as seamless as the play-state path.
+**Overcast auto-subscribe during `--only-subscriptions`** — currently generates an OPML for manual import. The same subscribe endpoint used during play-state writes could be used directly, making the subscriptions-only path as seamless as the play-state path.
 
 **Overcast episode cache targeted invalidation** — `--clear-episode-cache` drops all cached episode IDs. A `--invalidate-podcast "title"` option would allow selective cache busting for one podcast without a full re-fetch.
 

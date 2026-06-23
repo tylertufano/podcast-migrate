@@ -76,6 +76,20 @@ podcast-migrate migrate --from podcasts --to overcast \
 
 If you have Apple Podcasts Subscriptions (PSUB) or subscriber-feed episodes, subscribe to the equivalent private feed in Overcast first. The tool automatically detects that the destination has a podcast with a matching title and routes those episodes there — no extra flags needed. Use `--feed-map` to override the auto-match explicitly when titles differ between platforms.
 
+Podcasts that Overcast's search can't find (private or self-hosted feeds with no iTunes ID) cannot be subscribed automatically. At the end of the run, those feeds are listed and written to an OPML file you can import manually:
+
+```sh
+podcast-migrate migrate --from podcasts --to overcast \
+  --play-state --overcast-skipped-opml
+# writes skipped-private-feeds.opml in the current directory
+
+# or specify a path:
+podcast-migrate migrate --from podcasts --to overcast \
+  --play-state --overcast-skipped-opml ~/Desktop/private-feeds.opml
+```
+
+Then in Overcast: **Settings → Import OPML** and select the generated file.
+
 > **Note:** Uses an undocumented Overcast endpoint. It works as of the current release but may break without notice. Always use `--dry-run` to preview before a live run.
 
 ---
@@ -241,6 +255,8 @@ podcast-migrate migrate --from overcast --to overcast \
 ```
 
 The source OPML provides your old play history; the tool auto-fetches your current live library as the destination. `--force-update` overwrites episodes the destination already marks as played, which is what you want when restoring from an older snapshot.
+
+Because Overcast OPML exports include a numeric `overcastId` per episode, Overcast → Overcast migrations skip listing-page fetches entirely — episodes are matched directly by their Overcast ID with no extra HTTP requests.
 
 If you had both a public feed ("Fresh Air") and a paid feed ("Fresh Air Plus") and your cleaned-up account keeps only one, the tool matches episodes across those feeds by normalizing the title — play state is restored to whichever variant is currently subscribed.
 
@@ -498,5 +514,15 @@ The default inter-request delay is 1 second. Increase it with `--request-delay` 
 podcast-migrate migrate --from podcasts --to overcast \
   --play-state --request-delay 2s
 ```
+
+When writing to Overcast, if the server returns persistent 429 errors after the retry budget is exhausted the migration pauses and prompts you:
+
+```
+overcast: persistent rate limiting — still getting 429 after retries.
+Waiting 60s as requested by server...
+Continue? [Y/n] (current delay 2s; press Enter to also increase to 2.5s):
+```
+
+Press **Enter** to continue with the suggested +0.5 s delay increase, **y** to keep the current delay, or **n** to abort cleanly.
 
 See [Commands](commands.md) for the full flag reference.

@@ -320,13 +320,17 @@ Generates an OPML file at `--overcast-out` that the user imports via **Overcast 
 
 `overcastId` (from the OPML's `overcastId` attribute) is stored as the `numericId` used in `set_progress` calls. The index also carries `currentState` and `currentPos` (from the OPML export) for skip-reason evaluation.
 
-**Extended matching** (`augmentIndexFromPodcastPages`): resolves episode IDs for Apple episodes not in the Overcast OPML (episodes never opened in Overcast). Three steps:
+**Extended matching** (`augmentIndexFromPodcastPages`): resolves episode IDs for source episodes not already in the Overcast OPML index. Three steps:
 
-1. **`/podcasts` page** — fetch all subscribed podcast page URLs in one request (replacing N per-podcast search calls). Matches by podcast title (including Plus-normalization). Falls back to `search_autocomplete` JSON API for unsubscribed podcasts, then calls `SubscribeToPodcast` (idempotent; no-op if already subscribed).
+**Pre-seeding (Overcast → Overcast short-circuit)**: before any HTTP is attempted, if the source episode's `GUID` is a pure-numeric Overcast ID (i.e. the source is an Overcast OPML export), the episode is pre-seeded into the destination index directly using that ID. This means Overcast → Overcast migrations skip the listing-page and episode-page fetches entirely for episodes with known IDs.
 
-2. **Podcast listing pages** (`/itunes<ID>/<slug>` or `/p<ID>-<hash>`) — extract `PodcastEpisodeListing` per episode: `OvercastURL` (`/+HASH`), `DateStr` (YYYY-MM-DD), `Title`, and opportunistically `NumericID` (when `data-item-id` is already present on the cell anchor, saving a per-episode fetch).
+1. **`/podcasts` page** — fetch all subscribed podcast page URLs in one request (replacing N per-podcast search calls). Matches by podcast title (including Plus-normalization). Falls back to `search_autocomplete` JSON API for unsubscribed podcasts, then calls `POST /podcasts/add/<overcastId>` to subscribe (bypasses any page-scraping caching bugs). Podcasts that `search_autocomplete` cannot resolve (no iTunes ID — typically private or self-hosted feeds) are collected and written to `--overcast-skipped-opml` at the end of the run.
+
+2. **Podcast listing pages** (`/itunes<ID>/<slug>` or `/p<ID>-<hash>`) — extract `PodcastEpisodeListing` per episode: `OvercastURL` (`/+HASH`), `DateStr` (YYYY-MM-DD), `Title`, and opportunistically `NumericID` (when `data-item-id` is already present on the cell anchor, saving a per-episode fetch). When a podcast publishes multiple episodes on the same calendar day, all candidates are tried and the one whose title is compatible with the source episode is selected.
 
 3. **Episode pages** (`/+HASH`) — for entries where the listing page didn't provide a numeric ID, fetch the episode player page and extract `data-item-id` or parse it from a `set_progress` URL on the page. This step runs with a bounded worker pool (5 concurrent workers) with a shared rate-limiter ticker.
+
+**Private / custom feed OPML** (`--overcast-skipped-opml`): podcasts that cannot be subscribed programmatically (no iTunes ID in `search_autocomplete`) are written to an OPML file at the end of the run. Import via **Overcast → Settings → Import OPML**. Default path: `skipped-private-feeds.opml` in the working directory; pass the flag with a value to override.
 
 **Episode ID cache** (`overcast-episode-ids.json` in `os.UserCacheDir()/podcast-migrate/`):
 - Keyed by Overcast episode URL (`https://overcast.fm/+HASH`)
@@ -339,7 +343,15 @@ Generates an OPML file at `--overcast-out` that the user imports via **Overcast 
 
 **Retry logic**: both `SetProgress` and listing-page fetches implement separate retry budgets for 429 (rate limit, with `Retry-After` header support) and 5xx/network errors (exponential backoff: 2s → 4s → 8s for write calls; 30s → 60s → 120s for page fetches). An auth-failure abort fires immediately if the very first write call is redirected to the login page.
 
-**Rate limiting guards**: The listing-page loop, per-episode worker pool, and search calls all share the `requestDelay` timer to pace requests at ≤ 1 per second by default, staying well within Overcast's observed limits.
+**Rate limiting guards**: The listing-page loop, per-episode worker pool, and search calls all share the `requestDelay` timer to pace requests at ≤ 1 per second by default. When the retry budget is exhausted on a persistent 429, the migration pauses and prompts interactively:
+
+```
+overcast: persistent rate limiting — still getting 429 after retries.
+Waiting 60s as requested by server...
+Continue? [Y/n] (current delay 2s; press Enter to also increase to 2.5s):
+```
+
+Press **Enter** to continue with a +0.5 s delay increase, **y** to continue without changing the delay, or **n** to abort cleanly.
 
 ---
 

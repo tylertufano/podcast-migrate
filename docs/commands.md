@@ -93,6 +93,7 @@ The `--since` filter matches any of three Apple Podcasts timestamp columns:
 | `--clear-episode-cache` | false | Discard and rebuild Overcast episode ID cache |
 | `--clear-source-opml-cache` | false | Discard the cached Overcast source OPML and force a fresh download (only effective when `--from overcast` without `--overcast-source-opml`) |
 | `--overcast-save-source-opml [path]` | — | Save a copy of the auto-fetched Overcast source OPML to this path. If given without a value, saves to `~/Downloads/overcast.opml`. |
+| `--overcast-skipped-opml [path]` | — | When `--to overcast`: write an OPML file of podcasts that could not be auto-subscribed (private/custom feeds with no iTunes ID). If given without a value, writes to `skipped-private-feeds.opml` in the current directory. Import via **Overcast → Settings → Import OPML**. |
 | `--feed-map SRC=DST` | — | Remap a source feed URL to a destination feed URL (repeatable) |
 | `--log-file /path` | — | Write per-episode CSV log (columns: status, podcast, episode, pub_date, source_state, target_state, note) |
 | `--pc-include-unsubscribed` | false | When `--from pocketcasts`: include play history for unsubscribed podcasts |

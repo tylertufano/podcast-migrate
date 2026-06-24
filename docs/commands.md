@@ -91,7 +91,7 @@ The `--since` filter matches any of three Apple Podcasts timestamp columns:
 | `--force-update` | false | Write source state even if destination is already ahead |
 | `--episode-cache-max-age` | 0 (indefinite) | Treat Overcast episode ID cache entries older than this as stale |
 | `--clear-episode-cache` | false | Discard and rebuild Overcast episode ID cache |
-| `--clear-source-opml-cache` | false | Discard the cached Overcast source OPML and force a fresh download (only effective when `--from overcast` without `--overcast-source-opml`) |
+| `--clear-source-opml-cache` | false | Discard the cached Overcast source OPML and force a fresh download. Effective whenever Overcast is the source or destination and no explicit `--overcast-source-opml` path is given. |
 | `--overcast-save-source-opml [path]` | — | Save a copy of the auto-fetched Overcast source OPML to this path. If given without a value, saves to `~/Downloads/overcast.opml`. |
 | `--overcast-skipped-opml [path]` | — | When `--to overcast`: write an OPML file of podcasts that could not be auto-subscribed (private/custom feeds with no iTunes ID). If given without a value, writes to `skipped-private-feeds.opml` in the current directory. Import via **Overcast → Settings → Import OPML**. |
 | `--feed-map SRC=DST` | — | Remap a source feed URL to a destination feed URL (repeatable) |

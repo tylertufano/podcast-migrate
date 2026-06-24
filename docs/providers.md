@@ -28,7 +28,8 @@ nav_order: 5
 
 **Podcast query** (`ZMTPODCAST`): subscribed podcasts with `http`/`https` feed URLs, excluding:
 - `internal://` feeds (Apple-exclusive, no public RSS)
-- Feeds containing `/eyJ` (JWT authentication tokens embedded in the URL — subscriber feeds from NPR Plus, Slate Plus via supportingcast.fm, etc. that are valid only for one Apple account and break Overcast's OPML importer)
+
+Subscriber feeds with private JWT-authenticated URLs (e.g. NPR Plus via `wbez.plus.npr.org`, supportingcast.fm) are included — the private URL is importable by Overcast and other apps that accept OPML.
 
 Apple adds cache-buster `?t=` query parameters to stored feed URLs. These are stripped before the URL is returned so they don't break feed matching in other apps.
 
@@ -81,6 +82,8 @@ Source 4 is trusted when `ZLASTDATEPLAYED` is set because that timestamp confirm
 **iCloud sync gap (case 5)**: When an episode is listened to completion on iPhone or iPad, the mobile device records the event (incrementing `ZPLAYCOUNT` and setting `ZLASTDATEPLAYED`) but `ZPLAYSTATE` often remains `0` on the Mac because iCloud does not always propagate the completion flag. Apple also clears `ZLASTDATEPLAYED` when the user manually marks an episode as unplayed (while retaining `ZPLAYCOUNT` and `ZPLAYSTATESOURCE=3`). Requiring `ZLASTDATEPLAYED` to be set makes "completed but not synced" (date present) reliably distinguishable from "completed then manually unplayed" (date cleared).
 
 **Live KVS read** (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`): when KVS credentials are set and Apple Podcasts is the migration source, the reader calls `getAll(com.apple.upp)` on `bookkeeper.itunes.apple.com` and uses the server-side play state instead of the local `ZMTUPPMETADATA` cache. This gives a more authoritative result when the Mac SQLite database is stale (e.g. the Mac was not opened between a play event and the migration run).
+
+`getAll` returns at most 5,000 entries (hard server-side cap, most-recently-modified first). On a large library, this covers all episodes with any recent listening activity. The log reports how many records were fetched and how many matched episodes in the local library.
 
 The live KVS read has two phases:
 1. **Main query** (same as without live KVS) — episodes with local play evidence. For each episode that has a `ZMETADATAIDENTIFIER`, the server-side `HasBeenPlayed` / `BookmarkTimeSec` overrides local `ZMTUPPMETADATA`. Episodes not present in the live KVS response fall through to `ZMTEPISODE` heuristics.

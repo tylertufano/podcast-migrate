@@ -32,6 +32,9 @@ type SQLiteReader struct {
 	sinceTime        time.Time             // when set, only episodes modified after this time are returned
 	liveKVSRawValues map[string][]byte     // metadataID → DEFLATE-compressed plist (from live getAll(com.apple.upp))
 	liveKVSDecoded   map[string]kvsServerState // lazily decoded from liveKVSRawValues
+
+	// Populated by Read; available for the caller to log after Read returns.
+	LiveKVSMatched int // episodes whose play state came from the live server
 }
 
 func NewSQLiteReader(dbPath string) *SQLiteReader {
@@ -97,24 +100,16 @@ func (r *SQLiteReader) Read(ctx context.Context) (*model.Library, error) {
 }
 
 func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Podcast, int, error) {
-	// Restrict to publicly subscribable http/https feeds.
-	//
-	// Excluded feed patterns (counted in skippedPodcasts):
+	// Restrict to http/https feeds. Excluded (counted in skippedPodcasts):
 	//   "internal://" — Apple-exclusive shows with no public RSS feed.
-	//   "%/eyJ%" — Feeds whose URL path contains a JWT authentication token
-	//       (base64-encoded JSON; "eyJ" decodes to '{"'). Several podcast
-	//       subscription platforms embed a user-specific signed token directly
-	//       in the feed URL (NPR Plus, Slate Plus via supportingcast.fm, etc.).
-	//       These URLs are Apple-account-specific and fail to validate in any
-	//       other app — Overcast's OPML importer aborts the entire import batch
-	//       when it encounters them. Search for these shows by name in Overcast
-	//       to subscribe via their public feeds.
+	// Subscriber feeds with private JWT-authenticated URLs (e.g. NPR Plus via
+	// wbez.plus.npr.org) are included: the private URL is importable by Overcast
+	// and other apps that accept OPML.
 	const q = `
 		SELECT ZFEEDURL, ZTITLE, ZAUTHOR, ZIMAGEURL
 		FROM ZMTPODCAST
 		WHERE ZSUBSCRIBED = 1
 		  AND (ZFEEDURL LIKE 'http://%' OR ZFEEDURL LIKE 'https://%')
-		  AND ZFEEDURL NOT LIKE '%/eyJ%'
 		ORDER BY ZTITLE`
 
 	rows, err := db.QueryContext(ctx, q)
@@ -147,10 +142,7 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 		SELECT COUNT(*) FROM ZMTPODCAST
 		WHERE ZSUBSCRIBED = 1
 		  AND ZFEEDURL IS NOT NULL
-		  AND (
-		        ZFEEDURL NOT LIKE 'http://%' AND ZFEEDURL NOT LIKE 'https://%'
-		        OR ZFEEDURL LIKE '%/eyJ%'
-		      )`
+		  AND ZFEEDURL NOT LIKE 'http://%' AND ZFEEDURL NOT LIKE 'https://%'`
 
 	var skipped int
 	_ = db.QueryRowContext(ctx, countSkipped).Scan(&skipped)
@@ -289,7 +281,6 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		  AND (e.ZGUID IS NOT NULL OR (e.ZTITLE IS NOT NULL AND e.ZPUBDATE IS NOT NULL))
 		  AND p.ZSUBSCRIBED = 1
 		  AND p.ZFEEDURL IS NOT NULL
-		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
 		  AND p.ZFEEDURL NOT LIKE 'internal://%'` +
 		sinceClause + `
 		ORDER BY e.ZPUBDATE DESC`
@@ -362,6 +353,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			// Not present in the map means KVS has no play record → fall through to
 			// ZMTEPISODE heuristics (same as no ZMTUPPMETADATA row).
 			if state, ok := r.lookupLiveKVS(ctx, metadataID.String); ok {
+				r.LiveKVSMatched++
 				if state.HasBeenPlayed {
 					ep.PlayState = model.PlayStatePlayed
 				} else if state.BookmarkTimeSec > 0 {
@@ -379,7 +371,7 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		} else if uppHasBeenPlayed.Valid {
 			// Local ZMTUPPMETADATA: used when live KVS is unavailable. ZHASBEENPLAYED
 			// is never NULL when a row exists, so uppHasBeenPlayed.Valid is a reliable
-			// row-existence sentinel. ZBOOKMARKTIME stores position in seconds.
+			// row-existence sentinel.
 			if uppHasBeenPlayed.Int64 == 1 {
 				ep.PlayState = model.PlayStatePlayed
 			} else if uppBookmarkTime.Valid && uppBookmarkTime.Float64 > 0 {
@@ -503,7 +495,6 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 			  AND (e.ZGUID IS NOT NULL OR (e.ZTITLE IS NOT NULL AND e.ZPUBDATE IS NOT NULL))
 			  AND p.ZSUBSCRIBED = 1
 			  AND p.ZFEEDURL IS NOT NULL
-			  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
 			  AND p.ZFEEDURL NOT LIKE 'internal://%'
 			LIMIT 1`
 		stmt, stmtErr := db.PrepareContext(ctx, epQuery)
@@ -550,14 +541,15 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 				if lastPlayedRaw.Valid {
 					ep.LastPlayed = coreDataEpoch.Add(time.Duration(lastPlayedRaw.Float64 * float64(time.Second)))
 				}
+				r.LiveKVSMatched++
 				out = append(out, ep)
 			}
 		}
 	}
 
 	// Count PSUB/PLUS episodes that are included in the main query (i.e. on
-	// non-internal, non-JWT feeds). These have Apple-proprietary GUIDs and DRM
-	// enclosure URLs but are included for fuzzy matching by podcast title + pub date.
+	// non-internal feeds). These have Apple-proprietary GUIDs and DRM enclosure
+	// URLs but are included for fuzzy matching by podcast title + pub date.
 	const countPaywalled = `
 		SELECT COUNT(*) FROM ZMTEPISODE e
 		JOIN ZMTPODCAST p ON e.ZPODCAST = p.Z_PK
@@ -565,7 +557,6 @@ func (r *SQLiteReader) readEpisodes(ctx context.Context, db *sql.DB) ([]model.Ep
 		  AND e.ZGUID IS NOT NULL
 		  AND p.ZSUBSCRIBED = 1
 		  AND p.ZFEEDURL IS NOT NULL
-		  AND p.ZFEEDURL NOT LIKE '%/eyJ%'
 		  AND p.ZFEEDURL NOT LIKE 'internal://%'
 		  AND e.ZPRICETYPE IN ('PSUB', 'PLUS')`
 

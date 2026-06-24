@@ -212,17 +212,16 @@ func migrateCmd() *cobra.Command {
 				return fmt.Errorf("destination: %w", err)
 			}
 
-			// If an explicit destination matching OPML was provided, wire it into the
-			// Overcast destination provider. Without this, the provider auto-fetches
-			// the live account library after login.
-			if overcastMatchOPML != "" {
-				if op, ok := dst.(*overcast.Provider); ok {
+			// Wire destination-specific options into the Overcast destination provider.
+			if op, ok := dst.(*overcast.Provider); ok {
+				if overcastMatchOPML != "" {
 					op.SetMatchOPMLPath(overcastMatchOPML)
 				}
-			}
-			if overcastSkippedOPML != "" {
-				if op, ok := dst.(*overcast.Provider); ok {
+				if overcastSkippedOPML != "" {
 					op.SetSkippedOPMLPath(overcastSkippedOPML)
+				}
+				if overcastClearSourceCache {
+					op.SetClearSourceOPMLCache(true)
 				}
 			}
 

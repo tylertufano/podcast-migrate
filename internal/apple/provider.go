@@ -135,13 +135,16 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 			if p.kvsReader != nil {
 				if sessErr := p.kvsReader.initSession(ctx); sessErr == nil {
 					r.SetLiveKVSValues(p.kvsReader.serverRawValues)
-					fmt.Printf("apple: live KVS play state active (DSID %s) — %d episode records from server\n",
+					fmt.Printf("apple: live KVS active (DSID %s) — fetched %d records from server\n",
 						p.kvsReader.dsid, len(p.kvsReader.serverRawValues))
 				} else {
 					fmt.Fprintf(os.Stderr, "apple: live KVS read failed (%v) — using local ZMTUPPMETADATA\n", sessErr)
 				}
 			}
 			lib, err := r.Read(ctx)
+			if err == nil && p.kvsReader != nil && r.LiveKVSMatched > 0 {
+				fmt.Printf("apple: play state — %d episodes matched live server\n", r.LiveKVSMatched)
+			}
 			if err == nil {
 				return lib, nil
 			}

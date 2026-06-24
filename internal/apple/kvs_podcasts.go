@@ -20,10 +20,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"howett.net/plist"
 )
 
 const (
@@ -623,26 +624,28 @@ func buildSubscriptionValue(subs []podcastSubscription) ([]byte, error) {
 // Low-level utilities
 // ---------------------------------------------------------------------------
 
-// bplistToXML converts a binary plist to its XML representation via plutil.
-func bplistToXML(ctx context.Context, data []byte) (string, error) {
-	cmd := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", "-")
-	cmd.Stdin = bytes.NewReader(data)
-	out, err := cmd.Output()
+// bplistToXML converts a binary plist to its XML string representation.
+// Uses howett.net/plist — pure Go, works on all platforms.
+func bplistToXML(_ context.Context, data []byte) (string, error) {
+	var v interface{}
+	if _, err := plist.Unmarshal(data, &v); err != nil {
+		return "", fmt.Errorf("plist decode: %w", err)
+	}
+	out, err := plist.MarshalIndent(v, plist.XMLFormat, "\t")
 	if err != nil {
-		return "", fmt.Errorf("plutil xml1: %w", err)
+		return "", fmt.Errorf("plist encode xml: %w", err)
 	}
 	return string(out), nil
 }
 
-// bplistToJSON converts a binary plist to JSON via plutil.
-func bplistToJSON(ctx context.Context, data []byte) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "plutil", "-convert", "json", "-o", "-", "-")
-	cmd.Stdin = bytes.NewReader(data)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("plutil json: %w", err)
+// bplistToJSON converts a binary plist to JSON.
+// Uses howett.net/plist — pure Go, works on all platforms.
+func bplistToJSON(_ context.Context, data []byte) ([]byte, error) {
+	var v interface{}
+	if _, err := plist.Unmarshal(data, &v); err != nil {
+		return nil, fmt.Errorf("plist decode: %w", err)
 	}
-	return out, nil
+	return json.Marshal(v)
 }
 
 // deflateDecompress decompresses raw DEFLATE data (no zlib header).

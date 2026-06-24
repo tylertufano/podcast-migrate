@@ -27,12 +27,13 @@ import (
 //	  metadataIdentifiers are available, so newly subscribed feeds wait for
 //	  indexing. Pre-existing subscriptions resolve immediately from SQLite.
 type Provider struct {
-	sqlitePath string
-	opmlPath   string // optional fallback; empty disables it
-	webAPI     *WebAPIWriter
-	kvsOnly    *KVSWriter // set when using KVS without web API (KVS-only mode)
-	kvsReader  *KVSWriter // set by EnableLiveKVSRead; used for reading only
-	sinceTime  time.Time  // when set, only episodes modified after this time are read
+	sqlitePath    string
+	opmlPath      string      // optional fallback; empty disables it
+	webAPI        *WebAPIWriter
+	kvsOnly       *KVSWriter  // set when using KVS without web API (KVS-only mode)
+	kvsReader     *KVSWriter  // set by EnableLiveKVSRead; used as live overlay on SQLite
+	kvsOnlyReader *KVSReader  // set when SQLite unavailable; reads entirely from KVS + RSS
+	sinceTime     time.Time   // when set, only episodes modified after this time are read
 }
 
 // SetSinceTime restricts GetLibrary to episodes whose play state was modified
@@ -108,6 +109,26 @@ func (p *Provider) EnableLiveKVSRead() error {
 	return nil
 }
 
+// EnableKVSOnlyRead activates the cross-platform KVS+RSS reader, which reads
+// subscriptions and play state from Apple's iCloud KVS and fetches episode
+// metadata (title, pub date, duration) from the RSS feeds directly.
+//
+// Call this explicitly when running on non-macOS, or when you want to bypass
+// the local SQLite database entirely. Returns nil when APPLE_KVS_COOKIES is
+// unset (the path stays inactive). Returns an error if credentials are present
+// but invalid.
+func (p *Provider) EnableKVSOnlyRead() error {
+	if os.Getenv("APPLE_KVS_COOKIES") == "" {
+		return nil
+	}
+	r, err := NewKVSReader()
+	if err != nil {
+		return err
+	}
+	p.kvsOnlyReader = r
+	return nil
+}
+
 func (p *Provider) Name() string { return "Apple Podcasts" }
 
 func (p *Provider) Capabilities() provider.Capabilities {
@@ -148,14 +169,24 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 			if err == nil {
 				return lib, nil
 			}
-			// SQLite read failed — log and fall through to OPML if available.
-			fmt.Fprintf(os.Stderr, "apple: SQLite read failed (%v), falling back to OPML\n", err)
+			// SQLite read failed — fall through to KVS-only read or OPML.
+			fmt.Fprintf(os.Stderr, "apple: SQLite read failed (%v), trying KVS-only read\n", err)
 		}
+	}
+
+	// KVS-only read: no SQLite required (cross-platform).
+	// Activated when APPLE_KVS_COOKIES is set and SQLite is unavailable.
+	if p.kvsOnlyReader != nil {
+		if !p.sinceTime.IsZero() {
+			p.kvsOnlyReader.SetSinceTime(p.sinceTime)
+		}
+		return p.kvsOnlyReader.Read(ctx)
 	}
 
 	if p.opmlPath == "" {
 		if runtime.GOOS != "darwin" {
-			return nil, errors.New("apple: Apple Podcasts is only available on macOS")
+			return nil, errors.New("apple: Apple Podcasts reading requires macOS or KVS credentials " +
+				"(set APPLE_KVS_DSID and APPLE_KVS_COOKIES, then re-run)")
 		}
 		return nil, errors.New("apple: SQLite database not accessible and no OPML fallback path provided")
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -175,12 +176,18 @@ func migrateCmd() *cobra.Command {
 				}
 			}
 
-			// When Apple is the source and KVS credentials are available, read play
-			// state from the live KVS server (getAll(com.apple.upp)) instead of the
-			// local ZMTUPPMETADATA cache, for more authoritative results.
+			// When Apple is the source, activate the appropriate KVS read mode:
+			//   - On macOS with SQLite: live KVS overlay (more authoritative play state)
+			//   - On non-macOS or when SQLite is unavailable: KVS+RSS read (no SQLite needed)
 			if ap, ok := src.(*apple.Provider); ok {
-				if err := ap.EnableLiveKVSRead(); err != nil {
-					fmt.Fprintf(os.Stderr, "apple: KVS read unavailable (%v) — using local SQLite\n", err)
+				if runtime.GOOS == "darwin" {
+					if err := ap.EnableLiveKVSRead(); err != nil {
+						fmt.Fprintf(os.Stderr, "apple: live KVS unavailable (%v) — using local SQLite\n", err)
+					}
+				} else {
+					if err := ap.EnableKVSOnlyRead(); err != nil {
+						fmt.Fprintf(os.Stderr, "apple: KVS-only read unavailable (%v)\n", err)
+					}
 				}
 			}
 

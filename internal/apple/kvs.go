@@ -1064,13 +1064,10 @@ func parseServerState(ctx context.Context, body []byte) (versions map[string]int
 	if len(body) == 0 {
 		return
 	}
-	cmd := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", "-")
-	cmd.Stdin = bytes.NewReader(body)
-	xmlOut, err := cmd.Output()
+	s, err := bplistToXML(ctx, body)
 	if err != nil {
 		return
 	}
-	s := string(xmlOut)
 
 	// Narrow to the values array to avoid false matches on top-level keys.
 	// Extract domain-version (global sequence counter for this domain).
@@ -1158,13 +1155,10 @@ func decodeServerValue(ctx context.Context, compressed []byte) (kvsServerState, 
 	if err != nil {
 		return kvsServerState{}, fmt.Errorf("deflate: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", "-")
-	cmd.Stdin = bytes.NewReader(inner)
-	xmlOut, err := cmd.Output()
+	s, err := bplistToXML(ctx, inner)
 	if err != nil {
-		return kvsServerState{}, fmt.Errorf("plutil: %w", err)
+		return kvsServerState{}, fmt.Errorf("plist decode: %w", err)
 	}
-	s := string(xmlOut)
 	var state kvsServerState
 	if idx := strings.Index(s, "<key>hbpl</key>"); idx != -1 {
 		after := strings.TrimSpace(s[idx+len("<key>hbpl</key>"):])
@@ -1289,15 +1283,11 @@ func (w *KVSWriter) sendChunk(ctx context.Context, items []kvsItem) (conflictKey
 		return nil, fmt.Errorf("putAll HTTP %d: %s", resp.StatusCode, respBody)
 	}
 
-	cmd := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", "-")
-	cmd.Stdin = bytes.NewReader(respBody)
-	xmlOut, err := cmd.Output()
-	if err != nil {
-		// plutil failed — response may not be a plist (unexpected but non-fatal).
+	s, xmlErr := bplistToXML(ctx, respBody)
+	if xmlErr != nil {
+		// response may not be a plist (unexpected but non-fatal).
 		return nil, nil
 	}
-
-	s := string(xmlOut)
 	statusIdx := strings.Index(s, "<key>status</key>")
 	if statusIdx == -1 {
 		return nil, nil

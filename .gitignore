@@ -11,3 +11,6 @@ dist/
 
 # KVS session credentials (captured via scripts/capture-kvs-creds.sh)
 .creds
+blitz_6_17_backup.sql
+monitor_db.sh
+test_syncinfo_*.sql

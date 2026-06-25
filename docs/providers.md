@@ -29,7 +29,7 @@ nav_order: 5
 **Podcast query** (`ZMTPODCAST`): subscribed podcasts with `http`/`https` feed URLs, excluding:
 - `internal://` feeds (Apple-exclusive, no public RSS)
 
-Subscriber feeds with private JWT-authenticated URLs (e.g. NPR Plus via `wbez.plus.npr.org`, supportingcast.fm) are included — the private URL is importable by Overcast and other apps that accept OPML.
+Subscriber feeds with private JWT-authenticated URLs (e.g. NPR Plus via `wbez.plus.npr.org`, supportingcast.fm) are included. The SQLiteReader returns these feeds using the subscriber URL stored in the local database. When running via `KVSReader` (see below), these URLs are automatically replaced with the canonical public feed URL from the iTunes Store so that destination apps subscribe to the correct public listing.
 
 Apple adds cache-buster `?t=` query parameters to stored feed URLs. These are stripped before the URL is returned so they don't break feed matching in other apps.
 
@@ -99,6 +99,25 @@ The second pass is skipped when `--since` is active, since delta sync is scoped 
 **Schema compatibility**: `ZDURATION` was removed in macOS 27. The reader probes with `PRAGMA table_info(ZMTEPISODE)` and substitutes `NULL` when absent.
 
 **OPML fallback**: if SQLite is inaccessible (permissions, path doesn't exist, read error), the provider falls back to an Apple Podcasts OPML export. OPML provides subscriptions only — no play state.
+
+### Reading — KVSReader (cross-platform, no SQLite)
+
+`KVSReader` reads subscriptions and play state entirely from Apple's iCloud KVS — no local SQLite database required. This enables Apple Podcasts migrations from **non-macOS platforms** (Linux, Windows) and from macOS machines where the Apple Podcasts database is inaccessible.
+
+Activated automatically when `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` are set and SQLite is not available. On macOS, SQLite takes precedence; set both KVS and SQLite credentials to get the live KVS overlay on top of SQLite.
+
+**Data sources:**
+- `com.apple.podcasts` KVS domain — subscription list (feed URL, title, iTunes Store ID) and per-feed episode identity (GUID → `metadataIdentifier`)
+- `com.apple.upp` KVS domain — per-episode play state (played, bookmark position, timestamp of last change)
+- RSS feeds — episode titles, pub dates, durations (fetched concurrently, up to 8 parallel)
+
+**iTunes canonical URL resolution**: for every catalog subscription (`PodcastPID > 0`), `KVSReader` performs a batched lookup against the iTunes Store API (`itunes.apple.com/lookup`) to resolve the canonical public feed URL. This replaces subscriber JWT URLs (e.g. `slateprivate.supportingcast.fm/content/eyJ…`) with the public feed URL that destination apps expect. The iTunes ID is also stored in `model.Podcast.ITunesID` and used by the Overcast writer to skip `search_autocomplete` and subscribe directly via the podcast's `/itunes{ID}` page. Feeds with no `PodcastPID` (self-hosted, private) retain their KVS URL.
+
+**`internal://` feeds**: Apple-exclusive shows with no public RSS are excluded from output and counted in `lib.SkippedInternalPodcasts`.
+
+**Episode coverage**: `com.apple.upp` is capped at 5,000 entries (most-recently-modified first). On a large library this covers all recently active episodes. The UPP cap is shared with the live KVS overlay on the SQLite path.
+
+**Unsubscribed feeds**: `com.apple.podcasts` retains play state for feeds the user has since unsubscribed. These appear in `lib.Podcasts` (without a subscription flag) and their episodes are included if play state exists.
 
 ### Writing — Two modes
 
@@ -327,7 +346,9 @@ Generates an OPML file at `--overcast-out` that the user imports via **Overcast 
 
 **Pre-seeding (Overcast → Overcast short-circuit)**: before any HTTP is attempted, if the source episode's `GUID` is a pure-numeric Overcast ID (i.e. the source is an Overcast OPML export), the episode is pre-seeded into the destination index directly using that ID. This means Overcast → Overcast migrations skip the listing-page and episode-page fetches entirely for episodes with known IDs.
 
-1. **`/podcasts` page** — fetch all subscribed podcast page URLs in one request (replacing N per-podcast search calls). Matches by podcast title (including Plus-normalization). Falls back to `search_autocomplete` JSON API for unsubscribed podcasts, then calls `POST /podcasts/add/<overcastId>` to subscribe (bypasses any page-scraping caching bugs). Podcasts that `search_autocomplete` cannot resolve (no iTunes ID — typically private or self-hosted feeds) are collected and written to `--overcast-skipped-opml` at the end of the run.
+1. **`/podcasts` page** — fetch all subscribed podcast page URLs in one request (replacing N per-podcast search calls). Matches by podcast title (including Plus-normalization). For unsubscribed podcasts, two paths:
+   - **iTunes ID known** (source is `KVSReader` or the source library contains `model.Podcast.ITunesID`): constructs the Overcast page URL directly as `/itunes{ID}` and calls `SubscribeToPodcast` — no `search_autocomplete` round-trip, no title-matching ambiguity.
+   - **iTunes ID not known** (private/self-hosted feeds): falls back to `search_autocomplete` JSON API, then calls `POST /podcasts/add/<overcastId>` to subscribe (bypasses page-scraping caching bugs). Podcasts that `search_autocomplete` cannot resolve (no iTunes ID) are collected and written to `--overcast-skipped-opml` at the end of the run.
 
 2. **Podcast listing pages** (`/itunes<ID>/<slug>` or `/p<ID>-<hash>`) — extract `PodcastEpisodeListing` per episode: `OvercastURL` (`/+HASH`), `DateStr` (YYYY-MM-DD), `Title`, and opportunistically `NumericID` (when `data-item-id` is already present on the cell anchor, saving a per-episode fetch). When a podcast publishes multiple episodes on the same calendar day, all candidates are tried and the one whose title is compatible with the source episode is selected.
 

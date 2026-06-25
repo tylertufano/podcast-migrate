@@ -89,6 +89,7 @@ func TestAugment_EmptyEpisodes_ReturnsZero(t *testing.T) {
 		nil, // empty
 		map[string]overcastIndexEntry{},
 		0, map[string]string{},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
@@ -107,6 +108,7 @@ func TestAugment_AllUnplayed_ReturnsZero(t *testing.T) {
 		map[string]overcastIndexEntry{},
 		0,
 		map[string]string{"https://feeds.example.com/s": "test show"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
@@ -127,6 +129,7 @@ func TestAugment_AllAlreadyIndexed_ReturnsZero(t *testing.T) {
 		index,
 		0,
 		map[string]string{feedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
@@ -157,6 +160,7 @@ func TestAugment_StrictFeedMatch_SkipsAllFeeds(t *testing.T) {
 		map[string]overcastIndexEntry{},
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		true, // strictFeedMatch
 		false, false, 0, false, newTestCache(t),
 	)
@@ -189,6 +193,7 @@ func TestAugment_SubscribedOnly_SkipsUnsubscribed(t *testing.T) {
 		map[string]overcastIndexEntry{},
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false,
 		true, // subscribedOnly
 		false, 0, false, newTestCache(t),
@@ -227,6 +232,7 @@ func TestAugment_NormalPath_AddsToIndex(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -270,6 +276,7 @@ func TestAugment_NumericIDShortcut_AddsToIndex(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -327,6 +334,7 @@ func TestAugment_PodPageCacheDedup(t *testing.T) {
 		map[string]overcastIndexEntry{},
 		0,
 		map[string]string{feed1: "fresh air", feed2: "fresh air plus"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 
@@ -369,6 +377,7 @@ func TestAugment_TitleFallback_MatchesWhenDateMisses(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -408,6 +417,7 @@ func TestAugment_OneDayOffSameTitle_Accepted(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -458,6 +468,7 @@ func TestAugment_OneDayOffSeasonMarkerVariant_Accepted(t *testing.T) {
 		// feedToTitle uses "fresh air" to match augPodcastsPageFreshAir →
 		// /itunes12345/fresh-air, which serves listingPageS01 for this test.
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -514,6 +525,7 @@ func TestAugment_OneDayOffDifferentTitle_Rejected(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
@@ -562,6 +574,7 @@ func TestAugment_OPMLState_NumericIDShortcut_SeedsCurrentState(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -614,6 +627,7 @@ func TestAugment_OPMLState_CacheHitPath_SeedsCurrentState(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, cache,
 	)
 	if n != 1 {
@@ -662,6 +676,7 @@ func TestAugment_OPMLState_WorkerPath_SeedsCurrentState(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -717,6 +732,7 @@ func TestAugment_OPMLState_FurthestWins_CacheAhead(t *testing.T) {
 		index,
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
+		map[string]string{},
 		false, false, false, 0, false, cache,
 	)
 

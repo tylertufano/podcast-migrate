@@ -25,6 +25,13 @@ import (
 	"github.com/tyler/podcast-migrate/internal/model"
 )
 
+// subInfo holds per-subscription metadata built during the subscription scan.
+type subInfo struct {
+	title     string
+	canonical string // iTunes canonical feed URL; falls back to cleanFeedURL(sub.FeedURL)
+	itunesID  string // iTunes Store ID as a string; empty for private/unindexed feeds
+}
+
 // KVSReader reads a model.Library from Apple's iCloud KVS + RSS.
 // Requires APPLE_KVS_DSID and APPLE_KVS_COOKIES env vars.
 type KVSReader struct {
@@ -86,12 +93,58 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 	// cleanFeedURL strips these so that subscription.FeedURL and playState key
 	// URLs resolve to the same canonical URL, even if Apple wrote them at
 	// different times with different timestamps.
+	//
+	// For catalog subscriptions (PodcastPID > 0), we additionally replace the
+	// Apple-stored URL (which may be a subscriber JWT URL like
+	// slateprivate.supportingcast.fm/content/eyJ...) with the public canonical
+	// URL from the iTunes Store. This ensures destinations subscribe to the
+	// correct public feed rather than treating the feed as private/unpublished.
 	feedURLSet := make(map[string]bool)
 
-	// subByClean maps cleaned feedURL → subscription metadata.
-	type subInfo struct {
-		title string
+	// Step 1: batch iTunes lookup for all catalog subscriptions.
+	// Collect PIDs first, then do a single batched request.
+	pidToClean := make(map[int64]string, len(kw.subscriptions)) // PID → cleaned KVS URL
+	for _, sub := range kw.subscriptions {
+		if sub.Subscribed != 1 || sub.FeedURL == "" || sub.PodcastPID <= 0 {
+			continue
+		}
+		clean := cleanFeedURL(sub.FeedURL)
+		if strings.HasPrefix(clean, "http://") || strings.HasPrefix(clean, "https://") {
+			pidToClean[sub.PodcastPID] = clean
+		}
 	}
+
+	pids := make([]int64, 0, len(pidToClean))
+	for pid := range pidToClean {
+		pids = append(pids, pid)
+	}
+	itunesResults := map[int64]iTunesLookupResult{}
+	if len(pids) > 0 {
+		var lookupErr error
+		itunesResults, lookupErr = batchITunesLookup(ctx, r.httpClient, pids)
+		if lookupErr != nil {
+			fmt.Fprintf(os.Stderr, "apple: iTunes lookup failed (%v) — using KVS feed URLs\n", lookupErr)
+		} else {
+			fmt.Printf("apple: iTunes lookup resolved %d/%d canonical feed URL(s)\n", len(itunesResults), len(pids))
+		}
+	}
+
+	// Step 2: build cleanToCanonical and cleanToITunesID maps.
+	// cleanToCanonical: cleaned KVS URL → iTunes canonical URL.
+	// cleanToITunesID:  cleaned KVS URL → iTunes Store ID string.
+	cleanToCanonical := make(map[string]string, len(itunesResults))
+	cleanToITunesID := make(map[string]string, len(itunesResults))
+	for pid, clean := range pidToClean {
+		if result, ok := itunesResults[pid]; ok && result.FeedURL != "" {
+			canonical := cleanFeedURL(result.FeedURL)
+			if strings.HasPrefix(canonical, "http://") || strings.HasPrefix(canonical, "https://") {
+				cleanToCanonical[clean] = canonical
+				cleanToITunesID[clean] = strconv.FormatInt(pid, 10)
+			}
+		}
+	}
+
+	// Step 3: build subByClean (keyed by cleaned KVS URL) with canonical URL + iTunes ID.
 	subByClean := make(map[string]subInfo, len(kw.subscriptions))
 	var skippedInternal int
 	for _, sub := range kw.subscriptions {
@@ -105,8 +158,16 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 			skippedInternal++
 			continue
 		}
-		subByClean[clean] = subInfo{title: sub.Title}
-		feedURLSet[clean] = true
+		canonical := clean
+		if c, ok := cleanToCanonical[clean]; ok {
+			canonical = c
+		}
+		subByClean[clean] = subInfo{
+			title:     sub.Title,
+			canonical: canonical,
+			itunesID:  cleanToITunesID[clean], // empty string if no lookup result
+		}
+		feedURLSet[canonical] = true
 	}
 
 	// Also include feedURLs from playState entries (handles feeds that appear in
@@ -115,9 +176,14 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 	// be imported by any destination app.
 	for rawURL := range kw.podcastsFeeds {
 		clean := cleanFeedURL(rawURL)
-		if strings.HasPrefix(clean, "http://") || strings.HasPrefix(clean, "https://") {
-			feedURLSet[clean] = true
+		if !strings.HasPrefix(clean, "http://") && !strings.HasPrefix(clean, "https://") {
+			continue
 		}
+		canonical := clean
+		if c, ok := cleanToCanonical[clean]; ok {
+			canonical = c
+		}
+		feedURLSet[canonical] = true
 	}
 
 	// Collect sorted unique feed URLs for RSS fetching.
@@ -138,14 +204,19 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 			continue
 		}
 		clean := cleanFeedURL(sub.FeedURL)
-		if inLib[clean] {
+		info, ok := subByClean[clean]
+		if !ok {
+			continue // filtered (internal://, etc.)
+		}
+		if inLib[info.canonical] {
 			continue
 		}
 		pod := model.Podcast{
-			FeedURL: clean,
-			Title:   sub.Title,
+			FeedURL:  info.canonical,
+			Title:    sub.Title,
+			ITunesID: info.itunesID,
 		}
-		if feed, ok := rssFeeds[clean]; ok {
+		if feed, ok := rssFeeds[info.canonical]; ok {
 			if feed.Author != "" {
 				pod.Author = feed.Author
 			}
@@ -157,35 +228,47 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 			}
 		}
 		lib.Podcasts = append(lib.Podcasts, pod)
-		inLib[clean] = true
+		inLib[info.canonical] = true
 	}
 
 	// Also include podcasts that have playState data but are not in the
 	// subscription list (user unsubscribed but still has play history).
 	for rawURL := range kw.podcastsFeeds {
 		clean := cleanFeedURL(rawURL)
-		if inLib[clean] {
+		if !strings.HasPrefix(clean, "http://") && !strings.HasPrefix(clean, "https://") {
 			continue
 		}
-		pod := model.Podcast{FeedURL: clean}
-		if feed, ok := rssFeeds[clean]; ok {
+		canonical := clean
+		if c, ok := cleanToCanonical[clean]; ok {
+			canonical = c
+		}
+		if inLib[canonical] {
+			continue
+		}
+		pod := model.Podcast{FeedURL: canonical}
+		if feed, ok := rssFeeds[canonical]; ok {
 			pod.Title = feed.Title
 			pod.Author = feed.Author
 			pod.ImageURL = feed.ImageURL
 		}
 		lib.Podcasts = append(lib.Podcasts, pod)
-		inLib[clean] = true
+		inLib[canonical] = true
 	}
 
 	// Episodes: iterate over per-feed playState entries, look up UPP state,
-	// fill in metadata from RSS.
+	// fill in metadata from RSS. Use canonical URLs so episode FeedURLs match
+	// the corresponding lib.Podcasts entries.
 	var matched int
 	for rawURL, psFeed := range kw.podcastsFeeds {
 		clean := cleanFeedURL(rawURL)
 		if !strings.HasPrefix(clean, "http://") && !strings.HasPrefix(clean, "https://") {
 			continue
 		}
-		rssFeed := rssFeeds[clean]
+		canonical := clean
+		if c, ok := cleanToCanonical[clean]; ok {
+			canonical = c
+		}
+		rssFeed := rssFeeds[canonical]
 
 		// Build GUID→rssItem index for O(1) lookup.
 		rssIdx := make(map[string]*rssItem, len(rssFeed.Items))
@@ -222,7 +305,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 
 			ep := model.EpisodeState{
 				GUID:    psEp.GUID,
-				FeedURL: clean, // canonical URL, matches lib.Podcasts entries
+				FeedURL: canonical, // iTunes canonical URL, matches lib.Podcasts entries
 			}
 
 			if rssItem, ok := rssIdx[psEp.GUID]; ok {

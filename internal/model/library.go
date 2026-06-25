@@ -21,6 +21,7 @@ type Podcast struct {
 	Author     string
 	ImageURL   string
 	OvercastID string // Overcast's internal podcast ID (from OPML overcastId attribute)
+	ITunesID   string // Apple iTunes Store podcast ID (used for direct page lookup at destinations)
 }
 
 // EpisodeState captures everything we migrate about a single episode.

@@ -391,7 +391,17 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		}
 	}
 	defer idCache.save()
-	added, skippedPrivate := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, opts.StrictFeedMatch, opts.SubscribedOnly, opts.DryRun, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache, idCache)
+	// Build feedURL → iTunes ID map from the source library so that
+	// augmentIndexFromPodcastPages can skip search_autocomplete for catalog
+	// podcasts and go directly to /itunes{ID} on Overcast.
+	feedToITunesID := make(map[string]string, len(lib.Podcasts))
+	for _, pod := range lib.Podcasts {
+		if pod.ITunesID != "" && pod.FeedURL != "" {
+			feedToITunesID[pod.FeedURL] = pod.ITunesID
+		}
+	}
+
+	added, skippedPrivate := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, feedToITunesID, opts.StrictFeedMatch, opts.SubscribedOnly, opts.DryRun, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache, idCache)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
@@ -640,7 +650,8 @@ func augmentIndexFromPodcastPages(
 	episodes []model.EpisodeState,
 	index map[string]overcastIndexEntry,
 	requestDelay time.Duration,
-	feedToTitle map[string]string, // Apple feedURL → lowercased podcast title (for title-based fallback)
+	feedToTitle map[string]string,   // Apple feedURL → lowercased podcast title (for title-based fallback)
+	feedToITunesID map[string]string, // Apple feedURL → iTunes Store ID (skips search_autocomplete when set)
 	strictFeedMatch bool,
 	subscribedOnly bool,
 	dryRun bool,
@@ -821,7 +832,41 @@ func augmentIndexFromPodcastPages(
 			continue
 		}
 
-		// Fall back to search_autocomplete, subscribe, then add to page-fetch list.
+		// Step B2: if we have the iTunes ID from the source library, go directly
+		// to the Overcast podcast page — no search_autocomplete round-trip needed.
+		// SubscribeToPodcast fetches the page and submits the subscribe form.
+		if iTunesID, hasID := feedToITunesID[feedURL]; hasID {
+			pageURL := overcastBaseURL + "/itunes" + iTunesID
+			if dryRun {
+				fmt.Printf("  [dry-run] would subscribe to %q (iTunes ID %s)\n", appleTitle, iTunesID)
+			} else {
+				fmt.Printf("  subscribing to %q (iTunes ID %s)...\n", appleTitle, iTunesID)
+				var subErr error
+				for {
+					subErr = SubscribeToPodcast(ctx, client, pageURL)
+					if subErr == nil {
+						break
+					}
+					var rl *httputil.RateLimitError
+					if !errors.As(subErr, &rl) {
+						break
+					}
+					if !promptRateLimit(rl, &requestDelay) {
+						return 0, skippedPods
+					}
+				}
+				if subErr != nil {
+					fmt.Printf("  warning: could not subscribe to %q: %v — play state may not persist\n", appleTitle, subErr)
+				} else {
+					fmt.Printf("  subscribed to %q\n", appleTitle)
+				}
+				time.Sleep(requestDelay)
+			}
+			feedToPageURL[feedURL] = pageURL
+			continue
+		}
+
+		// Fall back to search_autocomplete for private/unindexed feeds (no iTunes ID).
 		// Use the overcastID from the OPML as a hint to verify the search result
 		// (empty string is fine — search will fall back to title matching).
 		hintOvercastID := ""

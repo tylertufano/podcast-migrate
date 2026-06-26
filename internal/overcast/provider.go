@@ -355,13 +355,11 @@ func (p *Provider) doWriteSubscriptionsAPI(ctx context.Context, lib *model.Libra
 			if result, findErr := itunes.FindByHints(ctx, client, pod.Title, pod.FeedURL, pod.Author); findErr == nil && result.CollectionID > 0 {
 				resolvedITunesID = fmt.Sprintf("%d", result.CollectionID)
 			}
-			time.Sleep(requestDelay) // pace the iTunes search request
 		}
 
 		// When the iTunes ID is known, fetch the /itunes{ID} listing page and let
 		// SubscribeToPodcast extract the Overcast internal ID from the page HTML.
-		// SubscribeToPodcast sleeps requestDelay between the GET and the AddPodcast
-		// POST; we sleep again after it returns to pace the next iteration.
+		// The GET+POST are one logical operation; sleep once after it returns.
 		// For podcasts with no iTunes ID, fall back to search_autocomplete.
 		if resolvedITunesID != "" {
 			if opts.DryRun {
@@ -373,7 +371,7 @@ func (p *Provider) doWriteSubscriptionsAPI(ctx context.Context, lib *model.Libra
 			pageURL := overcastBaseURL + "/itunes" + resolvedITunesID
 			var subErr error
 			for {
-				subErr = SubscribeToPodcast(ctx, client, pageURL, requestDelay)
+				subErr = SubscribeToPodcast(ctx, client, pageURL)
 				if subErr == nil {
 					break
 				}
@@ -1065,13 +1063,11 @@ func augmentIndexFromPodcastPages(
 			if result, err := itunes.FindByHints(ctx, client, appleTitle, feedURL, ""); err == nil && result.CollectionID > 0 {
 				resolvedITunesID = fmt.Sprintf("%d", result.CollectionID)
 			}
-			time.Sleep(requestDelay) // pace the iTunes search request
 		}
 		if resolvedITunesID != "" {
 			// Fetch the /itunes{ID} listing page, extract the Overcast internal
 			// podcast ID from the embedded /podcasts/add/{id} path, and POST to
-			// AddPodcast. SubscribeToPodcast sleeps requestDelay between the GET
-			// and the POST; we sleep again after it returns to pace the next feed.
+			// AddPodcast. The GET+POST are one logical operation; sleep once after.
 			pageURL := overcastBaseURL + "/itunes" + resolvedITunesID
 			if dryRun {
 				fmt.Printf("  [dry-run] would subscribe to %q (iTunes ID %s)\n", appleTitle, resolvedITunesID)
@@ -1079,7 +1075,7 @@ func augmentIndexFromPodcastPages(
 				fmt.Printf("  subscribing to %q (iTunes ID %s)...\n", appleTitle, resolvedITunesID)
 				var subErr error
 				for {
-					subErr = SubscribeToPodcast(ctx, client, pageURL, requestDelay)
+					subErr = SubscribeToPodcast(ctx, client, pageURL)
 					if subErr == nil {
 						break
 					}

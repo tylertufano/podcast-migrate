@@ -348,6 +348,17 @@ For each podcast in the source library:
 
 **OPML export** (when `--overcast-out` is provided): generates an OPML file that the user imports via **Overcast → Settings → Import OPML**. No credentials required. Use this path when you want to review subscriptions before committing, or when credentials are not available.
 
+#### Recommended migration order — avoid unexpected downloads
+
+When Overcast subscribes to a new podcast it automatically enqueues recent episodes for download based on the app's **Download** setting (default: automatic). If you write play state before Overcast knows which episodes are already played, it will queue those episodes for download and then mark them played — wasting bandwidth and cluttering the queue.
+
+Recommended order:
+
+1. **Subscribe first** — run `--only-subscriptions`, import an OPML file, or add feeds manually. This gives Overcast time to index each feed.
+2. **Set Download to Manual** — in the Overcast app: Settings → Default Settings → Download → **Off** (or set it per-podcast). This prevents auto-download when play state is written in the next step.
+3. **Sync play state** — run with `--play-state` (and optionally `--subscribed-only` to skip unmatched feeds). Overcast will mark episodes as played without downloading them.
+4. **Re-enable automatic downloads** (optional) — once play state is synced, restore your preferred Download setting.
+
 ### Writing — Play State (unofficial API)
 
 **Authentication**: POST to `overcast.fm/login` with email, password, and `then=account`. Session cookie is stored in the HTTP client's cookie jar.

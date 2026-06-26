@@ -96,6 +96,8 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **`--since` is Apple-only** — delta sync currently only filters the Apple Podcasts SQLite reader. Overcast and Pocket Casts sources always read the full play history.
 
+**Overcast migration order** — when migrating to Overcast, subscribe to podcasts *before* writing play state to avoid unwanted downloads. On subscription, Overcast auto-downloads recent episodes unless the Download setting is set to **Off** (Settings → Default Settings → Download). Recommended order: (1) subscribe with `--only-subscriptions` or OPML import, (2) set Download to Off in the Overcast app, (3) run the full `--play-state` sync. See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for details.
+
 ## Future work
 
 ### Reliability and correctness

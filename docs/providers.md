@@ -314,7 +314,7 @@ Auto-subscribe runs before the play state write, so that newly subscribed feeds 
 |---|---|
 | Read subscriptions | ✓ (from OPML — explicit file or auto-fetched) |
 | Read play state | ✓ (from extended OPML — explicit file or auto-fetched) |
-| Write subscriptions | ✓ (generates OPML import file) |
+| Write subscriptions | ✓ (API when credentials set; or OPML import file via `--overcast-out`) |
 | Write play state | ✓ (unofficial web API, when credentials set) |
 
 ### Reading — source OPML
@@ -336,7 +336,17 @@ The cache is valid for 24 hours. Use `--clear-source-opml-cache` to force a fres
 
 ### Writing — Subscriptions
 
-Generates an OPML file at `--overcast-out` that the user imports via **Overcast → Settings → Import OPML**. This is the only supported subscription write path (Overcast has no API for programmatic subscription management).
+Two paths are supported, selected automatically:
+
+**API subscribe** (when `OVERCAST_EMAIL` + `OVERCAST_PASSWORD` are set and `--overcast-out` is not provided): subscribes each podcast programmatically via the same unofficial web API used by the play-state write path. This is the path taken by `--only-subscriptions` when credentials are configured.
+
+For each podcast in the source library:
+- Already subscribed on Overcast (matched by normalised title from `/podcasts`) → skip
+- Private/subscriber-edition feed (`IsPrivate` or `model.IsSubscriberFeed`) → collected into skipped-feeds OPML (Overcast has no API path for non-iTunes feeds)
+- iTunes ID available (from source library or `itunes.FindByHints`) → `GET /itunes{ID}` which subscribes as a side-effect (`SubscribeToPodcast`)
+- Otherwise → `search_autocomplete` → `POST /podcasts/add/{overcastID}` (`AddPodcast`)
+
+**OPML export** (when `--overcast-out` is provided): generates an OPML file that the user imports via **Overcast → Settings → Import OPML**. No credentials required. Use this path when you want to review subscriptions before committing, or when credentials are not available.
 
 ### Writing — Play State (unofficial API)
 

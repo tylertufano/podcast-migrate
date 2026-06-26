@@ -203,19 +203,28 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 }
 
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
-	// Only write subscriptions when an export path is configured and play-state-only
-	// mode was not explicitly requested. When exportOPMLPath is empty we skip the
-	// subscription write silently — the caller already knows WriteSubscriptions is
-	// false via Capabilities() and has chosen not to provide a path.
-	writeSubscriptions := !opts.OnlyPlayState && p.exportOPMLPath != ""
+	// Subscription writes have two paths:
+	//   - OPML export (--overcast-out): always available, no credentials needed.
+	//   - API subscribe (credentials set, no --overcast-out): programmatically
+	//     subscribes each podcast via the /itunes{ID} or search_autocomplete path.
+	//     This is the right path for --only-subscriptions when the user has Overcast
+	//     credentials configured and does not want a manual OPML import step.
+	writeSubscriptionsOPML := !opts.OnlyPlayState && p.exportOPMLPath != ""
+	writeSubscriptionsAPI  := !opts.OnlyPlayState && p.email != "" && p.exportOPMLPath == ""
+	writeSubscriptions := writeSubscriptionsOPML || writeSubscriptionsAPI
 	writePlayState := !opts.OnlySubscriptions && p.email != ""
 
-	// When OnlyPlayState is explicitly requested but no credentials are configured,
-	// return a clear error rather than silently doing nothing.
+	// Explicit mode guards: return clear errors when the requested mode has no path.
 	if opts.OnlyPlayState && p.email == "" {
 		return &provider.ErrCapabilityUnsupported{
 			Provider:  p.Name(),
 			Operation: "write play state (no credentials configured — set OVERCAST_EMAIL and OVERCAST_PASSWORD, or use --overcast-email/--overcast-password)",
+		}
+	}
+	if opts.OnlySubscriptions && !writeSubscriptions {
+		return &provider.ErrCapabilityUnsupported{
+			Provider:  p.Name(),
+			Operation: "write subscriptions (set OVERCAST_EMAIL and OVERCAST_PASSWORD for API subscribe, or provide --overcast-out for OPML export)",
 		}
 	}
 
@@ -227,7 +236,7 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 		}
 	}
 
-	if writeSubscriptions {
+	if writeSubscriptionsOPML {
 		if opts.DryRun {
 			fmt.Printf("[dry-run] would write %d subscriptions to %s\n",
 				len(lib.Podcasts), p.exportOPMLPath)
@@ -235,6 +244,12 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 			if err := (&OPMLWriter{}).Write(lib, p.exportOPMLPath); err != nil {
 				return err
 			}
+		}
+	}
+
+	if writeSubscriptionsAPI {
+		if err := p.doWriteSubscriptionsAPI(ctx, lib, opts); err != nil {
+			return err
 		}
 	}
 
@@ -250,6 +265,177 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 		fmt.Printf("%supdated play state for %d episode(s)\n", prefix, n)
 	}
 
+	return nil
+}
+
+// doWriteSubscriptionsAPI subscribes to each podcast in lib via the Overcast web API.
+// It is the credentials-based path for --only-subscriptions when --overcast-out is not set.
+//
+// For each podcast in lib:
+//   - Already subscribed on Overcast (matched by normalised title from /podcasts) → skip
+//   - Private/subscriber-edition (IsPrivate or model.IsSubscriberFeed) → skipped-feeds OPML
+//   - iTunes ID available → GET /itunes{ID} (SubscribeToPodcast)
+//   - Otherwise → search_autocomplete → AddPodcast
+func (p *Provider) doWriteSubscriptionsAPI(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
+	requestDelay := opts.RequestDelay
+	if requestDelay <= 0 {
+		requestDelay = DefaultRequestDelay
+	}
+
+	fmt.Printf("overcast: authenticating as %s...\n", p.email)
+	client, err := Login(ctx, p.email, p.password)
+	if err != nil {
+		return fmt.Errorf("overcast: authentication failed: %w", err)
+	}
+	time.Sleep(requestDelay)
+
+	// Fetch current subscriptions to build an already-subscribed index.
+	pageURLByNormTitle := make(map[string]string)
+	subs, subsErr := FetchSubscribedPodcasts(ctx, client)
+	if subsErr != nil {
+		fmt.Printf("  warning: could not fetch /podcasts (%v) — will attempt to subscribe all\n", subsErr)
+	} else {
+		for _, s := range subs {
+			norm := strings.ToLower(strings.TrimSpace(s.Title))
+			if _, exists := pageURLByNormTitle[norm]; !exists {
+				pageURLByNormTitle[norm] = s.PageURL
+			}
+			if base := model.NormalizePlusTitle(s.Title); base != norm {
+				if _, exists := pageURLByNormTitle[base]; !exists {
+					pageURLByNormTitle[base] = s.PageURL
+				}
+			}
+		}
+		fmt.Printf("overcast: %d podcast(s) already subscribed\n", len(subs))
+		time.Sleep(requestDelay)
+	}
+
+	// Build private-flag and iTunes-ID maps from the source library.
+	feedIsPrivate := make(map[string]bool, len(lib.Podcasts))
+	feedToITunesID := make(map[string]string, len(lib.Podcasts))
+	for _, pod := range lib.Podcasts {
+		if pod.FeedURL == "" {
+			continue
+		}
+		if pod.IsPrivate || model.IsSubscriberFeed(pod.Title, pod.FeedURL) {
+			feedIsPrivate[pod.FeedURL] = true
+		} else if pod.ITunesID != "" {
+			feedToITunesID[pod.FeedURL] = pod.ITunesID
+		}
+	}
+
+	var skippedPods []model.Podcast
+	added := 0
+	for _, pod := range lib.Podcasts {
+		if pod.FeedURL == "" || pod.Title == "" {
+			continue
+		}
+		normTitle := strings.ToLower(strings.TrimSpace(pod.Title))
+
+		// Skip if already subscribed (exact or Plus-normalised title match).
+		if _, found := pageURLByNormTitle[normTitle]; found {
+			continue
+		}
+		if base := model.NormalizePlusTitle(pod.Title); base != normTitle {
+			if _, found := pageURLByNormTitle[base]; found {
+				continue
+			}
+		}
+
+		// Private/subscriber feeds cannot be subscribed via iTunes page.
+		if feedIsPrivate[pod.FeedURL] {
+			fmt.Printf("  note: %q is a private/subscriber feed — will include in skipped-feeds OPML for manual import\n", pod.Title)
+			skippedPods = append(skippedPods, pod)
+			continue
+		}
+
+		// Resolve iTunes ID: from source library, then FindByHints.
+		resolvedITunesID := feedToITunesID[pod.FeedURL]
+		if resolvedITunesID == "" {
+			if result, findErr := itunes.FindByHints(ctx, client, pod.Title, pod.FeedURL, pod.Author); findErr == nil && result.CollectionID > 0 {
+				resolvedITunesID = fmt.Sprintf("%d", result.CollectionID)
+			}
+		}
+
+		if resolvedITunesID != "" {
+			pageURL := overcastBaseURL + "/itunes" + resolvedITunesID
+			if opts.DryRun {
+				fmt.Printf("  [dry-run] would subscribe to %q (iTunes ID %s)\n", pod.Title, resolvedITunesID)
+				added++
+			} else {
+				fmt.Printf("  subscribing to %q (iTunes ID %s)...\n", pod.Title, resolvedITunesID)
+				var subErr error
+				for {
+					subErr = SubscribeToPodcast(ctx, client, pageURL)
+					if subErr == nil {
+						break
+					}
+					var rl *httputil.RateLimitError
+					if !errors.As(subErr, &rl) {
+						break
+					}
+					if !promptRateLimit(rl, &requestDelay) {
+						p.writeSkippedOPML(skippedPods, false)
+						return nil
+					}
+				}
+				if subErr != nil {
+					fmt.Printf("  warning: could not subscribe to %q: %v\n", pod.Title, subErr)
+				} else {
+					fmt.Printf("  subscribed to %q\n", pod.Title)
+					added++
+				}
+				time.Sleep(requestDelay)
+			}
+			continue
+		}
+
+		// Fall back to search_autocomplete.
+		if opts.DryRun {
+			fmt.Printf("  [dry-run] would search and subscribe to %q\n", pod.Title)
+			added++
+			continue
+		}
+		searchResult, searchErr := searchPodcastWithRetry(ctx, client, normTitle, "", requestDelay)
+		if searchErr != nil || searchResult.ITunesID == "" {
+			fmt.Printf("  warning: %q not found in Overcast search — will include in skipped-feeds OPML\n", pod.Title)
+			skippedPods = append(skippedPods, pod)
+			continue
+		}
+		fmt.Printf("  subscribing to %q (search)...\n", pod.Title)
+		time.Sleep(requestDelay)
+		var subErr error
+		for {
+			subErr = AddPodcast(ctx, client, searchResult.OvercastID)
+			if subErr == nil {
+				break
+			}
+			var rl *httputil.RateLimitError
+			if !errors.As(subErr, &rl) {
+				break
+			}
+			if !promptRateLimit(rl, &requestDelay) {
+				p.writeSkippedOPML(skippedPods, false)
+				return nil
+			}
+		}
+		if subErr != nil {
+			fmt.Printf("  warning: could not subscribe to %q: %v\n", pod.Title, subErr)
+		} else {
+			fmt.Printf("  subscribed to %q\n", pod.Title)
+			added++
+		}
+		time.Sleep(requestDelay)
+	}
+
+	prefix := ""
+	if opts.DryRun {
+		prefix = "[dry-run] "
+	}
+	fmt.Printf("%sovercast: subscriptions: %d added, %d private/skipped\n", prefix, added, len(skippedPods))
+	if len(skippedPods) > 0 {
+		p.writeSkippedOPML(skippedPods, opts.DryRun)
+	}
 	return nil
 }
 

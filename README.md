@@ -15,14 +15,14 @@ Episode matching uses a cascade of up to six strategies (GUID → feed URL + pub
 | Provider | Read subscriptions | Read play state | Write subscriptions | Write play state |
 |---|:---:|:---:|:---:|:---:|
 | Apple Podcasts | ✅ | ✅ | ✅ (KVS¹ → syncs to all devices) | ✅ (web API + KVS² or KVS-only³ → syncs to all devices) |
-| Overcast | ✅ | ✅ | ✅ (OPML + auto on play-state write⁴) | ✅ (unofficial web API) |
+| Overcast | ✅ | ✅ | ✅ (API when credentials set⁴; or OPML export via `--overcast-out`) | ✅ (unofficial web API) |
 | Pocket Casts | ✅ | ✅ complete history | ✅ (auto on play-state write⁴) | ✅ (unofficial web API) |
 | OPML | ✅ | ✅ (extended format) | ✅ | ✅ (extended format) |
 
 ¹ Apple subscription writes require KVS credentials (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`) captured via Proxyman. Subscriptions are written automatically during a play-state migration, or can be written standalone with `--only-subscriptions` (also requires KVS credentials).
 ² **Web API + KVS (recommended)**: Bearer token + `media-user-token` handle public-catalog episodes via `amp-api`; KVS handles private/subscriber-feed episodes. Public feeds resolve immediately without waiting for local indexing.
 ³ **KVS-only**: Set only `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` — no web API tokens needed. All episodes sync via KVS. Pre-existing subscriptions resolve immediately from the local SQLite DB; newly subscribed feeds wait for Apple Podcasts to index them first.
-⁴ Subscriptions are written automatically during a play-state write unless `--subscribed-only` is set.
+⁴ Overcast subscriptions use the unofficial web API when credentials are set (`OVERCAST_EMAIL` + `OVERCAST_PASSWORD`). `--only-subscriptions` with credentials subscribes programmatically without writing play state. Provide `--overcast-out` instead for an OPML file for manual import (no credentials needed). Private/subscriber feeds are always collected in a skipped-feeds OPML regardless of path.
 
 ## Platform support
 

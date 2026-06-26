@@ -516,17 +516,17 @@ func FetchSubscribedPodcasts(ctx context.Context, client *http.Client) ([]Subscr
 // data attribute, or script variable). The ID is a sequence of digits.
 var addPathRe = regexp.MustCompile(`/podcasts/add/(\d+)`)
 
-// unsubscribeRe detects an unsubscribe link or form on the podcast listing page,
-// indicating the account is already subscribed.
-var unsubscribeRe = regexp.MustCompile(`(?i)unsubscribe`)
+// deletePodcastPathRe detects the /podcasts/delete/{id} path that Overcast
+// renders when the account is already subscribed (shown instead of /podcasts/add).
+var deletePodcastPathRe = regexp.MustCompile(`/podcasts/delete/\d+`)
 
 // SubscribeToPodcast subscribes to a podcast by fetching its Overcast listing
 // page, extracting the Overcast internal podcast ID from the /podcasts/add/{id}
 // path present in the page HTML, and calling AddPodcast with that ID.
 //
-// Returns nil immediately when the page already shows an unsubscribe option
-// (i.e. the account is already subscribed). Returns an error when no
-// /podcasts/add/{id} path can be found in the page HTML.
+// Returns nil immediately when the page contains a /podcasts/delete/{id} path,
+// which indicates the account is already subscribed. Returns an error when
+// neither path can be found.
 //
 // The client must be authenticated (obtained from Login).
 func SubscribeToPodcast(ctx context.Context, client *http.Client, podcastPageURL string) error {
@@ -550,19 +550,19 @@ func SubscribeToPodcast(ctx context.Context, client *http.Client, podcastPageURL
 		return fmt.Errorf("overcast/web: GET %s returned HTTP %d", podcastPageURL, resp.StatusCode)
 	}
 
-	// Already subscribed — Overcast shows an unsubscribe option instead of add.
-	if unsubscribeRe.Match(body) {
-		return nil
+	// Extract the Overcast internal podcast ID from the /podcasts/add/{id} path.
+	m := addPathRe.FindSubmatch(body)
+	if m != nil {
+		return AddPodcast(ctx, client, string(m[1]))
 	}
 
-	// Extract the Overcast internal podcast ID from the /podcasts/add/{id} path
-	// embedded in the page HTML (present in links and data attributes even when
-	// the subscribe button itself is JS-rendered).
-	m := addPathRe.FindSubmatch(body)
-	if m == nil {
-		return fmt.Errorf("overcast/web: podcast ID not found on %s", podcastPageURL)
+	// No /podcasts/add path — check whether the podcast is already subscribed
+	// (Overcast shows /podcasts/delete/{id} instead of add when subscribed).
+	if deletePodcastPathRe.Match(body) {
+		return nil // already subscribed — nothing to do
 	}
-	return AddPodcast(ctx, client, string(m[1]))
+
+	return fmt.Errorf("overcast/web: podcast ID not found on %s", podcastPageURL)
 }
 
 // PodcastEpisodeListing holds the minimal data for one episode extracted from a podcast page.

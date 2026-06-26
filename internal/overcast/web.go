@@ -523,11 +523,13 @@ var overcastPodcastIDRe = regexp.MustCompile(`/podcasts/(?:add|delete)/(\d+)`)
 // AddPodcast with that ID. AddPodcast is idempotent; already-subscribed
 // deduplication is the caller's responsibility (via FetchSubscribedPodcasts).
 //
-// The GET and POST are treated as a single logical operation. The caller is
-// responsible for sleeping between subscribe operations.
+// requestDelay is inserted between the page GET and the AddPodcast POST so
+// the two Overcast requests within a single subscribe operation are spaced
+// apart. The caller sleeps again after SubscribeToPodcast returns to pace
+// the gap before the next subscribe.
 //
 // The client must be authenticated (obtained from Login).
-func SubscribeToPodcast(ctx context.Context, client *http.Client, podcastPageURL string) error {
+func SubscribeToPodcast(ctx context.Context, client *http.Client, podcastPageURL string, requestDelay time.Duration) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, podcastPageURL, nil)
 	if err != nil {
 		return fmt.Errorf("overcast/web: subscribe page request: %w", err)
@@ -551,6 +553,9 @@ func SubscribeToPodcast(ctx context.Context, client *http.Client, podcastPageURL
 	m := overcastPodcastIDRe.FindSubmatch(body)
 	if m == nil {
 		return fmt.Errorf("overcast/web: podcast ID not found on %s", podcastPageURL)
+	}
+	if requestDelay > 0 {
+		time.Sleep(requestDelay)
 	}
 	return AddPodcast(ctx, client, string(m[1]))
 }

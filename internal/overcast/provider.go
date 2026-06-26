@@ -19,10 +19,19 @@ import (
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
 
-// DefaultRequestDelay is the pause between consecutive Overcast API requests
-// when WriteOptions.RequestDelay is not set. 1 s is conservative enough to
-// avoid triggering Overcast's rate limiter, especially during the extended
-// matching phase which fetches one page per subscribed podcast.
+// DefaultRequestDelayPlayState is the default pause between Overcast API calls
+// during a play-state write. Subscribes are interspersed with episode fetches
+// so the effective subscribe rate is low; 3 s gives comfortable headroom.
+const DefaultRequestDelayPlayState = 3 * time.Second
+
+// DefaultRequestDelaySubscriptions is the default pause between subscribe
+// operations during an --only-subscriptions run. Each subscribe makes two
+// back-to-back Overcast requests (GET listing page + POST add); a 4 s gap
+// provides enough spacing to avoid Overcast's bulk-subscribe rate limiter.
+const DefaultRequestDelaySubscriptions = 4 * time.Second
+
+// DefaultRequestDelay is the fallback when neither mode-specific constant
+// applies (e.g. OPML export paths that don't enter the subscribe loop).
 const DefaultRequestDelay = 1 * time.Second
 
 // Provider implements provider.Provider for Overcast.
@@ -279,7 +288,7 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 func (p *Provider) doWriteSubscriptionsAPI(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
 	requestDelay := opts.RequestDelay
 	if requestDelay <= 0 {
-		requestDelay = DefaultRequestDelay
+		requestDelay = DefaultRequestDelaySubscriptions
 	}
 
 	fmt.Printf("overcast: authenticating as %s...\n", p.email)
@@ -371,7 +380,7 @@ func (p *Provider) doWriteSubscriptionsAPI(ctx context.Context, lib *model.Libra
 			pageURL := overcastBaseURL + "/itunes" + resolvedITunesID
 			var subErr error
 			for {
-				subErr = SubscribeToPodcast(ctx, client, pageURL)
+				subErr = SubscribeToPodcast(ctx, client, pageURL, requestDelay)
 				if subErr == nil {
 					break
 				}
@@ -502,7 +511,7 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	//    pauses and is consistent across all steps.
 	requestDelay := opts.RequestDelay
 	if requestDelay <= 0 {
-		requestDelay = DefaultRequestDelay
+		requestDelay = DefaultRequestDelayPlayState
 	}
 
 	// 3. Resolve the matching library:
@@ -1075,7 +1084,7 @@ func augmentIndexFromPodcastPages(
 				fmt.Printf("  subscribing to %q (iTunes ID %s)...\n", appleTitle, resolvedITunesID)
 				var subErr error
 				for {
-					subErr = SubscribeToPodcast(ctx, client, pageURL)
+					subErr = SubscribeToPodcast(ctx, client, pageURL, requestDelay)
 					if subErr == nil {
 						break
 					}

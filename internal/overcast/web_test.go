@@ -804,7 +804,7 @@ func TestSubscribeToPodcast_PostsForm(t *testing.T) {
 	defer overcast.SetBaseURLForTest("https://overcast.fm")
 
 	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(),
-		srv.URL+"/itunes1234567890")
+		srv.URL+"/itunes1234567890", 0)
 	if err != nil {
 		t.Fatalf("SubscribeToPodcast: %v", err)
 	}
@@ -835,7 +835,7 @@ func TestSubscribeToPodcast_DeletePathExtractsID(t *testing.T) {
 	defer overcast.SetBaseURLForTest("https://overcast.fm")
 
 	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(),
-		srv.URL+"/itunes1234567890")
+		srv.URL+"/itunes1234567890", 0)
 	if err != nil {
 		t.Fatalf("SubscribeToPodcast (delete path): %v", err)
 	}
@@ -978,7 +978,7 @@ func TestSubscribeToPodcast_GetError(t *testing.T) {
 	overcast.SetBaseURLForTest(srv.URL)
 	defer overcast.SetBaseURLForTest("https://overcast.fm")
 
-	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(), srv.URL+"/itunes999")
+	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(), srv.URL+"/itunes999", 0)
 	if err == nil {
 		t.Error("expected error when GET returns 404, got nil")
 	}
@@ -995,7 +995,7 @@ func TestSubscribeToPodcast_NoFormFound(t *testing.T) {
 	overcast.SetBaseURLForTest(srv.URL)
 	defer overcast.SetBaseURLForTest("https://overcast.fm")
 
-	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(), srv.URL+"/itunes999")
+	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(), srv.URL+"/itunes999", 0)
 	if err == nil {
 		t.Error("expected error when podcast ID not found in page, got nil")
 	}

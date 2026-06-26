@@ -773,8 +773,11 @@ const mockPodcastPageSubscribe = `<!DOCTYPE html><html><body>
 <a href="/podcasts/add/99887766" class="button">Add to Overcast</a>
 </body></html>`
 
-// mockPodcastPageAlreadySubscribed simulates the page when already subscribed:
-// an unsubscribe link is present, no /podcasts/add path.
+// mockPodcastPageAlreadySubscribed simulates the Overcast podcast page when
+// the account is already subscribed. Overcast renders /podcasts/delete/{id} in
+// this state — but due to a known site bug, this link also appears when NOT
+// subscribed. SubscribeToPodcast therefore always calls AddPodcast regardless;
+// already-subscribed dedup is handled by the caller via FetchSubscribedPodcasts.
 const mockPodcastPageAlreadySubscribed = `<!DOCTYPE html><html><body>
 <a href="/podcasts/delete/99887766" class="button">Unsubscribe</a>
 </body></html>`
@@ -810,14 +813,21 @@ func TestSubscribeToPodcast_PostsForm(t *testing.T) {
 	}
 }
 
-func TestSubscribeToPodcast_AlreadySubscribedIsNoop(t *testing.T) {
-	posted := false
+func TestSubscribeToPodcast_DeletePathExtractsID(t *testing.T) {
+	// Overcast shows /podcasts/delete/{id} regardless of subscription state (site
+	// bug). SubscribeToPodcast must still extract the ID and call AddPodcast.
+	var addPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			posted = true
+		switch {
+		case r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, mockPodcastPageAlreadySubscribed)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/podcasts/add/"):
+			addPath = r.URL.Path
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
 		}
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, mockPodcastPageAlreadySubscribed)
 	}))
 	defer srv.Close()
 
@@ -827,10 +837,10 @@ func TestSubscribeToPodcast_AlreadySubscribedIsNoop(t *testing.T) {
 	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(),
 		srv.URL+"/itunes1234567890")
 	if err != nil {
-		t.Fatalf("SubscribeToPodcast (already subscribed): %v", err)
+		t.Fatalf("SubscribeToPodcast (delete path): %v", err)
 	}
-	if posted {
-		t.Error("should not POST when already subscribed (unsubscribe detected)")
+	if addPath != "/podcasts/add/99887766" {
+		t.Errorf("AddPodcast path = %q, want /podcasts/add/99887766", addPath)
 	}
 }
 

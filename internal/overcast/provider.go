@@ -357,39 +357,59 @@ func (p *Provider) doWriteSubscriptionsAPI(ctx context.Context, lib *model.Libra
 			}
 		}
 
-		// Resolve Overcast's internal podcast ID.
-		// For catalog podcasts, Overcast's internal ID equals the iTunes Store ID
-		// (their catalog URLs are /itunes{ID}/slug). When we have an iTunes ID from
-		// the source library we can skip the search_autocomplete round-trip entirely.
-		// For self-hosted podcasts with no iTunes ID, fall back to search_autocomplete
-		// to obtain the ID — a zero result means Overcast cannot resolve the podcast
-		// and we add it to the skipped-feeds OPML.
-		overcastID := resolvedITunesID
-		if overcastID == "" {
+		// When the iTunes ID is known, fetch the /itunes{ID} listing page and let
+		// SubscribeToPodcast extract the Overcast internal ID from the page HTML.
+		// For podcasts with no iTunes ID, fall back to search_autocomplete.
+		if resolvedITunesID != "" {
 			if opts.DryRun {
-				fmt.Printf("  [dry-run] would search and subscribe to %q\n", pod.Title)
+				fmt.Printf("  [dry-run] would subscribe to %q\n", pod.Title)
 				added++
 				continue
 			}
-			searchResult, searchErr := searchPodcastWithRetry(ctx, client, normTitle, "", requestDelay)
-			if searchErr != nil || searchResult.OvercastID == "" {
-				fmt.Printf("  warning: %q not found in Overcast search — will include in skipped-feeds OPML\n", pod.Title)
-				skippedPods = append(skippedPods, pod)
-				continue
+			fmt.Printf("  subscribing to %q...\n", pod.Title)
+			pageURL := overcastBaseURL + "/itunes" + resolvedITunesID
+			var subErr error
+			for {
+				subErr = SubscribeToPodcast(ctx, client, pageURL)
+				if subErr == nil {
+					break
+				}
+				var rl *httputil.RateLimitError
+				if !errors.As(subErr, &rl) {
+					break
+				}
+				if !promptRateLimit(rl, &requestDelay) {
+					p.writeSkippedOPML(skippedPods, false)
+					return nil
+				}
 			}
-			overcastID = searchResult.OvercastID
+			if subErr != nil {
+				fmt.Printf("  warning: could not subscribe to %q: %v\n", pod.Title, subErr)
+			} else {
+				fmt.Printf("  subscribed to %q\n", pod.Title)
+				added++
+			}
 			time.Sleep(requestDelay)
+			continue
 		}
 
+		// No iTunes ID — search_autocomplete fallback.
 		if opts.DryRun {
-			fmt.Printf("  [dry-run] would subscribe to %q\n", pod.Title)
+			fmt.Printf("  [dry-run] would search and subscribe to %q\n", pod.Title)
 			added++
 			continue
 		}
-		fmt.Printf("  subscribing to %q...\n", pod.Title)
+		searchResult, searchErr := searchPodcastWithRetry(ctx, client, normTitle, "", requestDelay)
+		if searchErr != nil || searchResult.OvercastID == "" {
+			fmt.Printf("  warning: %q not found in Overcast search — will include in skipped-feeds OPML\n", pod.Title)
+			skippedPods = append(skippedPods, pod)
+			continue
+		}
+		fmt.Printf("  subscribing to %q (search)...\n", pod.Title)
+		time.Sleep(requestDelay)
 		var subErr error
 		for {
-			subErr = AddPodcast(ctx, client, overcastID)
+			subErr = AddPodcast(ctx, client, searchResult.OvercastID)
 			if subErr == nil {
 				break
 			}
@@ -1044,11 +1064,10 @@ func augmentIndexFromPodcastPages(
 			}
 		}
 		if resolvedITunesID != "" {
-			// For catalog podcasts, Overcast's internal podcast ID equals the iTunes
-			// Store ID — their catalog URLs are /itunes{ID}/slug and AddPodcast's
-			// endpoint accepts the same numeric ID. Posting directly avoids the
-			// SubscribeToPodcast page-scrape path, which breaks when the subscribe
-			// form is JS-rendered.
+			// Fetch the /itunes{ID} listing page, extract the Overcast internal
+			// podcast ID from the embedded /podcasts/add/{id} path, and POST to
+			// AddPodcast. SubscribeToPodcast handles all of this in one call and
+			// is a no-op when the podcast is already subscribed.
 			pageURL := overcastBaseURL + "/itunes" + resolvedITunesID
 			if dryRun {
 				fmt.Printf("  [dry-run] would subscribe to %q (iTunes ID %s)\n", appleTitle, resolvedITunesID)
@@ -1056,7 +1075,7 @@ func augmentIndexFromPodcastPages(
 				fmt.Printf("  subscribing to %q (iTunes ID %s)...\n", appleTitle, resolvedITunesID)
 				var subErr error
 				for {
-					subErr = AddPodcast(ctx, client, resolvedITunesID)
+					subErr = SubscribeToPodcast(ctx, client, pageURL)
 					if subErr == nil {
 						break
 					}

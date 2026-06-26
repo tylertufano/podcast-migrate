@@ -765,31 +765,31 @@ func TestFetchSubscribedPodcasts_ParsesCells(t *testing.T) {
 
 // --- SubscribeToPodcast ---
 
+// mockPodcastPageSubscribe simulates an Overcast podcast listing page for an
+// unsubscribed podcast. The /podcasts/add/{id} path is embedded in a link
+// element — the subscribe button itself may be JS-rendered, but the ID is
+// always present in the static HTML.
 const mockPodcastPageSubscribe = `<!DOCTYPE html><html><body>
-<form method="post" action="/itunes1234567890">
-  <input type="hidden" name="feedURL" value="https://feeds.example.com/show">
-  <input type="hidden" name="action" value="subscribe">
-  <button type="submit" class="fullbutton">Subscribe</button>
-</form>
+<a href="/podcasts/add/99887766" class="button">Add to Overcast</a>
 </body></html>`
 
+// mockPodcastPageAlreadySubscribed simulates the page when already subscribed:
+// an unsubscribe link is present, no /podcasts/add path.
 const mockPodcastPageAlreadySubscribed = `<!DOCTYPE html><html><body>
-<form method="post" action="/itunes1234567890">
-  <input type="hidden" name="action" value="unsubscribe">
-  <button type="submit" class="fullbutton">Unsubscribe</button>
-</form>
+<a href="/podcasts/delete/99887766" class="button">Unsubscribe</a>
 </body></html>`
 
 func TestSubscribeToPodcast_PostsForm(t *testing.T) {
-	var gotBody string
+	// Renamed: now verifies that the Overcast ID is extracted from the page HTML
+	// and AddPodcast is called (POST /podcasts/add/{id}).
+	var addPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/itunes1234567890":
 			w.Header().Set("Content-Type", "text/html")
 			fmt.Fprint(w, mockPodcastPageSubscribe)
-		case r.Method == http.MethodPost && r.URL.Path == "/itunes1234567890":
-			_ = r.ParseForm()
-			gotBody = r.Form.Encode()
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/podcasts/add/"):
+			addPath = r.URL.Path
 			w.WriteHeader(http.StatusOK)
 		default:
 			http.NotFound(w, r)
@@ -805,8 +805,8 @@ func TestSubscribeToPodcast_PostsForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubscribeToPodcast: %v", err)
 	}
-	if !strings.Contains(gotBody, "subscribe") {
-		t.Errorf("POST body should contain subscribe fields, got: %q", gotBody)
+	if addPath != "/podcasts/add/99887766" {
+		t.Errorf("AddPodcast path = %q, want /podcasts/add/99887766", addPath)
 	}
 }
 
@@ -830,7 +830,7 @@ func TestSubscribeToPodcast_AlreadySubscribedIsNoop(t *testing.T) {
 		t.Fatalf("SubscribeToPodcast (already subscribed): %v", err)
 	}
 	if posted {
-		t.Error("should not POST when already subscribed (unsubscribe form detected)")
+		t.Error("should not POST when already subscribed (unsubscribe detected)")
 	}
 }
 
@@ -975,10 +975,10 @@ func TestSubscribeToPodcast_GetError(t *testing.T) {
 }
 
 func TestSubscribeToPodcast_NoFormFound(t *testing.T) {
-	// Page exists but has no subscribe form → error returned.
+	// Page exists but contains no /podcasts/add/{id} path → error returned.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`<html><body><p>No form here</p></body></html>`))
+		_, _ = w.Write([]byte(`<html><body><p>No podcast ID here</p></body></html>`))
 	}))
 	defer srv.Close()
 
@@ -987,7 +987,7 @@ func TestSubscribeToPodcast_NoFormFound(t *testing.T) {
 
 	err := overcast.SubscribeToPodcast(context.Background(), srv.Client(), srv.URL+"/itunes999")
 	if err == nil {
-		t.Error("expected error when subscribe form not found, got nil")
+		t.Error("expected error when podcast ID not found in page, got nil")
 	}
 }
 

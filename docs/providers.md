@@ -343,8 +343,10 @@ Two paths are supported, selected automatically:
 For each podcast in the source library:
 - Already subscribed on Overcast (matched by normalised title from `/podcasts`) → skip
 - Private/subscriber-edition feed (`IsPrivate` or `model.IsSubscriberFeed`) → collected into skipped-feeds OPML (Overcast has no API path for non-iTunes feeds)
-- iTunes ID available (from source library or `itunes.FindByHints`) → `GET /itunes{ID}` which subscribes as a side-effect (`SubscribeToPodcast`)
+- iTunes ID available (from source library or `itunes.FindByHints`) → `GET /itunes{ID}` then `POST /podcasts/add/{overcastID}` (`SubscribeToPodcast`)
 - Otherwise → `search_autocomplete` → `POST /podcasts/add/{overcastID}` (`AddPodcast`)
+
+**Default request delay**: `--only-subscriptions` defaults to **4 s** between operations (vs 3 s for `--play-state`). Each subscribe makes two Overcast requests (a page GET to resolve the internal podcast ID, then a POST to add it); both are individually rate-limited using the configured delay. Use `--request-delay` to override both defaults. The `--only-subscriptions` path fires subscribes back-to-back, so it needs more headroom than the play-state path where subscribes are naturally spread across hours of episode fetches.
 
 **OPML export** (when `--overcast-out` is provided): generates an OPML file that the user imports via **Overcast → Settings → Import OPML**. No credentials required. Use this path when you want to review subscriptions before committing, or when credentials are not available.
 
@@ -395,7 +397,7 @@ Recommended order:
 
 **Retry logic**: both `SetProgress` and listing-page fetches implement separate retry budgets for 429 (rate limit, with `Retry-After` header support) and 5xx/network errors (exponential backoff: 2s → 4s → 8s for write calls; 30s → 60s → 120s for page fetches). An auth-failure abort fires immediately if the very first write call is redirected to the login page.
 
-**Rate limiting guards**: The listing-page loop, per-episode worker pool, and search calls all share the `requestDelay` timer to pace requests at ≤ 1 per second by default. When the retry budget is exhausted on a persistent 429, the migration pauses and prompts interactively:
+**Rate limiting guards**: All Overcast requests share the `requestDelay` timer. The default is **3 s** for `--play-state` and **4 s** for `--only-subscriptions`; override with `--request-delay`. When the retry budget is exhausted on a persistent 429, the migration pauses and prompts interactively:
 
 ```
 overcast: persistent rate limiting — still getting 429 after retries.

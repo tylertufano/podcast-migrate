@@ -22,7 +22,7 @@ Episode matching uses a cascade of up to six strategies (GUID → feed URL + pub
 ¹ Apple subscription writes require KVS credentials (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`) captured via Proxyman. Subscriptions are written automatically during a play-state migration, or can be written standalone with `--only-subscriptions` (also requires KVS credentials).
 ² **Web API + KVS (recommended)**: Bearer token + `media-user-token` handle public-catalog episodes via `amp-api`; KVS handles private/subscriber-feed episodes. Public feeds resolve immediately without waiting for local indexing.
 ³ **KVS-only**: Set only `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` — no web API tokens needed. All episodes sync via KVS. Pre-existing subscriptions resolve immediately from the local SQLite DB; newly subscribed feeds wait for Apple Podcasts to index them first.
-⁴ Overcast subscriptions use the unofficial web API when credentials are set (`OVERCAST_EMAIL` + `OVERCAST_PASSWORD`). `--only-subscriptions` with credentials subscribes programmatically without writing play state. Provide `--overcast-out` instead for an OPML file for manual import (no credentials needed). Private/subscriber feeds are always collected in a skipped-feeds OPML regardless of path.
+⁴ Overcast subscriptions use the unofficial web API when credentials are set (`OVERCAST_EMAIL` + `OVERCAST_PASSWORD`). `--only-subscriptions` with credentials subscribes programmatically without writing play state. Provide `--overcast-out` instead for an OPML file for manual import (no credentials needed). Private/subscriber feeds are always collected in a skipped-feeds OPML regardless of path. Default request delay is 4 s for `--only-subscriptions` and 3 s for `--play-state`; override with `--request-delay`.
 
 ## Platform support
 
@@ -115,8 +115,6 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 **Credential config file** — a `--creds-file` option (or auto-loading from `~/.config/podcast-migrate/credentials`) would reduce setup friction when migrating between multiple providers.
 
 **Apple token auto-extraction** — the Bearer token must currently be captured manually from browser DevTools. The Podcasts app may cache credentials in the macOS Keychain; automatic extraction and renewal would eliminate the only manual step in the Apple write path.
-
-**Overcast auto-subscribe during `--only-subscriptions`** — currently generates an OPML for manual import. The same subscribe endpoint used during play-state writes could be used directly, making the subscriptions-only path as seamless as the play-state path.
 
 **Overcast episode cache targeted invalidation** — `--clear-episode-cache` drops all cached episode IDs. A `--invalidate-podcast "title"` option would allow selective cache busting for one podcast without a full re-fetch.
 

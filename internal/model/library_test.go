@@ -1,6 +1,59 @@
 package model
 
-import "testing"
+import (
+	"testing"
+)
+
+func TestIsSubscriberFeed(t *testing.T) {
+	cases := []struct {
+		title   string
+		feedURL string
+		want    bool
+	}{
+		// Title markers — subscriber/paid suffixes
+		{"Fresh Air Plus", "https://feeds.npr.org/381444908/podcast.xml", true},
+		{"Planet Money +", "https://feeds.npr.org/pm/podcast.xml", true},
+		{"Planet Money+", "https://feeds.npm.org/pm/podcast.xml", true},
+		{"The Daily - Subscriber Feed (🔓 for you@example.com)", "https://thedaily.supercast.com", true},
+		{"Amicus - Member Feed", "https://feeds.megaphone.fm/amicus", true},
+		{"Some Show - Private Feed", "https://rss.example.com/private", true},
+		{"Some Show - Premium Feed", "https://rss.example.com/premium", true},
+		{"Some Show (🔓)", "https://rss.example.com/feed", true},
+
+		// Public titles — no markers
+		{"Fresh Air", "https://feeds.npr.org/381444908/podcast.xml", false},
+		{"The Daily", "https://feeds.simplecast.com/Sl5CSM3S", false},
+		{"Surplus", "https://rss.example.com/surplus", false}, // "plus" embedded in word
+		{"Plus", "https://rss.example.com/plus", false},       // lone "Plus" is not a suffix
+
+		// URL scheme — Apple internal
+		{"The Story of Classical", "internal://12345/feed", true},
+
+		// Known subscriber platform domains
+		{"Talking Feds", "https://talkingfeds.supercast.com/feed", true},
+		{"Some Show", "https://feeds.memberful.com/show/feed", true},
+		{"Some Show", "https://someshow.supporting.cast.st/feed", true},
+		{"Some Show", "https://www.patreon.com/rss/someshow", true},
+
+		// Subdomain of subscriber platform
+		{"Some Show", "https://show.supercast.com/rss", true},
+
+		// Regular CDN used for both public and subscriber — not caught here
+		// (KVS URL-mismatch signal handles these in the Apple reader)
+		{"The Daily", "https://feeds.simplecast.com/54nAGcIl", false},
+		{"Amicus With Dahlia Lithwick", "https://feeds.megaphone.fm/slatesamicuswithdahlialithwick", false},
+
+		// Empty/malformed URL — should not panic
+		{"Some Show", "", false},
+		{"Some Show", "not-a-url", false},
+	}
+	for _, tc := range cases {
+		got := IsSubscriberFeed(tc.title, tc.feedURL)
+		if got != tc.want {
+			t.Errorf("IsSubscriberFeed(%q, %q) = %v, want %v", tc.title, tc.feedURL, got, tc.want)
+		}
+	}
+}
 
 func TestNormalizePlusTitle(t *testing.T) {
 	cases := []struct {

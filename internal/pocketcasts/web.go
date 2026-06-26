@@ -28,6 +28,8 @@ package pocketcasts
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,10 +43,22 @@ import (
 	"github.com/tyler/podcast-migrate/internal/httputil"
 )
 
-var pcBaseURL     = "https://api.pocketcasts.com"
-var pcCacheURL    = "https://cache.pocketcasts.com"
-var pcRefreshURL  = "https://refresh.pocketcasts.com"
+var pcBaseURL      = "https://api.pocketcasts.com"
+var pcCacheURL     = "https://cache.pocketcasts.com"
+var pcRefreshURL   = "https://refresh.pocketcasts.com"
 var pcPollInterval = 2 * time.Second
+
+// pcDeviceID is a stable random identifier sent as the "device" parameter to
+// unauthenticated Pocket Casts refresh endpoints (mirrors the uniqueAppId used
+// by the iOS app). It is regenerated on each process start, which is fine —
+// the server uses it only for analytics, not for session continuity.
+var pcDeviceID = func() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "podcast-migrate-device"
+	}
+	return hex.EncodeToString(b)
+}()
 
 // SetBaseURLForTest overrides the Pocket Casts API base URL for unit tests
 // that spin up an httptest.Server. Must be reset after each test.
@@ -900,6 +914,77 @@ func UpdateEpisodeProgress(ctx context.Context, client *http.Client,
 			resp.StatusCode, bodyExcerpt(body))
 	}
 	return nil
+}
+
+// FindPodcastByITunesID resolves an iTunes Store podcast collection ID to the
+// Pocket Casts internal podcast UUID using the podcasts/show endpoint on
+// refresh.pocketcasts.com. No authentication is required.
+//
+// Returns ("", nil) when the podcast is not found in the Pocket Casts catalog
+// (status "error"). Returns an error only on network or parse failures.
+func FindPodcastByITunesID(ctx context.Context, itunesID int64) (string, error) {
+	type reqBody struct {
+		ID     int64  `json:"id"`
+		DT     string `json:"dt"`
+		Device string `json:"device"`
+		V      string `json:"v"`
+		M      string `json:"m"`
+		AV     string `json:"av"`
+		L      string `json:"l"`
+		C      string `json:"c"`
+	}
+	body, err := json.Marshal(reqBody{
+		ID:     itunesID,
+		DT:     "1",
+		Device: pcDeviceID,
+		V:      "1.7",
+		M:      "18.0",
+		AV:     "7.54",
+		L:      "en",
+		C:      "US",
+	})
+	if err != nil {
+		return "", fmt.Errorf("pocketcasts/web: marshal podcasts/show request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		pcRefreshURL+"/podcasts/show", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("pocketcasts/web: build podcasts/show request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", pcUA)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("pocketcasts/web: POST /podcasts/show: %w", err)
+	}
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		return "", httputil.NewTransientError(fmt.Errorf("pocketcasts/web: /podcasts/show returned HTTP %d", resp.StatusCode))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("pocketcasts/web: /podcasts/show returned HTTP %d: %s",
+			resp.StatusCode, bodyExcerpt(respBody))
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+		Result *struct {
+			Podcast struct {
+				UUID string `json:"uuid"`
+			} `json:"podcast"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return "", fmt.Errorf("pocketcasts/web: parse podcasts/show response: %w", err)
+	}
+	if payload.Status != "ok" || payload.Result == nil {
+		return "", nil // podcast not in PC catalog
+	}
+	return payload.Result.Podcast.UUID, nil
 }
 
 // ResolveFeedToPodcastUUID resolves a podcast RSS feed URL to the Pocket Casts

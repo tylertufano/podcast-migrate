@@ -90,6 +90,7 @@ func TestAugment_EmptyEpisodes_ReturnsZero(t *testing.T) {
 		map[string]overcastIndexEntry{},
 		0, map[string]string{},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
@@ -109,6 +110,7 @@ func TestAugment_AllUnplayed_ReturnsZero(t *testing.T) {
 		0,
 		map[string]string{"https://feeds.example.com/s": "test show"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
@@ -130,6 +132,7 @@ func TestAugment_AllAlreadyIndexed_ReturnsZero(t *testing.T) {
 		0,
 		map[string]string{feedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
@@ -161,6 +164,7 @@ func TestAugment_StrictFeedMatch_SkipsAllFeeds(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		true, // strictFeedMatch
 		false, false, 0, false, newTestCache(t),
 	)
@@ -194,6 +198,7 @@ func TestAugment_SubscribedOnly_SkipsUnsubscribed(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false,
 		true, // subscribedOnly
 		false, 0, false, newTestCache(t),
@@ -233,6 +238,7 @@ func TestAugment_NormalPath_AddsToIndex(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -277,6 +283,7 @@ func TestAugment_NumericIDShortcut_AddsToIndex(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -335,6 +342,7 @@ func TestAugment_PodPageCacheDedup(t *testing.T) {
 		0,
 		map[string]string{feed1: "fresh air", feed2: "fresh air plus"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 
@@ -378,6 +386,7 @@ func TestAugment_TitleFallback_MatchesWhenDateMisses(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -418,6 +427,7 @@ func TestAugment_OneDayOffSameTitle_Accepted(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -469,6 +479,7 @@ func TestAugment_OneDayOffSeasonMarkerVariant_Accepted(t *testing.T) {
 		// /itunes12345/fresh-air, which serves listingPageS01 for this test.
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -526,6 +537,7 @@ func TestAugment_OneDayOffDifferentTitle_Rejected(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 0 {
@@ -575,6 +587,7 @@ func TestAugment_OPMLState_NumericIDShortcut_SeedsCurrentState(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -628,6 +641,7 @@ func TestAugment_OPMLState_CacheHitPath_SeedsCurrentState(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, cache,
 	)
 	if n != 1 {
@@ -677,6 +691,7 @@ func TestAugment_OPMLState_WorkerPath_SeedsCurrentState(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, newTestCache(t),
 	)
 	if n != 1 {
@@ -733,6 +748,7 @@ func TestAugment_OPMLState_FurthestWins_CacheAhead(t *testing.T) {
 		0,
 		map[string]string{appleEp.FeedURL: "fresh air"},
 		map[string]string{},
+		nil,
 		false, false, false, 0, false, cache,
 	)
 
@@ -744,6 +760,152 @@ func TestAugment_OPMLState_FurthestWins_CacheAhead(t *testing.T) {
 	}
 	if entry.currentState != model.PlayStatePlayed {
 		t.Errorf("currentState: got %v, want PlayStatePlayed — cache Played should beat OPML Unplayed", entry.currentState)
+	}
+}
+
+// ── Private-feed skip tests ───────────────────────────────────────────────────
+
+func TestAugment_FeedIsPrivate_SkipsITunesPath(t *testing.T) {
+	// When feedIsPrivate[feedURL]=true, Step B1 should fire: no subscribe attempt
+	// is made, and the podcast is added to the skipped-feeds slice. No listing
+	// page or subscribe POST should be issued.
+	subscribeCalled := false
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageEmpty) // not subscribed at destination
+		},
+		"/itunes12345/fresh-air": func(w http.ResponseWriter, r *http.Request) {
+			subscribeCalled = true // must NOT be reached
+			fmt.Fprint(w, augListingPage)
+		},
+	})
+
+	feedURL := appleEp.FeedURL
+	privateEp := appleEp // same episode, same feed — but source marks feed as private
+
+	index := map[string]overcastIndexEntry{}
+	n, skipped := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		&model.Library{},
+		[]model.EpisodeState{privateEp},
+		index,
+		0,
+		map[string]string{feedURL: "fresh air"},
+		map[string]string{}, // iTunes ID excluded upstream for private feeds
+		map[string]bool{feedURL: true},
+		false, false, false, 0, false, newTestCache(t),
+	)
+
+	if n != 0 {
+		t.Errorf("private feed: added %d entries, want 0", n)
+	}
+	if subscribeCalled {
+		t.Error("subscribe page must not be fetched for a private feed")
+	}
+	if len(skipped) != 1 {
+		t.Errorf("skipped pods: got %d, want 1", len(skipped))
+	} else if skipped[0].FeedURL != feedURL {
+		t.Errorf("skipped pod FeedURL = %q, want %q", skipped[0].FeedURL, feedURL)
+	}
+}
+
+func TestAugment_SubscriberTitleMarker_SkipsITunesPath(t *testing.T) {
+	// When feedIsPrivate is nil but the title carries a subscriber marker
+	// (detected by model.IsSubscriberFeed via NormalizePlusTitle), Step B1 also
+	// fires: no subscribe attempt, pod lands in skipped slice.
+	subscribeCalled := false
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, augPodcastsPageEmpty)
+		},
+		"/itunes1200361736/the-daily": func(w http.ResponseWriter, r *http.Request) {
+			subscribeCalled = true
+			fmt.Fprint(w, augListingPage)
+		},
+	})
+
+	subscriberFeedURL := "https://feeds.simplecast.com/54nAGcIl"
+	subscriberTitle := "The Daily - Subscriber Feed (🔓 for you@example.com)"
+	ep := model.EpisodeState{
+		FeedURL:   subscriberFeedURL,
+		Title:     "Some Episode",
+		PubDate:   appleEp.PubDate,
+		PlayState: model.PlayStatePlayed,
+	}
+
+	index := map[string]overcastIndexEntry{}
+	n, skipped := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		&model.Library{},
+		[]model.EpisodeState{ep},
+		index,
+		0,
+		map[string]string{subscriberFeedURL: subscriberTitle},
+		map[string]string{},
+		nil, // feedIsPrivate not set — detection relies on title marker
+		false, false, false, 0, false, newTestCache(t),
+	)
+
+	if n != 0 {
+		t.Errorf("subscriber title marker: added %d entries, want 0", n)
+	}
+	if subscribeCalled {
+		t.Error("subscribe page must not be fetched for a subscriber-titled feed")
+	}
+	if len(skipped) != 1 {
+		t.Errorf("skipped pods: got %d, want 1", len(skipped))
+	} else if skipped[0].FeedURL != subscriberFeedURL {
+		t.Errorf("skipped pod FeedURL = %q, want %q", skipped[0].FeedURL, subscriberFeedURL)
+	}
+}
+
+func TestAugment_PrivateFeed_AlreadySubscribed_UsesPageURL(t *testing.T) {
+	// When the private feed IS already subscribed at the destination, Step A
+	// matches it by title in /podcasts and uses the page URL directly. Step B1
+	// must not fire in that case — private-feed detection only applies when the
+	// podcast is not yet subscribed.
+	listingCalled := false
+	srv := setupAugmentServer(t, map[string]http.HandlerFunc{
+		"/podcasts": func(w http.ResponseWriter, r *http.Request) {
+			// Overcast lists the private-feed podcast under the public title.
+			fmt.Fprint(w, `<!DOCTYPE html><html><body>
+<a class="feedcell" href="/p12345-AbCdEf">
+  <div class="titlestack"><div class="title">Fresh Air Plus</div></div>
+</a>
+</body></html>`)
+		},
+		"/p12345-AbCdEf": func(w http.ResponseWriter, r *http.Request) {
+			listingCalled = true
+			fmt.Fprint(w, augListingPage)
+		},
+	})
+
+	privateURL := "https://feeds.npr.org/plus/fresh-air"
+	ep := model.EpisodeState{
+		FeedURL:   privateURL,
+		Title:     "Test Episode",
+		PubDate:   appleEp.PubDate,
+		PlayState: model.PlayStatePlayed,
+	}
+
+	index := map[string]overcastIndexEntry{}
+	_, skipped := augmentIndexFromPodcastPages(
+		context.Background(), srv.Client(),
+		&model.Library{},
+		[]model.EpisodeState{ep},
+		index,
+		0,
+		map[string]string{privateURL: "fresh air plus"}, // NormalizePlusTitle strips " plus"
+		map[string]string{},
+		map[string]bool{privateURL: true},
+		false, false, false, 0, false, newTestCache(t),
+	)
+
+	if len(skipped) != 0 {
+		t.Errorf("already-subscribed private feed: got %d skipped pods, want 0", len(skipped))
+	}
+	if !listingCalled {
+		t.Error("listing page should be fetched once the feed is found via /podcasts (Step A)")
 	}
 }
 

@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"runtime"
+	"sort"
+	"strconv"
 	"time"
 
+	"github.com/tyler/podcast-migrate/internal/itunes"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
@@ -227,6 +231,134 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 	return p.setLibraryWebAPI(ctx, lib, opts)
 }
 
+// kvsSubscribeAll subscribes all unsubscribed podcasts in pods via kvs.
+//
+// Private feeds are sorted to the front so they are subscribed before their
+// public counterparts, ensuring that when a coexistence case is detected the
+// public subscription is already present in the writer's subscription list.
+//
+// Dedup rules:
+//   - Private incoming: skip if exact URL is subscribed, or if any active
+//     subscription with the same normalised title is itself private-type.
+//     When a public subscription already exists for the same title, subscribe
+//     both and print a coexistence message with navigation links.
+//   - Public incoming: skip if exact URL is subscribed, or if any active
+//     subscription (public or private) has the same normalised title.
+func kvsSubscribeAll(ctx context.Context, kvs *KVSWriter, pods []model.Podcast, dryRun bool, addedOut *int) {
+	itunesClient := &http.Client{Timeout: 15 * time.Second}
+
+	// Stable-sort: private feeds first. Source order is preserved within each group.
+	sorted := make([]model.Podcast, len(pods))
+	copy(sorted, pods)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		iPriv := sorted[i].IsPrivate || model.IsSubscriberFeed(sorted[i].Title, sorted[i].FeedURL)
+		jPriv := sorted[j].IsPrivate || model.IsSubscriberFeed(sorted[j].Title, sorted[j].FeedURL)
+		return iPriv && !jPriv
+	})
+
+	for _, pod := range sorted {
+		if pod.FeedURL == "" {
+			continue
+		}
+
+		normTitle := model.NormalizePlusTitle(pod.Title)
+		isPrivate := pod.IsPrivate || model.IsSubscriberFeed(pod.Title, pod.FeedURL)
+
+		if isPrivate {
+			// Private feed: skip if exact URL already subscribed, or if we already
+			// have a private-type subscription for this title.
+			if kvs.IsSubscribed(pod.FeedURL) || kvs.IsSubscribedByAnyPrivate(normTitle) {
+				continue
+			}
+
+			title := pod.Title
+			if title == "" {
+				title = pod.FeedURL
+			}
+
+			// Check for coexistence: public subscription already present.
+			pub := kvs.FindPublicByTitle(normTitle)
+
+			if dryRun {
+				if pub != nil {
+					fmt.Printf("  [dry-run] kvs: would add subscriber feed %q alongside existing public subscription\n", title)
+				} else {
+					fmt.Printf("  [dry-run] kvs: would subscribe to %q (private)\n", title)
+				}
+				if addedOut != nil {
+					*addedOut++
+				}
+				continue
+			}
+
+			isNew, subErr := kvs.Subscribe(ctx, pod.FeedURL, title, 0)
+			if subErr != nil {
+				fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
+				continue
+			}
+			if isNew {
+				if addedOut != nil {
+					*addedOut++
+				}
+				if pub != nil {
+					fmt.Printf("  kvs: note: %q — added subscriber feed alongside existing public subscription.\n", title)
+					fmt.Printf("    Public:  https://podcasts.apple.com/podcast/id%d\n", pub.PodcastPID)
+					fmt.Printf("    Private: %s\n", pod.FeedURL)
+					fmt.Printf("    Episode history will sync to the subscriber feed. Open Apple Podcasts to manage both.\n")
+				} else {
+					fmt.Printf("  kvs: subscribed to %q (private)\n", title)
+				}
+			}
+			continue
+		}
+
+		// Public feed: skip if already subscribed by URL or by any title match.
+		if kvs.IsSubscribed(pod.FeedURL) || kvs.IsSubscribedByTitle(normTitle) {
+			continue
+		}
+
+		// Resolve iTunes PID and canonical URL for public catalog podcasts.
+		feedURL := pod.FeedURL
+		var podcastPID int64
+		if pod.ITunesID != "" {
+			podcastPID, _ = strconv.ParseInt(pod.ITunesID, 10, 64)
+		} else if pod.Title != "" {
+			if result, err := itunes.FindByHints(ctx, itunesClient, pod.Title, pod.FeedURL, pod.Author); err == nil && result.CollectionID > 0 {
+				podcastPID = result.CollectionID
+				if result.FeedURL != "" && result.FeedURL != feedURL {
+					feedURL = result.FeedURL
+					if kvs.IsSubscribed(feedURL) {
+						continue
+					}
+				}
+			}
+		}
+
+		title := pod.Title
+		if title == "" {
+			title = feedURL
+		}
+		if dryRun {
+			fmt.Printf("  [dry-run] kvs: would subscribe to %q\n", title)
+			if addedOut != nil {
+				*addedOut++
+			}
+			continue
+		}
+		isNew, subErr := kvs.Subscribe(ctx, feedURL, title, podcastPID)
+		if subErr != nil {
+			fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
+			continue
+		}
+		if isNew {
+			if addedOut != nil {
+				*addedOut++
+			}
+			fmt.Printf("  kvs: subscribed to %q\n", title)
+		}
+	}
+}
+
 // setLibraryWebAPI is the web API path (with optional KVS fallback for private feeds).
 func (p *Provider) setLibraryWebAPI(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
 	// Subscribe any unsubscribed podcasts via KVS before the play state pass.
@@ -239,24 +371,7 @@ func (p *Provider) setLibraryWebAPI(ctx context.Context, lib *model.Library, opt
 				}
 			}
 			if kvs.podcastsDomainReady {
-				for _, pod := range lib.Podcasts {
-					if pod.FeedURL == "" || kvs.IsSubscribed(pod.FeedURL) {
-						continue
-					}
-					title := pod.Title
-					if title == "" {
-						title = pod.FeedURL
-					}
-					isNew, subErr := kvs.Subscribe(ctx, pod.FeedURL, title)
-					if subErr != nil {
-						fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
-					} else if isNew {
-						if opts.SubscriptionsAddedOut != nil {
-							*opts.SubscriptionsAddedOut++
-						}
-						fmt.Printf("  kvs: subscribed to %q\n", title)
-					}
-				}
+				kvsSubscribeAll(ctx, kvs, lib.Podcasts, false, opts.SubscriptionsAddedOut)
 			}
 		}
 	}
@@ -288,24 +403,7 @@ func (p *Provider) setLibraryKVSOnly(ctx context.Context, lib *model.Library, op
 			}
 		}
 		if kvs.podcastsDomainReady {
-			for _, pod := range lib.Podcasts {
-				if pod.FeedURL == "" || kvs.IsSubscribed(pod.FeedURL) {
-					continue
-				}
-				title := pod.Title
-				if title == "" {
-					title = pod.FeedURL
-				}
-				isNew, subErr := kvs.Subscribe(ctx, pod.FeedURL, title)
-				if subErr != nil {
-					fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
-				} else if isNew {
-					if opts.SubscriptionsAddedOut != nil {
-						*opts.SubscriptionsAddedOut++
-					}
-					fmt.Printf("  kvs: subscribed to %q\n", title)
-				}
-			}
+			kvsSubscribeAll(ctx, kvs, lib.Podcasts, false, opts.SubscriptionsAddedOut)
 		}
 	}
 
@@ -351,29 +449,7 @@ func (p *Provider) setLibrarySubscriptionsOnly(ctx context.Context, lib *model.L
 	}
 
 	added := 0
-	for _, pod := range lib.Podcasts {
-		if pod.FeedURL == "" || kvs.IsSubscribed(pod.FeedURL) {
-			continue
-		}
-		title := pod.Title
-		if title == "" {
-			title = pod.FeedURL
-		}
-		if opts.DryRun {
-			fmt.Printf("  [dry-run] kvs: would subscribe to %q\n", title)
-			added++
-			continue
-		}
-		isNew, subErr := kvs.Subscribe(ctx, pod.FeedURL, title)
-		if subErr != nil {
-			fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
-			continue
-		}
-		if isNew {
-			added++
-			fmt.Printf("  kvs: subscribed to %q\n", title)
-		}
-	}
+	kvsSubscribeAll(ctx, kvs, lib.Podcasts, opts.DryRun, &added)
 
 	if opts.SubscriptionsAddedOut != nil {
 		*opts.SubscriptionsAddedOut = added

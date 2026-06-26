@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"howett.net/plist"
+
+	"github.com/tyler/podcast-migrate/internal/model"
 )
 
 const (
@@ -422,10 +424,78 @@ func (w *KVSWriter) IsSubscribed(feedURL string) bool {
 	return false
 }
 
-// Subscribe adds feedURL to the subscription list. Returns true if a new
-// subscription was created (or an unsubscribed entry was re-enabled), false
-// if the feed was already subscribed. Writes the updated list to the KVS.
-func (w *KVSWriter) Subscribe(ctx context.Context, feedURL, title string) (bool, error) {
+// IsSubscribedByTitle reports whether any active subscription has the given
+// pre-normalised title. Use model.NormalizePlusTitle on both the query and the
+// stored title so subscriber-feed variants ("Fresh Air Plus") match their base
+// title ("fresh air"). An empty normalizedTitle always returns false.
+func (w *KVSWriter) IsSubscribedByTitle(normalizedTitle string) bool {
+	if normalizedTitle == "" {
+		return false
+	}
+	for _, s := range w.subscriptions {
+		if s.Subscribed == 1 && model.NormalizePlusTitle(s.Title) == normalizedTitle {
+			return true
+		}
+	}
+	return false
+}
+
+// IsSubscribedByAnyPrivate reports whether any active subscription has the
+// given pre-normalised title AND is a private-type feed. A subscription is
+// private-type when its PodcastPID is 0 (unindexed) or when its feed URL or
+// title matches a known subscriber platform via model.IsSubscriberFeed.
+//
+// Used by kvsSubscribeAll to block an incoming private feed from being added
+// when the user already has a private version of that podcast.
+func (w *KVSWriter) IsSubscribedByAnyPrivate(normalizedTitle string) bool {
+	if normalizedTitle == "" {
+		return false
+	}
+	for _, s := range w.subscriptions {
+		if s.Subscribed != 1 {
+			continue
+		}
+		if model.NormalizePlusTitle(s.Title) != normalizedTitle {
+			continue
+		}
+		if s.PodcastPID == 0 || model.IsSubscriberFeed(s.Title, s.FeedURL) {
+			return true
+		}
+	}
+	return false
+}
+
+// FindPublicByTitle returns a pointer to the first active subscription that
+// matches the given pre-normalised title and is NOT a private-type feed
+// (i.e. PodcastPID > 0 and not a known subscriber platform URL). Returns nil
+// when no such subscription exists.
+//
+// Used by kvsSubscribeAll to detect the coexistence case: an incoming private
+// feed that is being added alongside an already-subscribed public version.
+func (w *KVSWriter) FindPublicByTitle(normalizedTitle string) *podcastSubscription {
+	if normalizedTitle == "" {
+		return nil
+	}
+	for i := range w.subscriptions {
+		s := &w.subscriptions[i]
+		if s.Subscribed != 1 {
+			continue
+		}
+		if model.NormalizePlusTitle(s.Title) != normalizedTitle {
+			continue
+		}
+		if s.PodcastPID > 0 && !model.IsSubscriberFeed(s.Title, s.FeedURL) {
+			return s
+		}
+	}
+	return nil
+}
+
+// Subscribe adds feedURL to the subscription list. podcastPID is the iTunes
+// Store podcast ID; pass 0 if unknown. Returns true if a new subscription was
+// created (or an unsubscribed entry was re-enabled), false if already
+// subscribed. Writes the updated list to the KVS.
+func (w *KVSWriter) Subscribe(ctx context.Context, feedURL, title string, podcastPID int64) (bool, error) {
 	if err := w.initPodcastsDomain(ctx); err != nil {
 		return false, err
 	}
@@ -439,6 +509,9 @@ func (w *KVSWriter) Subscribe(ctx context.Context, feedURL, title string) (bool,
 			w.subscriptions[i].Subscribed = 1
 			w.subscriptions[i].UpdatedDate = time.Now().UTC()
 			w.subscriptions[i].LastTouchDate = time.Now().UTC()
+			if podcastPID > 0 {
+				w.subscriptions[i].PodcastPID = podcastPID
+			}
 			return true, w.putSubscriptions(ctx)
 		}
 	}
@@ -450,6 +523,7 @@ func (w *KVSWriter) Subscribe(ctx context.Context, feedURL, title string) (bool,
 		Subscribed:             1,
 		FeedURL:                feedURL,
 		Title:                  title,
+		PodcastPID:             podcastPID,
 		DarkCount:              0,
 		PlaybackNewestToOldest: true,
 		SortAscending:          false,

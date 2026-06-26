@@ -420,7 +420,7 @@ func (w *KVSWriter) WriteBatch(ctx context.Context, episodes []model.EpisodeStat
 				if title == "" {
 					title = ep.FeedURL
 				}
-				isNew, subErr := w.Subscribe(ctx, ep.FeedURL, title)
+				isNew, subErr := w.Subscribe(ctx, ep.FeedURL, title, 0)
 				if subErr != nil {
 					fmt.Printf("  kvs: subscribe %q failed: %v\n", title, subErr)
 				} else if isNew {

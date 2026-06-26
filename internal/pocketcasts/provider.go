@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,9 +121,10 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 		}
 		podUUIDToFeedURL[ap.UUID] = feedURL
 		podcasts = append(podcasts, model.Podcast{
-			FeedURL: feedURL,
-			Title:   ap.Title,
-			Author:  ap.Author,
+			FeedURL:   feedURL,
+			Title:     ap.Title,
+			Author:    ap.Author,
+			IsPrivate: ap.IsPrivate || model.IsSubscriberFeed(ap.Title, feedURL),
 		})
 	}
 	fmt.Printf("pocketcasts: %d subscribed podcast(s)\n", len(podcasts))
@@ -490,12 +492,25 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 			title = pod.FeedURL
 		}
 
-		// Resolve RSS feed URL → Pocket Casts podcast UUID.
-		pcUUID, err := ResolveFeedToPodcastUUID(ctx, pod.FeedURL)
-		if err != nil {
-			fmt.Printf("  warning: could not resolve %q: %v\n", title, err)
-			failed++
-			continue
+		// Resolve podcast to a Pocket Casts UUID.
+		// Fast path: iTunes ID → UUID via podcasts/show (no polling, synchronous).
+		// Fall back to add_feed_url polling for feeds not in the PC catalog.
+		var pcUUID string
+		if pod.ITunesID != "" {
+			if itunesID, parseErr := strconv.ParseInt(pod.ITunesID, 10, 64); parseErr == nil {
+				if uuid, lookupErr := FindPodcastByITunesID(ctx, itunesID); lookupErr == nil && uuid != "" {
+					pcUUID = uuid
+				}
+			}
+		}
+		if pcUUID == "" {
+			var err error
+			pcUUID, err = ResolveFeedToPodcastUUID(ctx, pod.FeedURL)
+			if err != nil {
+				fmt.Printf("  warning: could not resolve %q: %v\n", title, err)
+				failed++
+				continue
+			}
 		}
 
 		// Check by UUID: the same podcast may be subscribed under a different RSS

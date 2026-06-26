@@ -7,6 +7,81 @@ import (
 	"testing"
 )
 
+// newWriterWithSubs constructs a KVSWriter with a pre-populated subscription
+// list for testing dedup helpers, without requiring live credentials.
+func newWriterWithSubs(subs []podcastSubscription) *KVSWriter {
+	w := &KVSWriter{podcastsDomainReady: true}
+	w.subscriptions = subs
+	return w
+}
+
+func TestIsSubscribedByAnyPrivate(t *testing.T) {
+	subs := []podcastSubscription{
+		// Public subscription (PID > 0, no subscriber-domain URL)
+		{FeedURL: "https://feeds.npr.org/381444908/podcast.xml", Title: "Fresh Air", PodcastPID: 214089682, Subscribed: 1},
+		// Private: unindexed (PID = 0)
+		{FeedURL: "https://podsync.example.com/myfeed.xml", Title: "The Hang Up", PodcastPID: 0, Subscribed: 1},
+		// Private: subscriber platform domain
+		{FeedURL: "https://thedaily.supercast.com/feed", Title: "The Daily", PodcastPID: 1200361736, Subscribed: 1},
+		// Unsubscribed — must not match
+		{FeedURL: "https://feeds.example.com/old.xml", Title: "Old Show", PodcastPID: 0, Subscribed: 0},
+	}
+	w := newWriterWithSubs(subs)
+
+	cases := []struct {
+		normTitle string
+		want      bool
+	}{
+		{"fresh air", false},    // public subscription — not private-type
+		{"the hang up", true},   // PodcastPID == 0
+		{"the daily", true},     // subscriber platform URL
+		{"old show", false},     // unsubscribed — must not match
+		{"nonexistent", false},  // not in list
+		{"", false},             // empty title guard
+	}
+	for _, tc := range cases {
+		got := w.IsSubscribedByAnyPrivate(tc.normTitle)
+		if got != tc.want {
+			t.Errorf("IsSubscribedByAnyPrivate(%q) = %v, want %v", tc.normTitle, got, tc.want)
+		}
+	}
+}
+
+func TestFindPublicByTitle(t *testing.T) {
+	subs := []podcastSubscription{
+		// Public
+		{FeedURL: "https://feeds.npr.org/381444908/podcast.xml", Title: "Fresh Air", PodcastPID: 214089682, Subscribed: 1},
+		// Private: PodcastPID == 0
+		{FeedURL: "https://podsync.example.com/hangup.xml", Title: "The Hang Up", PodcastPID: 0, Subscribed: 1},
+		// Private: subscriber domain
+		{FeedURL: "https://thedaily.supercast.com/feed", Title: "The Daily", PodcastPID: 1200361736, Subscribed: 1},
+		// Unsubscribed public
+		{FeedURL: "https://feeds.example.com/old.xml", Title: "Old Show", PodcastPID: 999, Subscribed: 0},
+	}
+	w := newWriterWithSubs(subs)
+
+	if got := w.FindPublicByTitle("fresh air"); got == nil {
+		t.Error("FindPublicByTitle(fresh air) = nil, want non-nil")
+	} else if got.PodcastPID != 214089682 {
+		t.Errorf("PodcastPID = %d, want 214089682", got.PodcastPID)
+	}
+	if got := w.FindPublicByTitle("the hang up"); got != nil {
+		t.Errorf("FindPublicByTitle(the hang up) = %v, want nil (private)", got.FeedURL)
+	}
+	if got := w.FindPublicByTitle("the daily"); got != nil {
+		t.Errorf("FindPublicByTitle(the daily) = %v, want nil (subscriber domain)", got.FeedURL)
+	}
+	if got := w.FindPublicByTitle("old show"); got != nil {
+		t.Errorf("FindPublicByTitle(old show) = %v, want nil (unsubscribed)", got.FeedURL)
+	}
+	if got := w.FindPublicByTitle("nonexistent"); got != nil {
+		t.Errorf("FindPublicByTitle(nonexistent) = %v, want nil", got.FeedURL)
+	}
+	if got := w.FindPublicByTitle(""); got != nil {
+		t.Errorf("FindPublicByTitle(\"\") = %v, want nil", got.FeedURL)
+	}
+}
+
 // TestParseSubscriptionXML validates the XML plist subscription parser without
 // requiring live credentials.
 func TestParseSubscriptionXML(t *testing.T) {
@@ -202,7 +277,7 @@ func TestKVSPodcastsDomainLive(t *testing.T) {
 		prevCount := len(kvs.subscriptions)
 
 		// Subscribe.
-		if _, err := kvs.Subscribe(ctx, testFeed, testTitle); err != nil {
+		if _, err := kvs.Subscribe(ctx, testFeed, testTitle, 0); err != nil {
 			t.Fatalf("Subscribe: %v", err)
 		}
 		t.Logf("Subscribed to test feed; sub version now: %q  total subs: %d", kvs.subVersion, len(kvs.subscriptions))

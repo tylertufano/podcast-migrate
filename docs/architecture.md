@@ -61,12 +61,17 @@ podcast-migrate/
 │   │   └── log.go                WriteLogHeader, WriteLogLine, PlayStateLabel
 │   ├── httputil/
 │   │   └── retry.go              RateLimitError, TransientError, RetryFunc (shared by all write providers)
+│   ├── itunes/
+│   │   └── search.go             FindByHints — shared iTunes search with URL/author hint scoring
 │   ├── apple/
 │   │   ├── provider.go           Provider: SQLite → web API fallback
 │   │   ├── sqlite.go             SQLiteReader (MTLibrary.sqlite)
 │   │   ├── sqlite_write.go       SQLite write utilities
 │   │   ├── webapi.go             WebAPIWriter (amp-api.podcasts.apple.com)
 │   │   ├── kvs.go                KVSWriter (bookkeeper.itunes.apple.com, private feeds)
+│   │   ├── kvs_podcasts.go       KVSWriter subscription helpers (dedup, private-feed detection)
+│   │   ├── kvsreader.go          KVSReader (cross-platform, no SQLite)
+│   │   ├── itunes.go             batchITunesLookup (PID → canonical feed URL)
 │   │   ├── catalog.go            CatalogClient (iTunes Search + amp-api episodes)
 │   │   └── opml.go               OPMLReader (subscriptions fallback)
 │   ├── overcast/
@@ -119,8 +124,14 @@ type Podcast struct {
     Author     string
     ImageURL   string
     OvercastID string  // from Overcast OPML overcastId attribute
+    ITunesID   string  // iTunes Store collection ID; set by KVSReader, used by Overcast writer
+    IsPrivate  bool    // subscriber/private edition — skip iTunes URL substitution at destinations
 }
 ```
+
+`model.NormalizePlusTitle(title string) string` — strips paid-tier and subscriber suffixes (` Plus`, ` +`, `+`, ` - Subscriber Feed …`, ` - Member Feed …`, etc.) and lowercases, enabling cross-feed title matching between public and subscriber editions.
+
+`model.IsSubscriberFeed(title, feedURL string) bool` — detects subscriber or private editions via three signals: (1) title carries a paid-tier marker (`NormalizePlusTitle` differs from lowercased title); (2) feed URL uses `internal://` scheme (Apple-exclusive); (3) feed URL is on a known subscriber-only hosting platform (supercast.com, memberful.com, supporting.cast.st, patreon.com).
 
 ### `model.EpisodeState`
 

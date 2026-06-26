@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/httputil"
+	"github.com/tyler/podcast-migrate/internal/itunes"
 	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/provider"
@@ -391,17 +392,27 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		}
 	}
 	defer idCache.save()
-	// Build feedURL → iTunes ID map from the source library so that
-	// augmentIndexFromPodcastPages can skip search_autocomplete for catalog
-	// podcasts and go directly to /itunes{ID} on Overcast.
+	// Build feedURL → private flag and feedURL → iTunes ID maps from the source
+	// library. Private/subscriber feeds are flagged so augmentIndexFromPodcastPages
+	// can skip the iTunes subscription path entirely — subscribing the public
+	// counterpart in their place would be wrong. Their iTunes IDs are also excluded
+	// from feedToITunesID for the same reason.
+	feedIsPrivate := make(map[string]bool, len(lib.Podcasts))
 	feedToITunesID := make(map[string]string, len(lib.Podcasts))
 	for _, pod := range lib.Podcasts {
-		if pod.ITunesID != "" && pod.FeedURL != "" {
+		if pod.FeedURL == "" {
+			continue
+		}
+		if pod.IsPrivate || model.IsSubscriberFeed(pod.Title, pod.FeedURL) {
+			feedIsPrivate[pod.FeedURL] = true
+			continue // don't expose the iTunes ID — it belongs to the public feed
+		}
+		if pod.ITunesID != "" {
 			feedToITunesID[pod.FeedURL] = pod.ITunesID
 		}
 	}
 
-	added, skippedPrivate := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, feedToITunesID, opts.StrictFeedMatch, opts.SubscribedOnly, opts.DryRun, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache, idCache)
+	added, skippedPrivate := augmentIndexFromPodcastPages(ctx, httpClient, matchLib, episodes, index, requestDelay, feedToTitle, feedToITunesID, feedIsPrivate, opts.StrictFeedMatch, opts.SubscribedOnly, opts.DryRun, opts.EpisodeCacheMaxAge, opts.ClearEpisodeCache, idCache)
 	if added > 0 {
 		fmt.Printf("overcast: extended matching added %d additional episode(s)\n", added)
 	}
@@ -650,8 +661,9 @@ func augmentIndexFromPodcastPages(
 	episodes []model.EpisodeState,
 	index map[string]overcastIndexEntry,
 	requestDelay time.Duration,
-	feedToTitle map[string]string,   // Apple feedURL → lowercased podcast title (for title-based fallback)
+	feedToTitle map[string]string,    // Apple feedURL → lowercased podcast title (for title-based fallback)
 	feedToITunesID map[string]string, // Apple feedURL → iTunes Store ID (skips search_autocomplete when set)
+	feedIsPrivate map[string]bool,    // Apple feedURL → true when source pod is private/subscriber edition
 	strictFeedMatch bool,
 	subscribedOnly bool,
 	dryRun bool,
@@ -832,15 +844,42 @@ func augmentIndexFromPodcastPages(
 			continue
 		}
 
-		// Step B2: if we have the iTunes ID from the source library, go directly
-		// to the Overcast podcast page — no search_autocomplete round-trip needed.
-		// SubscribeToPodcast fetches the page and submits the subscribe form.
-		if iTunesID, hasID := feedToITunesID[feedURL]; hasID {
-			pageURL := overcastBaseURL + "/itunes" + iTunesID
+		// Step B1: skip private/subscriber-edition feeds — they have no iTunes page
+		// on Overcast and subscribing to their public counterpart would be wrong.
+		// Add them to the skipped-feeds OPML so the user can import the private URL
+		// manually via Add Feed → URL.
+		//
+		// Detection uses two signals:
+		//   - feedIsPrivate: set explicitly by source readers (e.g. Apple KVS when
+		//     the KVS URL differs from the iTunes canonical, or PodcastPID == 0).
+		//   - model.IsSubscriberFeed: heuristic for sources without an IsPrivate
+		//     flag (Overcast source) based on title markers and platform domains.
+		if feedIsPrivate[feedURL] || model.IsSubscriberFeed(appleTitle, feedURL) {
+			if !subscribedOnly {
+				fmt.Printf("  note: %q is a private/subscriber feed — will include in skipped-feeds OPML for manual import\n", appleTitle)
+				skippedPods = append(skippedPods, model.Podcast{FeedURL: feedURL, Title: appleTitle})
+				skippedFeeds++
+			}
+			continue
+		}
+
+		// Step B2: resolve the iTunes ID for this podcast so we can go directly
+		// to its Overcast page (/itunes{ID}) without a search_autocomplete round-trip.
+		// Priority: (1) iTunes ID from source library (KVSReader populates this for
+		// Apple sources); (2) iTunes title search (covers Overcast/PC sources that
+		// don't carry an iTunes ID); (3) fall through to search_autocomplete.
+		resolvedITunesID := feedToITunesID[feedURL]
+		if resolvedITunesID == "" && appleTitle != "" {
+			if result, err := itunes.FindByHints(ctx, client, appleTitle, feedURL, ""); err == nil && result.CollectionID > 0 {
+				resolvedITunesID = fmt.Sprintf("%d", result.CollectionID)
+			}
+		}
+		if resolvedITunesID != "" {
+			pageURL := overcastBaseURL + "/itunes" + resolvedITunesID
 			if dryRun {
-				fmt.Printf("  [dry-run] would subscribe to %q (iTunes ID %s)\n", appleTitle, iTunesID)
+				fmt.Printf("  [dry-run] would subscribe to %q (iTunes ID %s)\n", appleTitle, resolvedITunesID)
 			} else {
-				fmt.Printf("  subscribing to %q (iTunes ID %s)...\n", appleTitle, iTunesID)
+				fmt.Printf("  subscribing to %q (iTunes ID %s)...\n", appleTitle, resolvedITunesID)
 				var subErr error
 				for {
 					subErr = SubscribeToPodcast(ctx, client, pageURL)
@@ -1625,3 +1664,4 @@ func overcastSkipReason(desired model.EpisodeState, current overcastIndexEntry) 
 func overcastAlreadySatisfied(desired model.EpisodeState, current overcastIndexEntry) bool {
 	return overcastSkipReason(desired, current) != ""
 }
+

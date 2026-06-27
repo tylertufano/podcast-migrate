@@ -221,7 +221,7 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 	writeSubscriptionsOPML := !opts.OnlyPlayState && p.exportOPMLPath != ""
 	writeSubscriptionsAPI  := !opts.OnlyPlayState && p.email != "" && p.exportOPMLPath == ""
 	writeSubscriptions := writeSubscriptionsOPML || writeSubscriptionsAPI
-	writePlayState := !opts.OnlySubscriptions && p.email != ""
+	writePlayState := !opts.OnlySubscriptions && p.email != "" && p.exportOPMLPath == ""
 
 	// Explicit mode guards: return clear errors when the requested mode has no path.
 	if opts.OnlyPlayState && p.email == "" {

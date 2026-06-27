@@ -26,9 +26,9 @@ const DefaultRequestDelayPlayState = 3 * time.Second
 
 // DefaultRequestDelaySubscriptions is the default pause between subscribe
 // operations during an --only-subscriptions run. Each subscribe makes two
-// back-to-back Overcast requests (GET listing page + POST add); a 4 s gap
+// back-to-back Overcast requests (GET listing page + POST add); a 5 s gap
 // provides enough spacing to avoid Overcast's bulk-subscribe rate limiter.
-const DefaultRequestDelaySubscriptions = 4 * time.Second
+const DefaultRequestDelaySubscriptions = 5 * time.Second
 
 // DefaultRequestDelay is the fallback when neither mode-specific constant
 // applies (e.g. OPML export paths that don't enter the subscribe loop).

@@ -50,6 +50,21 @@ func NormalizeFeedURL(raw string) string {
 		// Not a parseable URL — fall back to simple lowercasing.
 		return strings.ToLower(strings.TrimRight(raw, "/"))
 	}
+
+	// Unwrap rss.pdrl.fm redirect tracking URLs. Format: /hash/domain/path.
+	// Overcast and Apple Podcasts both store these redirect URLs for feeds
+	// subscribed through certain directories; treat them as the underlying feed.
+	if strings.EqualFold(u.Host, "rss.pdrl.fm") {
+		path := strings.TrimPrefix(u.Path, "/")
+		if idx := strings.Index(path, "/"); idx > 0 {
+			actual := "https://" + path[idx+1:]
+			if u.RawQuery != "" {
+				actual += "?" + u.RawQuery
+			}
+			return NormalizeFeedURL(actual)
+		}
+	}
+
 	u.Scheme = strings.ToLower(u.Scheme)
 	u.Host = strings.ToLower(u.Host)
 	// Treat http and https as equivalent — use https as canonical form.

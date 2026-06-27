@@ -149,6 +149,17 @@ func (p *Provider) Capabilities() provider.Capabilities {
 }
 
 func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
+	// KVS-only read: preferred when KVS credentials are present. Cross-platform
+	// and authoritative — canonical URLs are resolved via the iTunes Store rather
+	// than from the locally cached ZFEEDURL which may be stale for moved feeds.
+	if p.kvsOnlyReader != nil {
+		if !p.sinceTime.IsZero() {
+			p.kvsOnlyReader.SetSinceTime(p.sinceTime)
+		}
+		return p.kvsOnlyReader.Read(ctx)
+	}
+
+	// SQLite read: macOS fallback when no KVS credentials are configured.
 	if runtime.GOOS == "darwin" {
 		if _, err := os.Stat(p.sqlitePath); err == nil {
 			r := NewSQLiteReader(p.sqlitePath)
@@ -173,18 +184,9 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 			if err == nil {
 				return lib, nil
 			}
-			// SQLite read failed — fall through to KVS-only read or OPML.
-			fmt.Fprintf(os.Stderr, "apple: SQLite read failed (%v), trying KVS-only read\n", err)
+			// SQLite read failed — fall through to OPML.
+			fmt.Fprintf(os.Stderr, "apple: SQLite read failed (%v), trying OPML fallback\n", err)
 		}
-	}
-
-	// KVS-only read: no SQLite required (cross-platform).
-	// Activated when APPLE_KVS_COOKIES is set and SQLite is unavailable.
-	if p.kvsOnlyReader != nil {
-		if !p.sinceTime.IsZero() {
-			p.kvsOnlyReader.SetSinceTime(p.sinceTime)
-		}
-		return p.kvsOnlyReader.Read(ctx)
 	}
 
 	if p.opmlPath == "" {

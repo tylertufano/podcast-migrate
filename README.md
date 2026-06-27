@@ -28,8 +28,8 @@ Episode matching uses a cascade of up to six strategies (GUID → feed URL + pub
 
 All providers that use HTTP APIs (Overcast, Pocket Casts, OPML) work on macOS, Linux, and Windows. The Apple Podcasts provider has two read paths:
 
-- **SQLite** (macOS only) — reads from the local `MTLibrary.sqlite` database with an optional live KVS overlay for up-to-date play state.
-- **KVS-only** (all platforms) — reads subscriptions and play state directly from Apple's iCloud KVS, with episode metadata fetched from RSS. Activated automatically when `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` are set and SQLite is unavailable. On non-macOS platforms this is the only read path.
+- **KVS-only** (all platforms) — reads subscriptions and play state directly from Apple's iCloud KVS, with episode metadata fetched from RSS. Activated automatically when `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` are set; takes precedence over SQLite on macOS as well.
+- **SQLite** (macOS fallback) — reads from the local `MTLibrary.sqlite` database. Used only when KVS credentials are not configured.
 
 Writing to Apple Podcasts (play state + subscriptions) always requires macOS.
 

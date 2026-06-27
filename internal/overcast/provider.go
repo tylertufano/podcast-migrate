@@ -58,6 +58,7 @@ type Provider struct {
 	password             string // Overcast account password
 	clearSourceOPMLCache bool   // if true, bypass the on-disk cache and re-fetch source OPML from the live account
 	saveSourceOPMLPath   string // if non-empty, save a copy of the fetched source OPML to this path after download
+	currentSubsNorm      map[string]bool // normalized URLs + titles of current subscriptions, set by GetLibrary
 }
 
 // NewProvider returns an Overcast provider without web API credentials.
@@ -155,7 +156,11 @@ func (p *Provider) Capabilities() provider.Capabilities {
 func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 	// Explicit file path — read directly, no auth needed.
 	if p.sourceOPMLPath != "" {
-		return NewOPMLReader(p.sourceOPMLPath).Read(ctx)
+		lib, err := NewOPMLReader(p.sourceOPMLPath).Read(ctx)
+		if err == nil {
+			p.cacheCurrentSubs(lib)
+		}
+		return lib, err
 	}
 
 	// No explicit path — credentials required for auto-fetch.
@@ -170,6 +175,7 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 	if hit, _ := loadCachedSourceOPML(ctx, p.clearSourceOPMLCache); hit != nil {
 		age := hit.age.Round(time.Minute)
 		fmt.Printf("overcast: using cached source OPML (%s old)\n", age)
+		p.cacheCurrentSubs(hit.lib)
 		return hit.lib, nil
 	}
 
@@ -208,7 +214,48 @@ func (p *Provider) GetLibrary(ctx context.Context) (*model.Library, error) {
 	}
 	fmt.Printf("overcast: fetched %d podcast(s), %d episode(s) from live account\n",
 		len(lib.Podcasts), len(lib.Episodes))
+	p.cacheCurrentSubs(lib)
 	return lib, nil
+}
+
+// cacheCurrentSubs indexes the current Overcast subscriptions by both normalized
+// feed URL and normalized title so SetLibrary can filter the OPML to net-new feeds.
+func (p *Provider) cacheCurrentSubs(lib *model.Library) {
+	if lib == nil {
+		return
+	}
+	p.currentSubsNorm = make(map[string]bool, len(lib.Podcasts)*2)
+	for _, pod := range lib.Podcasts {
+		if pod.FeedURL != "" {
+			p.currentSubsNorm[migrate.NormalizeFeedURL(pod.FeedURL)] = true
+		}
+		if pod.Title != "" {
+			p.currentSubsNorm[strings.ToLower(strings.TrimSpace(pod.Title))] = true
+			if base := model.NormalizePlusTitle(pod.Title); base != "" {
+				p.currentSubsNorm[base] = true
+			}
+		}
+	}
+}
+
+// isAlreadySubscribed reports whether pod matches a current Overcast subscription
+// by normalized feed URL or normalized title (exact or Plus-variant).
+func (p *Provider) isAlreadySubscribed(pod model.Podcast) bool {
+	if len(p.currentSubsNorm) == 0 {
+		return false
+	}
+	if pod.FeedURL != "" && p.currentSubsNorm[migrate.NormalizeFeedURL(pod.FeedURL)] {
+		return true
+	}
+	if pod.Title != "" {
+		if p.currentSubsNorm[strings.ToLower(strings.TrimSpace(pod.Title))] {
+			return true
+		}
+		if base := model.NormalizePlusTitle(pod.Title); base != "" && p.currentSubsNorm[base] {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts provider.WriteOptions) error {
@@ -246,11 +293,25 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 	}
 
 	if writeSubscriptionsOPML {
+		toExport := lib.Podcasts
+		if len(p.currentSubsNorm) > 0 {
+			filtered := make([]model.Podcast, 0, len(lib.Podcasts))
+			for _, pod := range lib.Podcasts {
+				if !p.isAlreadySubscribed(pod) {
+					filtered = append(filtered, pod)
+				}
+			}
+			skipped := len(lib.Podcasts) - len(filtered)
+			fmt.Printf("overcast: OPML export — %d net-new subscription(s), %d already subscribed (skipped)\n",
+				len(filtered), skipped)
+			toExport = filtered
+		}
+		exportLib := &model.Library{Podcasts: toExport}
 		if opts.DryRun {
 			fmt.Printf("[dry-run] would write %d subscriptions to %s\n",
-				len(lib.Podcasts), p.exportOPMLPath)
+				len(toExport), p.exportOPMLPath)
 		} else {
-			if err := (&OPMLWriter{}).Write(lib, p.exportOPMLPath); err != nil {
+			if err := (&OPMLWriter{}).Write(exportLib, p.exportOPMLPath); err != nil {
 				return err
 			}
 		}
@@ -341,7 +402,10 @@ func (p *Provider) doWriteSubscriptionsAPI(ctx context.Context, lib *model.Libra
 		}
 		normTitle := strings.ToLower(strings.TrimSpace(pod.Title))
 
-		// Skip if already subscribed (exact or Plus-normalised title match).
+		// Skip if already subscribed — URL match (from OPML cache) or title match (live /podcasts index).
+		if pod.FeedURL != "" && len(p.currentSubsNorm) > 0 && p.currentSubsNorm[migrate.NormalizeFeedURL(pod.FeedURL)] {
+			continue
+		}
 		if _, found := pageURLByNormTitle[normTitle]; found {
 			continue
 		}

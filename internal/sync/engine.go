@@ -128,16 +128,18 @@ func merge(src, dst *model.Library, opts provider.WriteOptions) *model.Library {
 		srcPodcasts := migrate.FilterPodcastsByTitle(src.Podcasts, opts.PodcastFilter)
 		feedSeen := make(map[string]bool)
 		for _, p := range srcPodcasts {
-			if !feedSeen[p.FeedURL] {
+			norm := migrate.NormalizeFeedURL(p.FeedURL)
+			if !feedSeen[norm] {
 				out.Podcasts = append(out.Podcasts, p)
-				feedSeen[p.FeedURL] = true
+				feedSeen[norm] = true
 			}
 		}
 		if dst != nil {
 			for _, p := range dst.Podcasts {
-				if !feedSeen[p.FeedURL] {
+				norm := migrate.NormalizeFeedURL(p.FeedURL)
+				if !feedSeen[norm] {
 					out.Podcasts = append(out.Podcasts, p)
-					feedSeen[p.FeedURL] = true
+					feedSeen[norm] = true
 				}
 			}
 		}

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -176,18 +175,15 @@ func migrateCmd() *cobra.Command {
 				}
 			}
 
-			// When Apple is the source, activate the appropriate KVS read mode:
-			//   - On macOS with SQLite: live KVS overlay (more authoritative play state)
-			//   - On non-macOS or when SQLite is unavailable: KVS+RSS read (no SQLite needed)
+			// When Apple is the source, use the KVS+RSS reader when credentials are
+			// available (APPLE_KVS_COOKIES). This applies on all platforms including
+			// macOS: KVS gives authoritative canonical URLs (via iTunes storeCollectionId
+			// lookup) whereas the local SQLite ZFEEDURL may be stale for moved feeds.
+			// EnableKVSOnlyRead is a no-op when APPLE_KVS_COOKIES is unset, in which
+			// case GetLibrary falls back to the local SQLite database.
 			if ap, ok := src.(*apple.Provider); ok {
-				if runtime.GOOS == "darwin" {
-					if err := ap.EnableLiveKVSRead(); err != nil {
-						fmt.Fprintf(os.Stderr, "apple: live KVS unavailable (%v) — using local SQLite\n", err)
-					}
-				} else {
-					if err := ap.EnableKVSOnlyRead(); err != nil {
-						fmt.Fprintf(os.Stderr, "apple: KVS-only read unavailable (%v)\n", err)
-					}
+				if err := ap.EnableKVSOnlyRead(); err != nil {
+					fmt.Fprintf(os.Stderr, "apple: KVS read unavailable (%v) — falling back to local SQLite\n", err)
 				}
 			}
 
@@ -312,7 +308,12 @@ func migrateCmd() *cobra.Command {
 		"optional when Overcast credentials are set — the extended OPML is fetched automatically\n"+
 		"and cached for 24 h (see --clear-source-opml-cache)")
 	cmd.Flags().StringVar(&overcastMatchOPML, "overcast-match-opml", "", "path to Overcast OPML used for destination episode matching when writing play state (optional; if omitted and credentials are set, the live account library is fetched automatically)")
-	cmd.Flags().StringVar(&overcastOut, "overcast-out", "", "path for the generated Overcast import OPML file")
+	cmd.Flags().StringVar(&overcastOut, "overcast-out", "", "path for the generated Overcast import OPML file (default when flag is provided without a value: ~/Desktop/podcast-migrate-overcast.opml)")
+	if home, err := os.UserHomeDir(); err == nil {
+		cmd.Flags().Lookup("overcast-out").NoOptDefVal = filepath.Join(home, "Desktop", "podcast-migrate-overcast.opml")
+	} else {
+		cmd.Flags().Lookup("overcast-out").NoOptDefVal = "podcast-migrate-overcast.opml"
+	}
 	cmd.Flags().StringVar(&overcastEmail, "overcast-email", "", "Overcast account email (or set OVERCAST_EMAIL env var)")
 	cmd.Flags().StringVar(&overcastPassword, "overcast-password", "", "Overcast account password (or set OVERCAST_PASSWORD env var)")
 	cmd.Flags().BoolVar(&overcastClearSourceCache, "clear-source-opml-cache", false,

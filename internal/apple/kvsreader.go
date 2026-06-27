@@ -104,20 +104,16 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 	feedURLSet := make(map[string]bool)
 
 	// Step 1: batch iTunes lookup for all catalog subscriptions.
-	// Collect PIDs first, then do a single batched request.
-	pidToClean := make(map[int64]string, len(kw.subscriptions)) // PID → cleaned KVS URL
+	// Collect unique StoreCollectionIDs first, then do a single batched request.
+	pidSet := make(map[int64]bool, len(kw.subscriptions))
 	for _, sub := range kw.subscriptions {
-		if sub.Subscribed != 1 || sub.FeedURL == "" || sub.PodcastPID <= 0 {
+		if sub.Subscribed != 1 || sub.FeedURL == "" || sub.StoreCollectionID <= 0 {
 			continue
 		}
-		clean := cleanFeedURL(sub.FeedURL)
-		if strings.HasPrefix(clean, "http://") || strings.HasPrefix(clean, "https://") {
-			pidToClean[sub.PodcastPID] = clean
-		}
+		pidSet[sub.StoreCollectionID] = true
 	}
-
-	pids := make([]int64, 0, len(pidToClean))
-	for pid := range pidToClean {
+	pids := make([]int64, 0, len(pidSet))
+	for pid := range pidSet {
 		pids = append(pids, pid)
 	}
 	itunesResults := map[int64]iTunesLookupResult{}
@@ -132,17 +128,25 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 	}
 
 	// Step 2: build cleanToCanonical and cleanToITunesID maps.
-	// cleanToCanonical: cleaned KVS URL → iTunes canonical URL.
-	// cleanToITunesID:  cleaned KVS URL → iTunes Store ID string.
-	cleanToCanonical := make(map[string]string, len(itunesResults))
-	cleanToITunesID := make(map[string]string, len(itunesResults))
-	for pid, clean := range pidToClean {
-		if result, ok := itunesResults[pid]; ok && result.FeedURL != "" {
-			canonical := cleanFeedURL(result.FeedURL)
-			if strings.HasPrefix(canonical, "http://") || strings.HasPrefix(canonical, "https://") {
-				cleanToCanonical[clean] = canonical
-				cleanToITunesID[clean] = strconv.FormatInt(pid, 10)
-			}
+	// Iterate every subscription directly so that all URL variants of the same
+	// podcast (e.g. a direct feed URL and a pdrl.fm redirect both pointing to the
+	// same StoreCollectionID) map to the same canonical — avoiding duplicates when
+	// the same podcast appears under two different stored URLs.
+	cleanToCanonical := make(map[string]string, len(kw.subscriptions))
+	cleanToITunesID := make(map[string]string, len(kw.subscriptions))
+	for _, sub := range kw.subscriptions {
+		if sub.Subscribed != 1 || sub.FeedURL == "" || sub.StoreCollectionID <= 0 {
+			continue
+		}
+		result, ok := itunesResults[sub.StoreCollectionID]
+		if !ok || result.FeedURL == "" {
+			continue
+		}
+		clean := cleanFeedURL(sub.FeedURL)
+		canonical := cleanFeedURL(result.FeedURL)
+		if strings.HasPrefix(canonical, "http://") || strings.HasPrefix(canonical, "https://") {
+			cleanToCanonical[clean] = canonical
+			cleanToITunesID[clean] = strconv.FormatInt(sub.StoreCollectionID, 10)
 		}
 	}
 
@@ -170,7 +174,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		// JWT-authenticated supportingcast.fm URL). Those URLs are
 		// Apple-internal and not usable by other apps; the public iTunes
 		// canonical URL is the correct export value for all destinations.
-		isPrivate := sub.PodcastPID == 0
+		isPrivate := sub.StoreCollectionID == 0
 		subByClean[clean] = subInfo{
 			title:     sub.Title,
 			feedURL:   canonical,
@@ -241,30 +245,6 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		}
 		lib.Podcasts = append(lib.Podcasts, pod)
 		inLib[info.feedURL] = true
-	}
-
-	// Also include podcasts that have playState data but are not in the
-	// subscription list (user unsubscribed but still has play history).
-	for rawURL := range kw.podcastsFeeds {
-		clean := cleanFeedURL(rawURL)
-		if !strings.HasPrefix(clean, "http://") && !strings.HasPrefix(clean, "https://") {
-			continue
-		}
-		canonical := clean
-		if c, ok := cleanToCanonical[clean]; ok {
-			canonical = c
-		}
-		if inLib[canonical] {
-			continue
-		}
-		pod := model.Podcast{FeedURL: canonical}
-		if feed, ok := rssFeeds[canonical]; ok {
-			pod.Title = feed.Title
-			pod.Author = feed.Author
-			pod.ImageURL = feed.ImageURL
-		}
-		lib.Podcasts = append(lib.Podcasts, pod)
-		inLib[canonical] = true
 	}
 
 	// Episodes: iterate over per-feed playState entries, look up UPP state,

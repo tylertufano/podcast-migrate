@@ -81,15 +81,7 @@ Source 4 is trusted when `ZLASTDATEPLAYED` is set because that timestamp confirm
 
 **iCloud sync gap (case 5)**: When an episode is listened to completion on iPhone or iPad, the mobile device records the event (incrementing `ZPLAYCOUNT` and setting `ZLASTDATEPLAYED`) but `ZPLAYSTATE` often remains `0` on the Mac because iCloud does not always propagate the completion flag. Apple also clears `ZLASTDATEPLAYED` when the user manually marks an episode as unplayed (while retaining `ZPLAYCOUNT` and `ZPLAYSTATESOURCE=3`). Requiring `ZLASTDATEPLAYED` to be set makes "completed but not synced" (date present) reliably distinguishable from "completed then manually unplayed" (date cleared).
 
-**Live KVS read** (`APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`): when KVS credentials are set and Apple Podcasts is the migration source, the reader calls `getAll(com.apple.upp)` on `bookkeeper.itunes.apple.com` and uses the server-side play state instead of the local `ZMTUPPMETADATA` cache. This gives a more authoritative result when the Mac SQLite database is stale (e.g. the Mac was not opened between a play event and the migration run).
-
-`getAll` returns at most 5,000 entries (hard server-side cap, most-recently-modified first). On a large library, this covers all episodes with any recent listening activity. The log reports how many records were fetched and how many matched episodes in the local library.
-
-The live KVS read has two phases:
-1. **Main query** (same as without live KVS) — episodes with local play evidence. For each episode that has a `ZMETADATAIDENTIFIER`, the server-side `HasBeenPlayed` / `BookmarkTimeSec` overrides local `ZMTUPPMETADATA`. Episodes not present in the live KVS response fall through to `ZMTEPISODE` heuristics.
-2. **Second pass** — for metadataIdentifiers in the live KVS that were not returned by the main query (no local play evidence at all), `ZMTEPISODE` is queried individually to fetch episode metadata. This picks up plays that exist only on the server and have not yet propagated to the local SQLite cache.
-
-The second pass is skipped when `--since` is active, since delta sync is scoped to recently-modified episodes and the live KVS carries no per-episode modification timestamp.
+**iTunes canonical URL resolution**: after reading subscriptions, `SQLiteReader` performs a batched lookup against the iTunes Store API (`itunes.apple.com/lookup`) using the `ZSTORECOLLECTIONID` column. This resolves stale feed URLs for podcasts that have moved hosts since the local database was last updated (e.g. a podcast that migrated from Podbean to Simplecast). The canonical URL from iTunes replaces the stored SQLite URL when available; podcasts with no iTunes listing are left unchanged.
 
 **Delta sync** (`--since`): filters by three timestamp columns:
 - `ZPLAYSTATELASTMODIFIEDDATE` — updated on state transitions
@@ -104,24 +96,24 @@ The second pass is skipped when `--since` is active, since delta sync is scoped 
 
 `KVSReader` reads subscriptions and play state entirely from Apple's iCloud KVS — no local SQLite database required. This enables Apple Podcasts migrations from **non-macOS platforms** (Linux, Windows) and from macOS machines where the Apple Podcasts database is inaccessible.
 
-Activated automatically when `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` are set and SQLite is not available. On macOS, SQLite takes precedence; set both KVS and SQLite credentials to get the live KVS overlay on top of SQLite.
+Activated automatically when `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` are set. KVS-only mode takes precedence over the local SQLite database on all platforms, including macOS. SQLite is used only when KVS credentials are not configured.
 
 **Data sources:**
 - `com.apple.podcasts` KVS domain — subscription list (feed URL, title, iTunes Store ID) and per-feed episode identity (GUID → `metadataIdentifier`)
 - `com.apple.upp` KVS domain — per-episode play state (played, bookmark position, timestamp of last change)
 - RSS feeds — episode titles, pub dates, durations (fetched concurrently, up to 8 parallel)
 
-**iTunes canonical URL resolution**: for every catalog subscription (`PodcastPID > 0`), `KVSReader` performs a batched lookup against the iTunes Store API (`itunes.apple.com/lookup`) to resolve the canonical public feed URL. The iTunes ID is stored in `model.Podcast.ITunesID` and used by the Overcast writer to subscribe directly via `/itunes{ID}` without a `search_autocomplete` round-trip.
+**iTunes canonical URL resolution**: for every catalog subscription (`StoreCollectionID > 0`), `KVSReader` performs a batched lookup against the iTunes Store API (`itunes.apple.com/lookup`) to resolve the canonical public feed URL. The iTunes ID is stored in `model.Podcast.ITunesID` and used by the Overcast writer to subscribe directly via `/itunes{ID}` without a `search_autocomplete` round-trip.
 
-**Subscriber URL preservation and `IsPrivate` flag**: when the KVS feed URL differs from the iTunes canonical URL (e.g. `slateprivate.supportingcast.fm/content/eyJ…` vs. `feeds.slate.com/…`), the podcast is a subscriber or private edition. In this case the KVS subscriber URL is exported as `pod.FeedURL` — not replaced by the canonical URL — and `pod.IsPrivate` is set to `true`. Feeds with no `PodcastPID` (self-hosted, unindexed) are also marked `IsPrivate`. Only public/catalog feeds (KVS URL matches iTunes canonical) get the canonical URL substitution.
+**Subscriber URL preservation and `IsPrivate` flag**: when the KVS feed URL differs from the iTunes canonical URL (e.g. `slateprivate.supportingcast.fm/content/eyJ…` vs. `feeds.slate.com/…`), the podcast is a subscriber or private edition. In this case the KVS subscriber URL is exported as `pod.FeedURL` — not replaced by the canonical URL — and `pod.IsPrivate` is set to `true`. Feeds with no `StoreCollectionID` (self-hosted, unindexed) are also marked `IsPrivate`. Only public/catalog feeds (KVS URL matches iTunes canonical) get the canonical URL substitution.
 
 Destination providers use `IsPrivate` to route feeds correctly without manual configuration: the Apple KVS writer accepts the private feed URL directly and can subscribe it alongside an existing public subscription; the Overcast writer collects private feeds into a skipped-feeds OPML for manual import via Add Feed → URL (Overcast has no programmatic subscribe path for non-iTunes feeds).
 
 **`internal://` feeds**: Apple-exclusive shows with no public RSS are excluded from output and counted in `lib.SkippedInternalPodcasts`.
 
-**Episode coverage**: `com.apple.upp` is capped at 5,000 entries (most-recently-modified first). On a large library this covers all recently active episodes. The UPP cap is shared with the live KVS overlay on the SQLite path.
+**Episode coverage**: `com.apple.upp` is capped at 5,000 entries (most-recently-modified first). On a large library this covers all recently active episodes.
 
-**Unsubscribed feeds**: `com.apple.podcasts` retains play state for feeds the user has since unsubscribed. These appear in `lib.Podcasts` (without a subscription flag) and their episodes are included if play state exists.
+**Unsubscribed feeds**: `com.apple.podcasts` retains play state for feeds the user has since unsubscribed. Their episodes are included in `lib.Episodes` if play state exists, but the unsubscribed feeds themselves are not included in `lib.Podcasts` — they do not appear in OPML exports or subscription migrations.
 
 ### Writing — Two modes
 

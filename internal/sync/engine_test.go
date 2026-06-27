@@ -1200,9 +1200,9 @@ func TestApplyFeedMap_NormalisesHTTPKey(t *testing.T) {
 // ---- buildAutoFeedMap subtitle contains-match ----
 
 func TestBuildAutoFeedMap_SubtitleContainsMatch_Remaps(t *testing.T) {
-	// Apple stores "Crooked City" but PC/Overcast imported it as "Crooked City: Dixon, IL".
-	// The fuzzy prefix-match pass should still find the destination feed — "crooked city"
-	// is a word-aligned prefix of "crooked city dixon il".
+	// Apple stores "Crooked City" but Overcast imported it as "Crooked City: Dixon, IL"
+	// under a different host. The fuzzy prefix-match pass should still find the destination
+	// feed — "crooked city" is a word-aligned prefix of "crooked city dixon il".
 	srcLib := &model.Library{
 		Podcasts: []model.Podcast{
 			{FeedURL: "https://feeds.megaphone.fm/crookedcity", Title: "Crooked City"},
@@ -1210,14 +1210,14 @@ func TestBuildAutoFeedMap_SubtitleContainsMatch_Remaps(t *testing.T) {
 	}
 	dstLib := &model.Library{
 		Podcasts: []model.Podcast{
-			{FeedURL: "https://rss.pdrl.fm/7f8056/feeds.megaphone.fm/crookedcity", Title: "Crooked City: Dixon, IL"},
+			{FeedURL: "https://feeds.overcast.fm/crookedcity-rehost", Title: "Crooked City: Dixon, IL"},
 		},
 	}
 	got := buildAutoFeedMap(srcLib, dstLib)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 subtitle contains-match mapping, got %d: %v", len(got), got)
 	}
-	want := "https://rss.pdrl.fm/7f8056/feeds.megaphone.fm/crookedcity"
+	want := "https://feeds.overcast.fm/crookedcity-rehost"
 	if got["https://feeds.megaphone.fm/crookedcity"] != want {
 		t.Errorf("dst feed: got %q, want %q", got["https://feeds.megaphone.fm/crookedcity"], want)
 	}

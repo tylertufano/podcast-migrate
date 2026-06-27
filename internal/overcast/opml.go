@@ -210,7 +210,7 @@ type OPMLWriter struct{}
 
 func (w *OPMLWriter) Write(lib *model.Library, path string) error {
 	doc := overcastOPML{
-		Version: "1.0",
+		Version: "2.0",
 		Head:    overcastHead{Title: "Podcast Subscriptions"},
 		Body:    overcastBody{},
 	}
@@ -227,11 +227,6 @@ func (w *OPMLWriter) Write(lib *model.Library, path string) error {
 	if err != nil {
 		return fmt.Errorf("overcast/opml: marshal: %w", err)
 	}
-
-	// Go's xml package escapes apostrophes as &#39; in attribute values, but
-	// they don't require escaping inside double-quoted attributes. Replace with
-	// literal apostrophes to match the format Overcast natively produces.
-	out = bytes.ReplaceAll(out, []byte("&#39;"), []byte("'"))
 
 	content := append([]byte(xml.Header), out...)
 	// Ensure a trailing newline.

@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -106,7 +108,7 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 	// wbez.plus.npr.org) are included: the private URL is importable by Overcast
 	// and other apps that accept OPML.
 	const q = `
-		SELECT ZFEEDURL, ZTITLE, ZAUTHOR, ZIMAGEURL
+		SELECT ZFEEDURL, ZTITLE, ZAUTHOR, ZIMAGEURL, COALESCE(ZSTORECOLLECTIONID, 0)
 		FROM ZMTPODCAST
 		WHERE ZSUBSCRIBED = 1
 		  AND (ZFEEDURL LIKE 'http://%' OR ZFEEDURL LIKE 'https://%')
@@ -118,11 +120,16 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 	}
 	defer rows.Close()
 
-	var out []model.Podcast
+	type rawPodcast struct {
+		pod          model.Podcast
+		collectionID int64
+	}
+	var raw []rawPodcast
 	for rows.Next() {
 		var p model.Podcast
 		var imageURL sql.NullString
-		if err := rows.Scan(&p.FeedURL, &p.Title, &p.Author, &imageURL); err != nil {
+		var collectionID int64
+		if err := rows.Scan(&p.FeedURL, &p.Title, &p.Author, &imageURL, &collectionID); err != nil {
 			return nil, 0, fmt.Errorf("apple/sqlite: scan podcast: %w", err)
 		}
 		if imageURL.Valid {
@@ -132,10 +139,44 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 		// are appended to feed URLs to force a refresh. They are not part of the
 		// canonical feed URL and can break feed resolution in other apps.
 		p.FeedURL = cleanFeedURL(p.FeedURL)
-		out = append(out, p)
+		raw = append(raw, rawPodcast{pod: p, collectionID: collectionID})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
+	}
+
+	// Batch iTunes lookup: resolve current canonical feed URLs using
+	// ZSTORECOLLECTIONID. This corrects stale ZFEEDURL values for podcasts
+	// that have moved hosts since Apple Podcasts last refreshed the local cache.
+	var pids []int64
+	pidToIdx := make(map[int64]int, len(raw))
+	for i, rp := range raw {
+		if rp.collectionID > 0 {
+			pids = append(pids, rp.collectionID)
+			pidToIdx[rp.collectionID] = i
+		}
+	}
+	if len(pids) > 0 {
+		httpClient := &http.Client{Timeout: 15 * time.Second}
+		itunesResults, lookupErr := batchITunesLookup(ctx, httpClient, pids)
+		if lookupErr != nil {
+			fmt.Fprintf(os.Stderr, "apple: iTunes lookup failed (%v) — using SQLite feed URLs\n", lookupErr)
+		} else {
+			fmt.Printf("apple: iTunes lookup resolved %d/%d canonical feed URL(s)\n", len(itunesResults), len(pids))
+			for pid, result := range itunesResults {
+				if result.FeedURL == "" {
+					continue
+				}
+				i := pidToIdx[pid]
+				raw[i].pod.FeedURL = cleanFeedURL(result.FeedURL)
+				raw[i].pod.ITunesID = strconv.FormatInt(pid, 10)
+			}
+		}
+	}
+
+	out := make([]model.Podcast, len(raw))
+	for i, rp := range raw {
+		out[i] = rp.pod
 	}
 
 	const countSkipped = `
@@ -150,13 +191,31 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 	return out, skipped, nil
 }
 
-// cleanFeedURL removes transient query parameters that Apple Podcasts appends to
-// feed URLs (currently "t", a millisecond timestamp used as a cache-buster).
-// These parameters are not part of the canonical feed URL and cause failures when
-// other apps try to subscribe.
+// cleanFeedURL normalises a raw feed URL from Apple's local stores:
+//   - Unwraps rss.pdrl.fm redirect URLs (format: /hash/domain/path)
+//   - Removes Apple's transient "t" / "_t" cache-buster query parameters
 func cleanFeedURL(rawURL string) string {
 	u, err := url.Parse(rawURL)
-	if err != nil || u.RawQuery == "" {
+	if err != nil {
+		return rawURL
+	}
+
+	// Unwrap rss.pdrl.fm redirect links. Apple stores URLs that were subscribed
+	// through podcast directory redirect tracking services. The actual feed URL
+	// is encoded as the path after a 6-char hash segment:
+	//   https://rss.pdrl.fm/<hash>/<domain>/<path>[?query]
+	if u.Host == "rss.pdrl.fm" {
+		path := strings.TrimPrefix(u.Path, "/")
+		if idx := strings.Index(path, "/"); idx > 0 {
+			actual := "https://" + path[idx+1:]
+			if u.RawQuery != "" {
+				actual += "?" + u.RawQuery
+			}
+			return cleanFeedURL(actual) // recurse to strip any cache-buster params
+		}
+	}
+
+	if u.RawQuery == "" {
 		return rawURL
 	}
 	q := u.Query()

@@ -314,6 +314,7 @@ func (p *Provider) SetLibrary(ctx context.Context, lib *model.Library, opts prov
 			if err := (&OPMLWriter{}).Write(exportLib, p.exportOPMLPath); err != nil {
 				return err
 			}
+			fmt.Printf("overcast: wrote %d subscription(s) to %s\n", len(toExport), p.exportOPMLPath)
 		}
 	}
 

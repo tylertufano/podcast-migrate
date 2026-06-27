@@ -31,16 +31,20 @@ type subInfo struct {
 	feedURL   string // export URL: subscriber URL if private, canonical if public
 	canonical string // iTunes canonical feed URL; falls back to cleanFeedURL(sub.FeedURL)
 	itunesID  string // iTunes Store ID as a string; empty for private/unindexed feeds
+	author    string // from iTunes lookup; empty for private/unindexed feeds
+	imageURL  string // from iTunes lookup (artworkUrl600); empty for private/unindexed feeds
 	isPrivate bool   // true when KVS URL differs from iTunes canonical, or PodcastPID == 0
 }
 
 // KVSReader reads a model.Library from Apple's iCloud KVS + RSS.
 // Requires APPLE_KVS_DSID and APPLE_KVS_COOKIES env vars.
 type KVSReader struct {
-	kvsWriter   *KVSWriter
-	httpClient  *http.Client
-	sinceTime   time.Time
-	concurrency int // max parallel RSS fetches (default 8)
+	kvsWriter          *KVSWriter
+	httpClient         *http.Client
+	sinceTime          time.Time
+	skipRSSFetch       bool // when true, skip RSS fetches (subscriptions-only runs)
+	allPlayState       bool // when true, fetch RSS and emit episodes for unsubscribed feeds too
+	concurrency        int  // max parallel RSS fetches (default 5)
 }
 
 // NewKVSReader creates a KVSReader using KVS credentials from env vars
@@ -57,13 +61,15 @@ func NewKVSReader() (*KVSReader, error) {
 	return &KVSReader{
 		kvsWriter:   kw,
 		httpClient:  &http.Client{Timeout: 30 * time.Second},
-		concurrency: 8,
+		concurrency: 5,
 	}, nil
 }
 
 // SetSinceTime restricts Read to episodes whose KVS play-state timestamp is
 // after t. A zero t reads all episodes.
-func (r *KVSReader) SetSinceTime(t time.Time) { r.sinceTime = t }
+func (r *KVSReader) SetSinceTime(t time.Time)    { r.sinceTime = t }
+func (r *KVSReader) SetSkipRSSFetch(skip bool)  { r.skipRSSFetch = skip }
+func (r *KVSReader) SetAllPlayState(all bool)   { r.allPlayState = all }
 
 // Read fetches subscriptions and play state from KVS, resolves episode
 // metadata from RSS feeds, and returns the merged library.
@@ -175,40 +181,51 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		// Apple-internal and not usable by other apps; the public iTunes
 		// canonical URL is the correct export value for all destinations.
 		isPrivate := sub.StoreCollectionID == 0
+		var author, imageURL string
+		if result, ok := itunesResults[sub.StoreCollectionID]; ok {
+			author = result.Author
+			imageURL = result.ImageURL
+		}
 		subByClean[clean] = subInfo{
 			title:     sub.Title,
 			feedURL:   canonical,
 			canonical: canonical,
 			itunesID:  cleanToITunesID[clean],
+			author:    author,
+			imageURL:  imageURL,
 			isPrivate: isPrivate,
 		}
 		feedURLSet[canonical] = true
 	}
 
-	// Also include feedURLs from playState entries (handles feeds that appear in
-	// com.apple.podcasts but are not (or no longer) in the subscription list).
-	// Restrict to http/https — internal:// and other non-standard schemes cannot
-	// be imported by any destination app.
-	for rawURL := range kw.podcastsFeeds {
-		clean := cleanFeedURL(rawURL)
-		if !strings.HasPrefix(clean, "http://") && !strings.HasPrefix(clean, "https://") {
-			continue
+	// When --all-play-state is set, also fetch RSS for feeds that have play state
+	// history but are no longer subscribed. This enables play state migration across
+	// different feed URLs for the same podcast, or recovery of historical play data.
+	if r.allPlayState {
+		for rawURL := range kw.podcastsFeeds {
+			clean := cleanFeedURL(rawURL)
+			if !strings.HasPrefix(clean, "http://") && !strings.HasPrefix(clean, "https://") {
+				continue
+			}
+			canonical := clean
+			if c, ok := cleanToCanonical[clean]; ok {
+				canonical = c
+			}
+			feedURLSet[canonical] = true
 		}
-		canonical := clean
-		if c, ok := cleanToCanonical[clean]; ok {
-			canonical = c
-		}
-		feedURLSet[canonical] = true
-	}
-
-	// Collect sorted unique feed URLs for RSS fetching.
-	feedURLs := make([]string, 0, len(feedURLSet))
-	for u := range feedURLSet {
-		feedURLs = append(feedURLs, u)
 	}
 
 	// Fetch RSS feeds concurrently to get episode metadata (title, pubDate, duration).
-	rssFeeds := r.fetchRSSFeeds(ctx, feedURLs)
+	// Skipped for subscriptions-only runs — iTunes lookup already provides Author
+	// and ImageURL, and episode metadata is not needed when play state is not migrated.
+	var rssFeeds map[string]rssFeed
+	if !r.skipRSSFetch {
+		feedURLs := make([]string, 0, len(feedURLSet))
+		for u := range feedURLSet {
+			feedURLs = append(feedURLs, u)
+		}
+		rssFeeds = r.fetchRSSFeeds(ctx, feedURLs)
+	}
 
 	lib := &model.Library{}
 
@@ -229,16 +246,12 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		pod := model.Podcast{
 			FeedURL:   info.feedURL,
 			Title:     sub.Title,
+			Author:    info.author,
+			ImageURL:  info.imageURL,
 			ITunesID:  info.itunesID,
 			IsPrivate: info.isPrivate,
 		}
 		if feed, ok := rssFeeds[info.feedURL]; ok {
-			if feed.Author != "" {
-				pod.Author = feed.Author
-			}
-			if feed.ImageURL != "" {
-				pod.ImageURL = feed.ImageURL
-			}
 			if pod.Title == "" {
 				pod.Title = feed.Title
 			}
@@ -249,8 +262,11 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 
 	// Episodes: iterate over per-feed playState entries, look up UPP state,
 	// fill in metadata from RSS. Use canonical URLs so episode FeedURLs match
-	// the corresponding lib.Podcasts entries.
+	// the corresponding lib.Podcasts entries. Skipped entirely for subscriptions-only runs.
 	var matched int
+	if r.skipRSSFetch {
+		goto doneEpisodes
+	}
 	for rawURL, psFeed := range kw.podcastsFeeds {
 		clean := cleanFeedURL(rawURL)
 		if !strings.HasPrefix(clean, "http://") && !strings.HasPrefix(clean, "https://") {
@@ -323,6 +339,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		}
 	}
 
+doneEpisodes:
 	lib.SkippedInternalPodcasts = skippedInternal
 	fmt.Printf("apple: KVS-only read complete — %d subscriptions, %d episodes with play state\n",
 		len(lib.Podcasts), matched)

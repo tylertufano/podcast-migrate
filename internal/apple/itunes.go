@@ -10,11 +10,13 @@ import (
 	"strings"
 )
 
-// iTunesLookupResult holds the canonical feed URL and title for one podcast
-// returned by the iTunes Store lookup API.
+// iTunesLookupResult holds metadata for one podcast returned by the iTunes
+// Store lookup API.
 type iTunesLookupResult struct {
-	FeedURL string
-	Title   string
+	FeedURL  string
+	Title    string
+	Author   string
+	ImageURL string
 }
 
 // batchITunesLookup resolves canonical feed URLs for a list of iTunes Store
@@ -64,6 +66,8 @@ func batchITunesLookup(ctx context.Context, client *http.Client, pids []int64) (
 				CollectionID int64  `json:"collectionId"`
 				FeedURL      string `json:"feedUrl"`
 				Title        string `json:"collectionName"`
+				Author       string `json:"artistName"`
+				ImageURL     string `json:"artworkUrl600"`
 			} `json:"results"`
 		}
 		if err := json.Unmarshal(body, &payload); err != nil {
@@ -72,7 +76,12 @@ func batchITunesLookup(ctx context.Context, client *http.Client, pids []int64) (
 
 		for _, r := range payload.Results {
 			if r.FeedURL != "" && r.CollectionID > 0 {
-				out[r.CollectionID] = iTunesLookupResult{FeedURL: r.FeedURL, Title: r.Title}
+				out[r.CollectionID] = iTunesLookupResult{
+					FeedURL:  r.FeedURL,
+					Title:    r.Title,
+					Author:   r.Author,
+					ImageURL: r.ImageURL,
+				}
 			}
 		}
 	}

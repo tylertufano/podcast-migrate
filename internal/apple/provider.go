@@ -133,6 +133,22 @@ func (p *Provider) EnableKVSOnlyRead() error {
 	return nil
 }
 
+// SetSkipRSSFetch configures the KVS-only reader to skip RSS fetches.
+// Call this for subscriptions-only runs where episode metadata is not needed.
+func (p *Provider) SetSkipRSSFetch(skip bool) {
+	if p.kvsOnlyReader != nil {
+		p.kvsOnlyReader.SetSkipRSSFetch(skip)
+	}
+}
+
+// SetAllPlayState configures the KVS-only reader to include play state from
+// unsubscribed feeds, fetching their RSS so episode metadata is available for matching.
+func (p *Provider) SetAllPlayState(all bool) {
+	if p.kvsOnlyReader != nil {
+		p.kvsOnlyReader.SetAllPlayState(all)
+	}
+}
+
 func (p *Provider) Name() string { return "Apple Podcasts" }
 
 func (p *Provider) Capabilities() provider.Capabilities {

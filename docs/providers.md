@@ -101,9 +101,10 @@ Activated automatically when `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` are set. KVS
 **Data sources:**
 - `com.apple.podcasts` KVS domain — subscription list (feed URL, title, iTunes Store ID) and per-feed episode identity (GUID → `metadataIdentifier`)
 - `com.apple.upp` KVS domain — per-episode play state (played, bookmark position, timestamp of last change)
-- RSS feeds — episode titles, pub dates, durations (fetched concurrently, up to 8 parallel)
+- iTunes Store API (`itunes.apple.com/lookup`) — canonical feed URLs, author, and artwork (600 px) for every catalog subscription, resolved in a single batched request
+- RSS feeds — episode titles, pub dates, durations (fetched concurrently, up to 5 parallel, with retry on transient errors)
 
-**iTunes canonical URL resolution**: for every catalog subscription (`StoreCollectionID > 0`), `KVSReader` performs a batched lookup against the iTunes Store API (`itunes.apple.com/lookup`) to resolve the canonical public feed URL. The iTunes ID is stored in `model.Podcast.ITunesID` and used by the Overcast writer to subscribe directly via `/itunes{ID}` without a `search_autocomplete` round-trip.
+**iTunes canonical URL resolution**: for every catalog subscription (`StoreCollectionID > 0`), `KVSReader` performs a batched lookup against the iTunes Store API to resolve the canonical public feed URL plus `author` and `artworkUrl600`. The iTunes ID is stored in `model.Podcast.ITunesID` and used by the Overcast writer to subscribe directly via `/itunes{ID}` without a `search_autocomplete` round-trip. Feed URLs from the iTunes API are treated as canonical and are never replaced by following HTTP redirects or RSS `<itunes:new-feed-url>` tags.
 
 **Subscriber URL preservation and `IsPrivate` flag**: when the KVS feed URL differs from the iTunes canonical URL (e.g. `slateprivate.supportingcast.fm/content/eyJ…` vs. `feeds.slate.com/…`), the podcast is a subscriber or private edition. In this case the KVS subscriber URL is exported as `pod.FeedURL` — not replaced by the canonical URL — and `pod.IsPrivate` is set to `true`. Feeds with no `StoreCollectionID` (self-hosted, unindexed) are also marked `IsPrivate`. Only public/catalog feeds (KVS URL matches iTunes canonical) get the canonical URL substitution.
 
@@ -113,7 +114,9 @@ Destination providers use `IsPrivate` to route feeds correctly without manual co
 
 **Episode coverage**: `com.apple.upp` is capped at 5,000 entries (most-recently-modified first). On a large library this covers all recently active episodes.
 
-**Unsubscribed feeds**: `com.apple.podcasts` retains play state for feeds the user has since unsubscribed. Their episodes are included in `lib.Episodes` if play state exists, but the unsubscribed feeds themselves are not included in `lib.Podcasts` — they do not appear in OPML exports or subscription migrations.
+**Unsubscribed feeds**: `com.apple.podcasts` retains play state for feeds the user has since unsubscribed. By default their episodes are omitted — RSS is only fetched for currently-subscribed feeds, so unsubscribed episodes have no title/pubDate/duration and cannot be matched by destination providers. Pass `--apple-all-play-state` to also fetch RSS for unsubscribed feeds and include their episodes in `lib.Episodes`; useful when consolidating play data across feed URL changes.
+
+**RSS fetch behaviour**: RSS is skipped entirely for subscriptions-only runs (`--only-subscriptions`, `--overcast-out`) since episode metadata is not needed. For play-state runs, up to 5 feeds are fetched concurrently; network errors, 5xx responses, and truncated XML are retried up to 2 times with 1 s / 2 s backoff; 429 rate limits respect the `Retry-After` header.
 
 ### Writing — Two modes
 

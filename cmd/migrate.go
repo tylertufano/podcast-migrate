@@ -54,6 +54,7 @@ func migrateCmd() *cobra.Command {
 		pocketcastsEmail        string   // --pocketcasts-email / POCKETCASTS_EMAIL
 		pocketcastsPassword     string   // --pocketcasts-password / POCKETCASTS_PASSWORD
 		pcIncludeUnsubscribed   bool     // --pc-include-unsubscribed
+		appleAllPlayState       bool     // --apple-all-play-state
 		feedMapPairs            []string // --feed-map (repeatable, "SRC_URL=DST_URL")
 		opmlFile            string        // --opml-file (source OPML path when --from opml)
 		opmlOut             string        // --opml-out (output OPML path when --to opml)
@@ -184,6 +185,12 @@ func migrateCmd() *cobra.Command {
 			if ap, ok := src.(*apple.Provider); ok {
 				if err := ap.EnableKVSOnlyRead(); err != nil {
 					fmt.Fprintf(os.Stderr, "apple: KVS read unavailable (%v) — falling back to local SQLite\n", err)
+				}
+				if onlySubs || overcastOut != "" {
+					ap.SetSkipRSSFetch(true)
+				}
+				if appleAllPlayState {
+					ap.SetAllPlayState(true)
 				}
 			}
 
@@ -359,6 +366,9 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&pcIncludeUnsubscribed, "pc-include-unsubscribed", false,
 		"when --from pocketcasts: also export play history for podcasts no longer subscribed to;\n"+
 			"the feed URL is recovered via the Pocket Casts CDN or iTunes Search API")
+	cmd.Flags().BoolVar(&appleAllPlayState, "apple-all-play-state", false,
+		"when --from podcasts (KVS): include play state for all feeds with history, not just\n"+
+			"current subscriptions; useful when consolidating play data across feed URL changes")
 	cmd.Flags().StringArrayVar(&feedMapPairs, "feed-map", nil,
 		"map a source subscriber feed URL to a destination analog feed URL\n"+
 			"(format: SRC_URL=DST_URL; repeatable). Use when you have already\n"+

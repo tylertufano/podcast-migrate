@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/tyler/podcast-migrate/internal/httputil"
 )
 
 // rssFeed is the minimal parsed representation of an RSS 2.0 feed.
@@ -119,60 +121,73 @@ func parseItunesDuration(s string) time.Duration {
 	return 0
 }
 
-// fetchRSSFeed fetches and parses an RSS feed. Returns (rssFeed{}, nil) when
-// the URL returns 4xx/5xx so callers can still use KVS data for the feed.
+// fetchRSSFeed fetches and parses an RSS feed. Network errors, 5xx, and
+// truncated XML are retried up to 2 times with exponential backoff.
+// Returns (rssFeed{}, nil) for 4xx and empty responses so callers can
+// still use KVS data for the feed.
 func fetchRSSFeed(ctx context.Context, client *http.Client, feedURL string) (rssFeed, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
-	if err != nil {
-		return rssFeed{}, fmt.Errorf("rss request: %w", err)
-	}
-	req.Header.Set("User-Agent", "podcast-migrate/1.0 (+https://github.com/tylertufano/podcast-migrate)")
-	req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, */*")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return rssFeed{}, fmt.Errorf("rss fetch: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return rssFeed{}, nil
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
-	if err != nil {
-		return rssFeed{}, fmt.Errorf("rss read: %w", err)
-	}
-
-	var raw rssFeedRaw
-	if err := xml.Unmarshal(body, &raw); err != nil {
-		return rssFeed{}, fmt.Errorf("rss parse: %w", err)
-	}
-	ch := raw.Channel
-
-	feed := rssFeed{
-		Title:  ch.Title,
-		Author: ch.ItunesAuthor,
-	}
-	if ch.ItunesImage.Href != "" {
-		feed.ImageURL = ch.ItunesImage.Href
-	} else {
-		feed.ImageURL = ch.Image.URL
-	}
-
-	for _, raw := range ch.Items {
-		guid := strings.TrimSpace(raw.GUID.Value)
-		if guid == "" {
-			guid = raw.Enclosure.URL
+	var out rssFeed
+	err := httputil.RetryFunc(ctx, func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
+		if err != nil {
+			return fmt.Errorf("rss request: %w", err) // permanent — bad URL
 		}
-		item := rssItem{
-			GUID:      guid,
-			Title:     strings.TrimSpace(raw.Title),
-			PubDate:   parsePubDate(raw.PubDate),
-			Duration:  parseItunesDuration(raw.ItunesDuration),
-			EnclosURL: raw.Enclosure.URL,
+		req.Header.Set("User-Agent", "podcast-migrate/1.0 (+https://github.com/tylertufano/podcast-migrate)")
+		req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, */*")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return httputil.NewTransientError(fmt.Errorf("rss fetch: %w", err))
 		}
-		feed.Items = append(feed.Items, item)
-	}
-	return feed, nil
+		defer resp.Body.Close()
+
+		if resp.StatusCode == 429 {
+			return &httputil.RateLimitError{Wait: httputil.ParseRetryAfter(resp, 30*time.Second)}
+		}
+		if resp.StatusCode >= 500 {
+			return httputil.NewTransientError(fmt.Errorf("rss fetch: HTTP %d", resp.StatusCode))
+		}
+		if resp.StatusCode >= 400 {
+			return nil // auth-gated or gone — not retriable, treat as empty
+		}
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+		if err != nil {
+			return httputil.NewTransientError(fmt.Errorf("rss read: %w", err))
+		}
+		if len(body) == 0 {
+			return nil // empty response — treat as empty, not retriable
+		}
+
+		var raw rssFeedRaw
+		if err := xml.Unmarshal(body, &raw); err != nil {
+			return httputil.NewTransientError(fmt.Errorf("rss parse: %w", err))
+		}
+
+		ch := raw.Channel
+		out = rssFeed{
+			Title:  ch.Title,
+			Author: ch.ItunesAuthor,
+		}
+		if ch.ItunesImage.Href != "" {
+			out.ImageURL = ch.ItunesImage.Href
+		} else {
+			out.ImageURL = ch.Image.URL
+		}
+		for _, item := range ch.Items {
+			guid := strings.TrimSpace(item.GUID.Value)
+			if guid == "" {
+				guid = item.Enclosure.URL
+			}
+			out.Items = append(out.Items, rssItem{
+				GUID:      guid,
+				Title:     strings.TrimSpace(item.Title),
+				PubDate:   parsePubDate(item.PubDate),
+				Duration:  parseItunesDuration(item.ItunesDuration),
+				EnclosURL: item.Enclosure.URL,
+			})
+		}
+		return nil
+	}, httputil.RetryOptions{MaxTransientAttempts: 2, BaseDelay: 1 * time.Second})
+	return out, err
 }

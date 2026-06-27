@@ -164,25 +164,21 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		if c, ok := cleanToCanonical[clean]; ok {
 			canonical = c
 		}
-		// A feed is private when the KVS URL differs from the iTunes canonical
-		// (e.g. a subscriber edition URL) or when there is no iTunes listing at
-		// all (PodcastPID == 0). For private feeds, export the KVS URL directly
-		// so destinations subscribe to the correct subscriber/private feed rather
-		// than the public canonical — and so episode FeedURLs key correctly into
-		// kw.podcastsFeeds (which is keyed by the KVS URL, not the canonical).
-		isPrivate := canonical != clean || sub.PodcastPID == 0
-		exportURL := canonical
-		if isPrivate {
-			exportURL = clean
-		}
+		// A feed is private only when there is no iTunes listing at all
+		// (PodcastPID == 0). When a canonical URL exists, always use it —
+		// even if Apple stored a private subscriber URL internally (e.g. a
+		// JWT-authenticated supportingcast.fm URL). Those URLs are
+		// Apple-internal and not usable by other apps; the public iTunes
+		// canonical URL is the correct export value for all destinations.
+		isPrivate := sub.PodcastPID == 0
 		subByClean[clean] = subInfo{
 			title:     sub.Title,
-			feedURL:   exportURL,
+			feedURL:   canonical,
 			canonical: canonical,
 			itunesID:  cleanToITunesID[clean],
 			isPrivate: isPrivate,
 		}
-		feedURLSet[exportURL] = true
+		feedURLSet[canonical] = true
 	}
 
 	// Also include feedURLs from playState entries (handles feeds that appear in
@@ -198,11 +194,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		if c, ok := cleanToCanonical[clean]; ok {
 			canonical = c
 		}
-		exportURL := canonical
-		if canonical != clean {
-			exportURL = clean
-		}
-		feedURLSet[exportURL] = true
+		feedURLSet[canonical] = true
 	}
 
 	// Collect sorted unique feed URLs for RSS fetching.
@@ -262,21 +254,17 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		if c, ok := cleanToCanonical[clean]; ok {
 			canonical = c
 		}
-		exportURL := canonical
-		if canonical != clean {
-			exportURL = clean
-		}
-		if inLib[exportURL] {
+		if inLib[canonical] {
 			continue
 		}
-		pod := model.Podcast{FeedURL: exportURL}
-		if feed, ok := rssFeeds[exportURL]; ok {
+		pod := model.Podcast{FeedURL: canonical}
+		if feed, ok := rssFeeds[canonical]; ok {
 			pod.Title = feed.Title
 			pod.Author = feed.Author
 			pod.ImageURL = feed.ImageURL
 		}
 		lib.Podcasts = append(lib.Podcasts, pod)
-		inLib[exportURL] = true
+		inLib[canonical] = true
 	}
 
 	// Episodes: iterate over per-feed playState entries, look up UPP state,
@@ -292,13 +280,8 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		if c, ok := cleanToCanonical[clean]; ok {
 			canonical = c
 		}
-		// Use subscriber URL for private feeds so episode FeedURL matches the
-		// corresponding lib.Podcasts entry (which also exports the subscriber URL).
-		exportURL := canonical
-		if canonical != clean {
-			exportURL = clean
-		}
-		rssFeed := rssFeeds[exportURL]
+		// Use canonical URL so episode FeedURL matches the corresponding lib.Podcasts entry.
+		rssFeed := rssFeeds[canonical]
 
 		// Build GUID→rssItem index for O(1) lookup.
 		rssIdx := make(map[string]*rssItem, len(rssFeed.Items))
@@ -335,7 +318,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 
 			ep := model.EpisodeState{
 				GUID:    psEp.GUID,
-				FeedURL: exportURL, // matches lib.Podcasts entry (subscriber URL for private feeds)
+				FeedURL: canonical,
 			}
 
 			if rssItem, ok := rssIdx[psEp.GUID]; ok {

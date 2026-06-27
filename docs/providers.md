@@ -350,16 +350,22 @@ For each podcast in the source library:
 
 **OPML export** (when `--overcast-out` is provided): generates an OPML file that the user imports via **Overcast → Settings → Import OPML**. No credentials required. Use this path when you want to review subscriptions before committing, or when credentials are not available.
 
-#### Recommended migration order — avoid unexpected downloads
+#### Recommended full-library migration — OPML first
 
-When Overcast subscribes to a new podcast it automatically enqueues recent episodes for download based on the app's **Download** setting (default: automatic). If you write play state before Overcast knows which episodes are already played, it will queue those episodes for download and then mark them played — wasting bandwidth and cluttering the queue.
+For a complete library migration, the OPML export path is faster and more complete than the API subscribe path:
 
-Recommended order:
+- **Faster**: Overcast's bulk OPML import handles all subscriptions in one operation, bypassing the per-podcast request loop and its rate-limiting constraints.
+- **More complete**: The OPML includes private and subscriber-edition feeds (NPR+, Slate+, etc.) directly, so they are imported as-is. The API path cannot subscribe non-iTunes feeds and routes them to a separate skipped-feeds OPML for manual follow-up.
 
-1. **Subscribe first** — run `--only-subscriptions`, import an OPML file, or add feeds manually. This gives Overcast time to index each feed.
-2. **Set Download to Manual** — in the Overcast app: Settings → Default Settings → Download → **Off** (or set it per-podcast). This prevents auto-download when play state is written in the next step.
-3. **Sync play state** — run with `--play-state` (and optionally `--subscribed-only` to skip unmatched feeds). Overcast will mark episodes as played without downloading them.
-4. **Re-enable automatic downloads** (optional) — once play state is synced, restore your preferred Download setting.
+Recommended order for a full migration:
+
+1. **Generate a subscription OPML** — run with `--overcast-out ~/Desktop/import.opml`. No credentials required.
+2. **Import in Overcast** — Settings → Import OPML. Overcast subscribes all feeds including private ones.
+3. **Set Download to Manual** — Settings → Default Settings → Download → **Off**. This prevents auto-download when play state is written next.
+4. **Sync play state** — run with `--play-state` (and optionally `--subscribed-only`). Credentials required.
+5. **Re-enable automatic downloads** (optional).
+
+The `--only-subscriptions` API path is more convenient when you want a fully automated single-step run, accept the rate-limiting pauses, and have few or no private feeds.
 
 ### Writing — Play State (unofficial API)
 

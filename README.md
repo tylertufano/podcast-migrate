@@ -54,13 +54,25 @@ Reading the Apple Podcasts database requires **Full Disk Access** for your termi
 ## Quick start
 
 ```sh
-# Preview Apple Podcasts → Overcast subscription migration (no writes)
+# Full Apple Podcasts → Overcast migration (recommended two-pass approach)
+# Pass 1: generate subscription OPML (includes private feeds), then import
+#         via Overcast → Settings → Import OPML
 podcast-migrate migrate --from podcasts --to overcast \
-  --overcast-out ~/Desktop/import.opml --dry-run
+  --overcast-out ~/Desktop/import.opml
 
-# Sync play state Apple Podcasts → Overcast (last 48 hours)
+# Pass 2: after importing and setting Download → Off in Overcast,
+#         sync play state
 export OVERCAST_EMAIL="you@example.com"
 export OVERCAST_PASSWORD="yourpassword"
+podcast-migrate migrate --from podcasts --to overcast --play-state
+
+# Single-pass API subscribe + play state (slower due to per-podcast rate limiting;
+# private feeds are skipped to a separate OPML for manual import)
+export OVERCAST_EMAIL="you@example.com"
+export OVERCAST_PASSWORD="yourpassword"
+podcast-migrate migrate --from podcasts --to overcast --play-state
+
+# Sync play state Apple Podcasts → Overcast (incremental, last 48 hours)
 podcast-migrate migrate --from podcasts --to overcast \
   --play-state --since 48h
 
@@ -96,7 +108,7 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **`--since` is Apple-only** — delta sync currently only filters the Apple Podcasts SQLite reader. Overcast and Pocket Casts sources always read the full play history.
 
-**Overcast migration order** — when migrating to Overcast, subscribe to podcasts *before* writing play state to avoid unwanted downloads. On subscription, Overcast auto-downloads recent episodes unless the Download setting is set to **Off** (Settings → Default Settings → Download). Recommended order: (1) subscribe with `--only-subscriptions` or OPML import, (2) set Download to Off in the Overcast app, (3) run the full `--play-state` sync. See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for details.
+**Overcast migration order** — subscribe to podcasts *before* writing play state to avoid Overcast auto-downloading episodes it will immediately mark played. The recommended approach is a two-pass migration: (1) generate a subscription OPML with `--overcast-out` and import it via Overcast → Settings → Import OPML — this is faster than the API path and includes private/subscriber feeds that the API cannot subscribe; (2) set Download → Off in Overcast app settings; (3) run `--play-state` to sync play state. See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for the full workflow.
 
 ## Future work
 

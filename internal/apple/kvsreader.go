@@ -285,6 +285,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 			rssIdx[rssFeed.Items[i].GUID] = &rssFeed.Items[i]
 		}
 
+		var feedTotal, feedMatched int
 		for i := range psFeed.Episodes {
 			psEp := &psFeed.Episodes[i]
 			if psEp.MetadataIdentifier == "" {
@@ -312,6 +313,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 				continue // UPP entry exists but records no meaningful activity
 			}
 
+			feedTotal++
 			ep := model.EpisodeState{
 				GUID:    psEp.GUID,
 				FeedURL: canonical,
@@ -321,6 +323,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 				ep.Title = rssItem.Title
 				ep.PubDate = rssItem.PubDate
 				ep.Duration = rssItem.Duration
+				feedMatched++
 			}
 
 			if uppData.HasBeenPlayed {
@@ -336,6 +339,18 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 
 			lib.Episodes = append(lib.Episodes, ep)
 			matched++
+		}
+
+		if feedTotal > 0 && feedMatched < feedTotal {
+			podTitle := ""
+			if info, ok := subByClean[clean]; ok {
+				podTitle = info.title
+			}
+			label := canonical
+			if podTitle != "" {
+				label = fmt.Sprintf("%q", podTitle)
+			}
+			fmt.Printf("apple: rss match %d/%d episodes for %s\n", feedMatched, feedTotal, label)
 		}
 	}
 

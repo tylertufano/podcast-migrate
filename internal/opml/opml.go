@@ -230,6 +230,13 @@ func (w *Writer) Write(lib *model.Library, path string) error {
 			if ep.FromDestination || ep.PlayState == model.PlayStateUnplayed {
 				continue
 			}
+			// Skip episodes with no title: they can't be matched by any destination
+			// provider. These occur when the episode's GUID is absent from the current
+			// RSS feed (e.g. the episode has rotated off, or the podcast changed hosts
+			// and GUIDs changed in the process).
+			if ep.Title == "" {
+				continue
+			}
 			epsByFeed[ep.FeedURL] = append(epsByFeed[ep.FeedURL], ep)
 		}
 	}

@@ -191,28 +191,12 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 	return out, skipped, nil
 }
 
-// cleanFeedURL normalises a raw feed URL from Apple's local stores:
-//   - Unwraps rss.pdrl.fm redirect URLs (format: /hash/domain/path)
-//   - Removes Apple's transient "t" / "_t" cache-buster query parameters
+// cleanFeedURL removes Apple's transient "t" / "_t" cache-buster query
+// parameters from a raw feed URL from Apple's local stores.
 func cleanFeedURL(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
-	}
-
-	// Unwrap rss.pdrl.fm redirect links. Apple stores URLs that were subscribed
-	// through podcast directory redirect tracking services. The actual feed URL
-	// is encoded as the path after a 6-char hash segment:
-	//   https://rss.pdrl.fm/<hash>/<domain>/<path>[?query]
-	if u.Host == "rss.pdrl.fm" {
-		path := strings.TrimPrefix(u.Path, "/")
-		if idx := strings.Index(path, "/"); idx > 0 {
-			actual := "https://" + path[idx+1:]
-			if u.RawQuery != "" {
-				actual += "?" + u.RawQuery
-			}
-			return cleanFeedURL(actual) // recurse to strip any cache-buster params
-		}
 	}
 
 	if u.RawQuery == "" {

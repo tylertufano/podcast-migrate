@@ -43,26 +43,15 @@ var (
 // identity (e.g. ?feed=rss2). Apple's cache-buster params (?t=...) are already
 // stripped upstream before a URL reaches this function.
 //
+// URLs are never rewritten to a different host — index URLs (e.g. from the
+// iTunes Search API) and user subscription URLs are treated as canonical as-is.
+//
 // This function is used only for matching keys, never for making HTTP requests.
 func NormalizeFeedURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		// Not a parseable URL — fall back to simple lowercasing.
 		return strings.ToLower(strings.TrimRight(raw, "/"))
-	}
-
-	// Unwrap rss.pdrl.fm redirect tracking URLs. Format: /hash/domain/path.
-	// Overcast and Apple Podcasts both store these redirect URLs for feeds
-	// subscribed through certain directories; treat them as the underlying feed.
-	if strings.EqualFold(u.Host, "rss.pdrl.fm") {
-		path := strings.TrimPrefix(u.Path, "/")
-		if idx := strings.Index(path, "/"); idx > 0 {
-			actual := "https://" + path[idx+1:]
-			if u.RawQuery != "" {
-				actual += "?" + u.RawQuery
-			}
-			return NormalizeFeedURL(actual)
-		}
 	}
 
 	u.Scheme = strings.ToLower(u.Scheme)

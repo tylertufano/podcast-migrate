@@ -362,7 +362,7 @@ Recommended order for a full migration:
 1. **Generate a subscription OPML** — run with `--overcast-out ~/Desktop/import.opml`. No credentials required.
 2. **Import in Overcast** — Settings → Import OPML. Overcast subscribes all feeds including private ones.
 3. **Set Download to Manual** — Settings → Default Settings → Download → **Off**. This prevents auto-download when play state is written next.
-4. **Sync play state** — run with `--play-state` (and optionally `--subscribed-only`). Credentials required.
+4. **Sync play state** — run with `--play-state --subscribed-only`. Credentials required. `--subscribed-only` skips episode resolution for any feeds not yet subscribed in Overcast, which avoids re-running feed search logic for podcasts that were not in the OPML.
 5. **Re-enable automatic downloads** (optional).
 
 The `--only-subscriptions` API path is more convenient when you want a fully automated single-step run, accept the rate-limiting pauses, and have few or no private feeds.

@@ -61,10 +61,11 @@ podcast-migrate migrate --from podcasts --to overcast \
   --overcast-out ~/Desktop/import.opml
 
 # Pass 2: after importing and setting Download → Off in Overcast,
-#         sync play state
+#         sync play state; --subscribed-only skips feed search for any podcasts
+#         not yet subscribed in Overcast
 export OVERCAST_EMAIL="you@example.com"
 export OVERCAST_PASSWORD="yourpassword"
-podcast-migrate migrate --from podcasts --to overcast --play-state
+podcast-migrate migrate --from podcasts --to overcast --play-state --subscribed-only
 
 # Single-pass API subscribe + play state (slower due to per-podcast rate limiting;
 # private feeds are skipped to a separate OPML for manual import)
@@ -108,7 +109,7 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **`--since` is Apple-only** — delta sync currently only filters the Apple Podcasts SQLite reader. Overcast and Pocket Casts sources always read the full play history.
 
-**Overcast migration order** — subscribe to podcasts *before* writing play state to avoid Overcast auto-downloading episodes it will immediately mark played. The recommended approach is a two-pass migration: (1) generate a subscription OPML with `--overcast-out` and import it via Overcast → Settings → Import OPML — this is faster than the API path and includes private/subscriber feeds that the API cannot subscribe; (2) set Download → Off in Overcast app settings; (3) run `--play-state` to sync play state. See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for the full workflow.
+**Overcast migration order** — subscribe to podcasts *before* writing play state to avoid Overcast auto-downloading episodes it will immediately mark played. The recommended approach is a two-pass migration: (1) generate a subscription OPML with `--overcast-out` and import it — faster than the API path and includes private feeds the API cannot subscribe; (2) set Download → Off in Overcast; (3) run `--play-state --subscribed-only` to sync play state, skipping feed search for any podcasts not covered by the OPML. See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for the full workflow.
 
 ## Future work
 

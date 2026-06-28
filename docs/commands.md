@@ -73,14 +73,20 @@ podcast-migrate migrate --from <src> --to <dst> [flags]
 
 ### Delta sync
 
-| Flag | Description |
-|---|---|
-| `--since 48h` | Only process Apple episodes whose play state changed after this cutoff. Accepts: `7d`, `24h`, `2026-06-01`, `2026-06-01T12:00`, RFC3339. Only effective when `--from podcasts`. |
-
-The `--since` filter matches any of three Apple Podcasts timestamp columns:
+`--since` limits the Apple Podcasts source to episodes whose play state changed after the given cutoff. It matches any of three timestamp columns:
 - `ZPLAYSTATELASTMODIFIEDDATE` — state transitions (unplayed → in-progress → played)
 - `ZPLAYHEADLASTMODIFIEDDATE` — playhead advances (resumed in-progress episodes), when present
 - `ZLASTDATEPLAYED` — completion or cross-device sync
+
+### Apple Podcasts source flags
+
+These flags apply when `--from podcasts` (KVS read path).
+
+| Flag | Default | Description |
+|---|---|---|
+| `--apple-all-play-state` | false | Include play state for feeds you are no longer subscribed to. By default only current subscriptions have their RSS fetched, so unsubscribed episodes have no title and are omitted. Useful when consolidating history after a podcast moved to a new feed URL. |
+| `--private-feed` | `subscriber` | Strategy for feeds where the Apple subscription URL differs from the iTunes canonical URL. See [Providers](providers) for classification details. Options: `subscriber` (auto-detect, keep KVS when it adds archive or subscriber value), `public` (always use iTunes canonical), `kvs` (always use KVS URL), `custom` (prompt interactively per feed, requires TTY). |
+| `--since` | — | Delta sync cutoff. Only process episodes whose Apple play state changed after this point. Accepts a duration (`7d`, `24h`) or a date (`2026-06-01`, `2026-06-01T12:00`, RFC3339). See [Delta sync](#delta-sync). |
 
 ### Advanced
 

@@ -103,7 +103,24 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **Apple token expiry** — the Bearer token for the web API path is a short-lived JWT (~90 days). Re-capture it from browser DevTools if you get `401` errors. If you'd rather avoid managing these tokens, use KVS-only mode (just `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES`). See [Providers](https://tylertufano.github.io/podcast-migrate/providers) for details on both modes.
 
-**Apple subscriber and internal feeds** — `internal://` feeds (Apple-exclusive shows with no public RSS) are excluded from all exports. Subscriber and private feeds (NPR+, Slate+ via supportingcast.fm, etc.) are included and routed correctly at each destination. When reading via `KVSReader`, public catalog feeds use the canonical iTunes Store URL (never replaced by following HTTP redirects or RSS redirect tags); subscriber editions whose KVS URL differs from the iTunes canonical retain their subscriber URL and are flagged `IsPrivate`. When migrating *to* Apple Podcasts with KVS credentials set, private feeds are subscribed directly via KVS and can coexist alongside an existing public subscription with separate episode history. When migrating *to* Overcast, private feeds are collected in a skipped-feeds OPML for manual import via Add Feed → URL — Overcast has no programmatic subscribe path for non-iTunes feeds. Without KVS credentials, private-feed subscriptions and Apple Podcasts episode writes are skipped.
+**Apple subscriber and internal feeds** — `internal://` feeds (Apple-exclusive shows with no public RSS) are excluded from all exports. Subscriber and private feeds (NPR+, Slate+ via supportingcast.fm, etc.) are included and routed correctly at each destination.
+
+When reading via `KVSReader`, some subscriptions carry a KVS feed URL that differs from the iTunes canonical URL (e.g. a subscriber edition like `feeds.simplecast.com/54nAGcIl` vs. the iTunes canonical `feeds.simplecast.com/Sl5CSM3S`). For these, `KVSReader` fetches both RSS feeds and classifies the relationship before deciding which URL to export:
+
+| Class | Condition | Default URL (`subscriber` mode) |
+|---|---|---|
+| `private-auth` | KVS RSS inaccessible or empty | iTunes canonical |
+| `public-equivalent` | KVS RSS accessible, identical content and depth to iTunes | iTunes canonical |
+| `public-archive` | KVS RSS accessible, same episodes in iTunes window but deeper archive | KVS URL |
+| `public-subscriber` | KVS RSS has episodes absent from iTunes in the same date window | KVS URL |
+
+Control this behaviour with `--private-feed`:
+- `subscriber` (default) — automatic detection as above
+- `public` — always use the iTunes canonical URL
+- `kvs` — always use the KVS URL as-is
+- `custom` — prompt interactively for each mismatched feed
+
+When migrating *to* Apple Podcasts with KVS credentials set, private feeds are subscribed directly via KVS and can coexist alongside an existing public subscription with separate episode history. When migrating *to* Overcast, private feeds are collected in a skipped-feeds OPML for manual import via Add Feed → URL — Overcast has no programmatic subscribe path for non-iTunes feeds. Without KVS credentials, private-feed subscriptions and Apple Podcasts episode writes are skipped.
 
 **`--apple-all-play-state`** — by default, `KVSReader` only fetches RSS for currently-subscribed feeds; play state from feeds you've since unsubscribed is omitted. Pass `--apple-all-play-state` to also fetch RSS for unsubscribed feeds and include their episodes in the migration. Useful when consolidating play history after a podcast moved to a new feed URL and you re-subscribed under the new one.
 

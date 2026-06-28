@@ -106,9 +106,28 @@ Activated automatically when `APPLE_KVS_DSID` + `APPLE_KVS_COOKIES` are set. KVS
 
 **iTunes canonical URL resolution**: for every catalog subscription (`StoreCollectionID > 0`), `KVSReader` performs a batched lookup against the iTunes Store API to resolve the canonical public feed URL plus `author` and `artworkUrl600`. The iTunes ID is stored in `model.Podcast.ITunesID` and used by the Overcast writer to subscribe directly via `/itunes{ID}` without a `search_autocomplete` round-trip. Feed URLs from the iTunes API are treated as canonical and are never replaced by following HTTP redirects or RSS `<itunes:new-feed-url>` tags.
 
-**Subscriber URL preservation and `IsPrivate` flag**: when the KVS feed URL differs from the iTunes canonical URL (e.g. `slateprivate.supportingcast.fm/content/eyJ…` vs. `feeds.slate.com/…`), the podcast is a subscriber or private edition. In this case the KVS subscriber URL is exported as `pod.FeedURL` — not replaced by the canonical URL — and `pod.IsPrivate` is set to `true`. Feeds with no `StoreCollectionID` (self-hosted, unindexed) are also marked `IsPrivate`. Only public/catalog feeds (KVS URL matches iTunes canonical) get the canonical URL substitution.
+**Subscriber URL classification and `IsPrivate` flag**: when the KVS feed URL differs from the iTunes canonical URL (e.g. a subscriber edition like `feeds.simplecast.com/54nAGcIl` vs. the iTunes canonical `feeds.simplecast.com/Sl5CSM3S`), `KVSReader` fetches both RSS feeds and classifies the relationship before deciding which URL to export. The default mode is `subscriber` (controlled by `--private-feed`):
+
+| Class | Condition | URL used (`subscriber` mode) |
+|---|---|---|
+| `private-auth` | KVS RSS inaccessible or empty (auth-gated or no content) | iTunes canonical |
+| `public-equivalent` | KVS RSS accessible; same episodes **and** same depth as iTunes | iTunes canonical |
+| `public-archive` | KVS RSS accessible; same episodes in iTunes window but older archive beyond it | KVS URL |
+| `public-subscriber` | KVS RSS accessible; has episodes absent from iTunes in the same date window | KVS URL (+ log notice) |
+
+`public-subscriber` detection compares episode titles within the iTunes date window (oldest iTunes pub date as the floor). `public-archive` detection checks whether the KVS feed contains any episodes older than that floor.
+
+**`--private-feed` modes:**
+- `subscriber` (default) — automatic detection as above
+- `public` — always use the iTunes canonical URL for all mismatched feeds
+- `kvs` — always use the KVS URL as-is for all mismatched feeds
+- `custom` — prompt interactively for each mismatched feed; shows the detection result and offers canonical / KVS / custom URL per feed (requires a TTY)
+
+Feeds with no `StoreCollectionID` (self-hosted, unindexed) are marked `IsPrivate=true` and bypass classification — their KVS URL is the only known URL. Only feeds with a catalog entry and a KVS URL that differs from the iTunes canonical go through the detection path.
 
 Destination providers use `IsPrivate` to route feeds correctly without manual configuration: the Apple KVS writer accepts the private feed URL directly and can subscribe it alongside an existing public subscription; the Overcast writer collects private feeds into a skipped-feeds OPML for manual import via Add Feed → URL (Overcast has no programmatic subscribe path for non-iTunes feeds).
+
+**RSS fetch for classification**: both the KVS URL and the iTunes canonical URL are fetched (concurrently with the rest of the RSS fetch pool, subject to the same 5-worker limit and retry policy) when `--private-feed subscriber` or `custom` is active. The full RSS body is read without a size cap, so large archive feeds (thousands of episodes) are handled correctly. RSS fetches are skipped entirely for `--private-feed public` or `kvs`, and for `--only-subscriptions` / `--overcast-out` runs where episode metadata is not needed.
 
 **`internal://` feeds**: Apple-exclusive shows with no public RSS are excluded from output and counted in `lib.SkippedInternalPodcasts`.
 

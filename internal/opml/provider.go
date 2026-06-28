@@ -90,7 +90,7 @@ func (p *Provider) SetLibrary(_ context.Context, lib *model.Library, opts provid
 	if writeEpisodes {
 		episodeCount := 0
 		for _, ep := range lib.Episodes {
-			if !ep.FromDestination && ep.PlayState != model.PlayStateUnplayed {
+			if !ep.FromDestination && ep.PlayState != model.PlayStateUnplayed && ep.Title != "" {
 				episodeCount++
 			}
 		}

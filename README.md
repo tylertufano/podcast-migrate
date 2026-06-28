@@ -105,6 +105,8 @@ See [Usage](https://tylertufano.github.io/podcast-migrate/usage) for step-by-ste
 
 **Apple subscriber and internal feeds** — `internal://` feeds (Apple-exclusive shows with no public RSS) are excluded from all exports. Subscriber and private feeds (NPR+, Slate+ via supportingcast.fm, etc.) are included and routed correctly at each destination.
 
+Apple KVS stores the full episode play-state history, including episodes recorded against subscriber JWT feed URLs that are no longer active (e.g. an NPR Plus token from 2022 still in the KVS history when the current token is from 2024). When migrating to Pocket Casts, these historical episode URLs are not subscribed as separate podcasts. Instead, Phase B fetches the RSS `<channel><title>` for the historical URL and uses it — optionally refined via an iTunes catalog lookup — to match episodes to the currently-subscribed version of the same podcast. If the feed is inaccessible or title matching fails, the historical episodes are skipped rather than creating duplicate subscriptions.
+
 When reading via `KVSReader`, some subscriptions carry a KVS feed URL that differs from the iTunes canonical URL (e.g. a subscriber edition like `feeds.simplecast.com/54nAGcIl` vs. the iTunes canonical `feeds.simplecast.com/Sl5CSM3S`). For these, `KVSReader` fetches both RSS feeds and classifies the relationship before deciding which URL to export:
 
 | Class | Condition | Default URL (`subscriber` mode) |
@@ -177,7 +179,7 @@ All tests run offline — no live API credentials required. Provider-to-API inte
 | `internal/opml` | ~95% | |
 | `internal/migrate` | ~89% | |
 | `internal/itunes` | ~86% | |
-| `internal/pocketcasts` | ~65% | Web API write path partially live-only |
+| `internal/pocketcasts` | ~67% | Web API write path partially live-only |
 | `internal/overcast` | ~53% | Web API write path partially live-only |
 | `internal/apple` | ~30% | `kvs.go` write path and `WebAPIWriter.Write` require live credentials; offline-testable functions (`private_feed.go`, `rss.go`, `sqlite.go`, `webapi.go` HTTP layer) are individually at 85–100% |
 | `cmd` | ~30% | `migrate.go` utilities and observe/export/import commands covered; `markplayed.go` and `observe` loop untested |

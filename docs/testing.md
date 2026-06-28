@@ -196,7 +196,7 @@ The Overcast package has the most test files, covering every sub-component:
 |---|---|
 | `index_test.go` (2 cases) | `findInIndex`: cross-podcast `titledate` fallback, `feeddate` key priority over `titledate` |
 | `private_feed_test.go` (5 cases) | `IsPrivate=true` feed: skips iTunes ID fast path and uses feed URL via `add_feed_url`; successful resolution → subscribe; failed resolution → skipped-feeds OPML; mixed success (one resolved, one not); public feed failure → warning only, no OPML |
-| `provider_test.go` (~22 cases) | GetLibrary (podcasts + in-progress + history, dedup, deleted-episode handling), SetLibrary Phase A/A_sync/B (dry-run, played write, skip-from-destination, subscriptions, filter, already-subscribed, URL-mismatch Phase B, sync overlay, sync overlay fallback), `Capabilities`, `Name` |
+| `provider_test.go` (~24 cases) | GetLibrary (podcasts + in-progress + history, dedup, deleted-episode handling), SetLibrary Phase A/A_sync/B (dry-run, played write, skip-from-destination, subscriptions, filter, already-subscribed, URL-mismatch Phase B, sync overlay, sync overlay fallback), `Capabilities`, `Name`; Phase B historical episode URL regression: no-duplicate-subscribe guard, RSS title resolution → title match |
 | `web_test.go` (~28 cases) | Login, `FetchSubscribedPodcasts`, `FetchInProgressEpisodes`, `FetchPlayedEpisodes`, `FetchPodcastEpisodes` (pagination), `UpdateEpisodeProgress` (played/in-progress, rate limit, transient error, bad request), `ResolveFeedToPodcastUUID` (immediate OK, poll-then-OK, error), `SubscribePodcast`, `FetchSyncUpdate` (including delta sync lastModified and server error) |
 
 ---

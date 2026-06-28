@@ -881,6 +881,87 @@ func TestProvider_SetLibrary_PhaseB_NoDuplicateSubscribeForHistoricalEpisodeURL(
 	}
 }
 
+// TestProvider_SetLibrary_PhaseB_HistoricalURL_ResolvesViaTitleMatch verifies that
+// Phase B can match episodes from a historical (unsubscribed) feed URL to the correct
+// currently-subscribed podcast by fetching the RSS <channel><title> and using it for
+// Strategy 2 title-based matching.
+func TestProvider_SetLibrary_PhaseB_HistoricalURL_ResolvesViaTitleMatch(t *testing.T) {
+	// RSS server: serves a minimal RSS feed for the old/historical URL.
+	// The channel title ("My Show") matches the currently-subscribed PC podcast.
+	rssServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>My Show</title>
+    <link>https://example.com/myshow</link>
+    <description>Testing</description>
+  </channel>
+</rss>`))
+	}))
+	defer rssServer.Close()
+
+	oldFeedURL := rssServer.URL + "/old-feed.rss"
+
+	var updateCalls []map[string]any
+	restore := newFullTestServer(t, testServerConfig{
+		subscribedPodcasts: []map[string]any{
+			{"uuid": "pod-current", "title": "My Show", "author": "AuthorX",
+				"url": "https://feeds.example.com/myshow-current"},
+		},
+		podcastEpisodes: map[string][]map[string]any{
+			"pod-current": {
+				{
+					"uuid":      "ep-old-match",
+					"title":     "Old Episode",
+					"url":       "https://cdn.example.com/old.mp3",
+					"duration":  1800,
+					"published": "2022-08-01T10:00:00Z",
+				},
+			},
+		},
+		// The refresh API resolves the old URL to pod-old (not subscribed).
+		// Strategy 1 cannot subscribe it (not in sourceSubscribedNormFeeds).
+		// Strategy 2 should use the RSS title "My Show" to match pod-current.
+		feedURLToUUID: map[string]string{oldFeedURL: "pod-old"},
+		updateCalls:   &updateCalls,
+	})
+	defer restore()
+
+	lib := &model.Library{
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.example.com/myshow-current", Title: "My Show"},
+		},
+		Episodes: []model.EpisodeState{
+			{
+				FeedURL:   oldFeedURL,
+				Title:     "Old Episode",
+				PubDate:   time.Date(2022, 8, 1, 10, 0, 0, 0, time.UTC),
+				Duration:  1800 * time.Second,
+				PlayState: model.PlayStatePlayed,
+			},
+		},
+	}
+
+	p := pocketcasts.NewProvider("user@example.com", "pass")
+	opts := provider.WriteOptions{RequestDelay: time.Millisecond}
+	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
+		t.Fatalf("SetLibrary: %v", err)
+	}
+
+	// "Old Episode" should have been matched to pod-current via the RSS title.
+	found := false
+	for _, call := range updateCalls {
+		if call["uuid"] == "ep-old-match" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected update for ep-old-match (historical episode matched via RSS title), got: %v", updateCalls)
+	}
+}
+
 func TestProvider_SetLibrary_PodcastFilter_LimitsSubscriptions(t *testing.T) {
 	// Source has two unsubscribed podcasts (gamma, delta). --podcast "gamma"
 	// should subscribe only to gamma, not delta.

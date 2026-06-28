@@ -2,14 +2,17 @@ package pocketcasts
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tyler/podcast-migrate/internal/httputil"
+	"github.com/tyler/podcast-migrate/internal/itunes"
 	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
 	"github.com/tyler/podcast-migrate/internal/opml"
@@ -852,6 +855,13 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 		// calls in this run.
 		authEpAvailable := true
 
+		// plainClient is used for external RSS and iTunes requests in Phase B.
+		// It must not carry PC auth headers, so we create a separate client.
+		plainClient := &http.Client{Timeout: 15 * time.Second}
+		// historicalFeedTitles caches resolved podcast titles for historical
+		// episode URLs (feed URLs only in lib.Episodes, not lib.Podcasts).
+		historicalFeedTitles := make(map[string]string)
+
 		fetched := 0 // episodes processed (auth + CDN passes combined)
 		skipped := 0
 		for normFeed, originalFeedURL := range unmatchedFeeds {
@@ -937,8 +947,20 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 				//  a) NormalizePlusTitle exact match — fast path for subscriber feeds.
 				//  b) fuzzyPCTitle exact match, then contains-match — handles subtitle
 				//     differences (e.g. Apple "Crooked City" ↔ PC "Crooked City: Dixon, IL").
+				//
+				// For historical episode URLs (not in lib.Podcasts), feedToTitle has
+				// no entry. In that case we resolve the podcast title by fetching the
+				// RSS <channel><title>, then optionally refining it via iTunes so that
+				// NormalizePlusTitle can strip "+"/Premium suffixes and Strategy 2 can
+				// still match episodes to the currently-subscribed version of the feed.
 				if podUUID == "" {
 					srcTitle := feedToTitle[originalFeedURL]
+					if srcTitle == "" {
+						srcTitle = resolveHistoricalFeedTitle(ctx, originalFeedURL, plainClient, historicalFeedTitles)
+						if srcTitle != "" {
+							fmt.Printf("  resolved title %q for historical feed %q via RSS/iTunes\n", srcTitle, podTitle)
+						}
+					}
 					if srcTitle != "" {
 						// Pass (a): NormalizePlusTitle exact match.
 						if normTitle := model.NormalizePlusTitle(srcTitle); normTitle != "" {
@@ -1423,4 +1445,49 @@ func filterEpisodesByPodcast(episodes []model.EpisodeState, feedToTitle map[stri
 // normalizeFeedURL returns a canonical form of a podcast feed URL for matching.
 // See migrate.NormalizeFeedURL for full documentation.
 func normalizeFeedURL(raw string) string { return migrate.NormalizeFeedURL(raw) }
+
+// resolveHistoricalFeedTitle returns the podcast title for a feed URL that does
+// not appear in the source subscription list (i.e., it only shows up in episode
+// history, e.g. an old subscriber JWT URL). It fetches the RSS <channel><title>
+// and, if that succeeds, optionally refines the title via an iTunes catalog search
+// to get the canonical name (useful for NormalizePlusTitle subscriber-stripping).
+// Results are cached in the provided map to avoid re-fetching the same URL.
+func resolveHistoricalFeedTitle(ctx context.Context, feedURL string, client *http.Client, cache map[string]string) string {
+	if title, ok := cache[feedURL]; ok {
+		return title
+	}
+	rssTitle := fetchRSSChannelTitle(ctx, client, feedURL)
+	best := rssTitle
+	if rssTitle != "" {
+		if res, err := itunes.FindByHints(ctx, client, rssTitle, feedURL, ""); err == nil && res.Title != "" {
+			best = res.Title
+		}
+	}
+	cache[feedURL] = best
+	return best
+}
+
+// fetchRSSChannelTitle fetches the RSS feed at feedURL and returns the value of
+// <channel><title>. Returns "" on any error (network, non-200, XML parse).
+func fetchRSSChannelTitle(ctx context.Context, client *http.Client, feedURL string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var feed struct {
+		Title string `xml:"channel>title"`
+	}
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&feed); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(feed.Title)
+}
 

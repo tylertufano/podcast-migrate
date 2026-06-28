@@ -158,7 +158,7 @@ The `Provider` interface makes adding new services straightforward:
 
 ### Infrastructure
 
-**WebAPIWriter testability** — `WebAPIWriter` has no unit tests because `CatalogClient.FindEpisode` requires live Apple tokens. Extracting a `catalogFinder` interface would allow testing retry logic, skip-reason checks, dry-run, and `ForceUpdate` with an `httptest.Server` stub.
+**WebAPIWriter `Write` testability** — `getServerPosition` and `markPosition` are now tested offline. The `Write` method is not yet tested because it creates a `CatalogClient` internally, which requires live Apple tokens. Extracting a `catalogFinder` interface would allow testing skip-reason checks, dry-run, and `ForceUpdate` with an `httptest.Server` stub.
 
 **Packaged release** — signed macOS binary via GitHub Actions, distributed through Homebrew.
 
@@ -179,7 +179,8 @@ All tests run offline — no live API credentials required. Provider-to-API inte
 | `internal/itunes` | ~86% | |
 | `internal/pocketcasts` | ~65% | Web API write path partially live-only |
 | `internal/overcast` | ~53% | Web API write path partially live-only |
-| `internal/apple` | ~27% | `kvs.go` write path requires live credentials; offline-testable functions (`private_feed.go`, `rss.go`, `sqlite.go`) are individually at 85–100% |
+| `internal/apple` | ~30% | `kvs.go` write path and `WebAPIWriter.Write` require live credentials; offline-testable functions (`private_feed.go`, `rss.go`, `sqlite.go`, `webapi.go` HTTP layer) are individually at 85–100% |
+| `cmd` | ~30% | `migrate.go` utilities and observe/export/import commands covered; `markplayed.go` and `observe` loop untested |
 
 See [Testing](https://tylertufano.github.io/podcast-migrate/testing) for a per-file breakdown and prioritised gap list.
 

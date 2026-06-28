@@ -6,6 +6,7 @@ package apple
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -283,6 +284,95 @@ func TestSearchITunes_PlusTitleFallback_PlusSymbol(t *testing.T) {
 	}
 	if id != 290783428 {
 		t.Errorf("collectionId: got %d, want 290783428", id)
+	}
+}
+
+// TestPaginateEpisodes_FindsEpisodeOnSecondPage verifies that paginateEpisodes
+// loops past the first page when total > pageSize and the target episode is on
+// page 2. The test server returns 100 dummy episodes (total=200) for offset=0
+// and one real episode for offset=100, so the loop must make two requests.
+func TestPaginateEpisodes_FindsEpisodeOnSecondPage(t *testing.T) {
+	targetDate := time.Date(2024, 3, 15, 10, 0, 0, 0, time.UTC)
+	const collectionID = int64(111222333)
+
+	calls := 0
+	mux := http.NewServeMux()
+
+	// iTunes Search — returns a matching collection ID.
+	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(itunesSearchResponse([]map[string]any{
+			{
+				"collectionId":   collectionID,
+				"feedUrl":        "https://feeds.example.com/paginated",
+				"collectionName": "Paginated Show",
+			},
+		}))
+	})
+
+	mux.HandleFunc("/v1/catalog/us/podcasts/111222333/episodes", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		offset := 0
+		if o := r.URL.Query().Get("offset"); o != "" {
+			fmt.Sscan(o, &offset) //nolint:errcheck
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		if offset == 0 {
+			// Page 1: 100 dummy episodes; total = 200 (signals a second page).
+			eps := make([]map[string]any, 100)
+			for i := range eps {
+				eps[i] = map[string]any{
+					"id":   fmt.Sprintf("%d", 9000000+i),
+					"type": "podcast-episodes",
+					"attributes": map[string]any{
+						"name":            fmt.Sprintf("Old Episode %d", i),
+						"releaseDateTime": time.Date(2020, 1, i+1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339),
+					},
+				}
+			}
+			w.Write(episodePageResponse(eps, 200))
+		} else {
+			// Page 2: the target episode plus one filler.
+			w.Write(episodePageResponse([]map[string]any{
+				{
+					"id":   "9999999",
+					"type": "podcast-episodes",
+					"attributes": map[string]any{
+						"name":            "Target Episode",
+						"releaseDateTime": targetDate.Format(time.RFC3339),
+					},
+				},
+			}, 200))
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewCatalogClient("token")
+	c.httpClient = &http.Client{Transport: rewriteHostTransport(srv.URL)}
+
+	ep := model.EpisodeState{
+		FeedURL:   "https://feeds.example.com/paginated",
+		Title:     "Target Episode",
+		PubDate:   targetDate,
+		PlayState: model.PlayStatePlayed,
+	}
+	feedToTitle := map[string]string{ep.FeedURL: "paginated show"}
+
+	appleID, result, err := c.FindEpisode(context.Background(), ep, feedToTitle, 72*time.Hour, false)
+	if err != nil {
+		t.Fatalf("FindEpisode error: %v", err)
+	}
+	if result != CatalogFound {
+		t.Fatalf("result = %v, want CatalogFound", result)
+	}
+	if appleID != 9999999 {
+		t.Errorf("appleID = %d, want 9999999", appleID)
+	}
+	if calls < 2 {
+		t.Errorf("expected at least 2 episode-page requests (pagination), got %d", calls)
 	}
 }
 

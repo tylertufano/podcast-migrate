@@ -82,6 +82,45 @@ All tests use `httptest.NewServer` to serve fake iTunes Search API and amp-api r
 
 ---
 
+### `internal/apple/private_feed.go` — subscriber feed URL resolution
+
+**File:** `private_feed_test.go` (32 test functions)
+
+New tests added for the four-class classification and URL resolution pipeline:
+
+| Area | Tests |
+|---|---|
+| `normalizeEpTitle` — lowercase, HTML entity unescape, trim | `TestNormalizeEpTitle_*` (4 cases) |
+| `classifyMismatchedFeed` — all 4 class outcomes | `TestClassifyMismatchedFeed_EmptyKVS_ReturnsPrivateAuth`, `_IdenticalContent_ReturnsPublicEquivalent`, `_KVSHasExclusiveEpisode_ReturnsPublicSubscriber`, `_KVSHasOlderEpisodes_ReturnsPublicArchive` |
+| `classifyMismatchedFeed` — exclusive count, items-before-floor guard | `TestClassifyMismatchedFeed_MultipleExclusiveEpisodes_CountsCorrectly`, `_KVSItemBeforeFloor_NotCountedAsExclusive` |
+| `classifyMismatchedFeed` — iTunes undated items, HTML entity title matching | `TestClassifyMismatchedFeed_iTunesNoDatableItems_ReturnsPublicArchive`, `_TitleNormalizationMatchesHTMLEntities` |
+| `privateFeedClass.String` — all 4 string labels | `TestPrivateFeedClass_String` |
+| `resolveURL` — `public` mode always uses canonical | `TestResolveURL_PublicMode_AlwaysReturnsCanonical` |
+| `resolveURL` — `kvs` mode always uses KVS URL | `TestResolveURL_KVSMode_AlwaysReturnsKVSURL` |
+| `resolveURL` — `subscriber` mode × 4 class types | `TestResolveURL_SubscriberMode_PrivateAuth_ReturnsCanonical`, `_PublicEquivalent_ReturnsCanonical`, `_PublicSubscriber_ReturnsKVSURL`, `_PublicArchive_ReturnsKVSURL` |
+| `resolveURL` — unknown mode falls through to canonical | `TestResolveURL_UnknownMode_ReturnsCanonical` |
+| `ParsePrivateFeedMode` — all valid values, case-insensitive, trimmed | `TestParsePrivateFeedMode_ValidValues` |
+| `ParsePrivateFeedMode` — invalid values, error message content | `TestParsePrivateFeedMode_InvalidValue_ReturnsError`, `_ErrorMessageContainsValidOptions` |
+
+All functions in `private_feed.go` except `promptPrivateFeedChoice` (requires a TTY) are now at 100% statement coverage.
+
+---
+
+### `internal/apple/rss.go` — RSS date and duration parsing
+
+**File:** `rss_test.go` (19 test functions)
+
+New tests for the two pure parsing functions:
+
+| Area | Tests |
+|---|---|
+| `parsePubDate` — RFC1123Z, RFC1123 UTC, single-digit day, ISO 8601 Z and offset | `TestParsePubDate_RFC1123Z`, `_RFC1123Z_WithOffset`, `_RFC1123_UTCNamedZone`, `_SingleDigitDay`, `_SingleDigitDay_WithOffset`, `_ISO8601_UTC`, `_ISO8601_WithOffset` |
+| `parsePubDate` — result is always UTC, empty/invalid → zero | `TestParsePubDate_ResultIsUTC`, `_Empty_ReturnsZero`, `_Invalid_ReturnsZero`, `_WhitespaceOnly_ReturnsZero` |
+| `parseItunesDuration` — HH:MM:SS, MM:SS, plain seconds (including unit check) | `TestParseItunesDuration_HHMMSS`, `_HHMMSS_Zero`, `_MMSS`, `_SecondsOnly`, `_SecondsUnit_IsSeconds` |
+| `parseItunesDuration` — empty, whitespace, non-numeric string, non-numeric HH:MM:SS | `TestParseItunesDuration_Empty_ReturnsZero`, `_WhitespaceOnly_ReturnsZero`, `_InvalidString_ReturnsZero`, `_InvalidHHMMSS_ReturnsZero` |
+
+---
+
 ### `internal/apple/opml.go` — Apple Podcasts OPML reader
 
 **File:** `opml_test.go` (8 test functions): flat and nested outlines, empty body, missing file, invalid XML, no play state returned.
@@ -134,6 +173,7 @@ The Overcast package has the most test files, covering every sub-component:
 | File | What's covered |
 |---|---|
 | `index_test.go` (2 cases) | `findInIndex`: cross-podcast `titledate` fallback, `feeddate` key priority over `titledate` |
+| `private_feed_test.go` (5 cases) | `IsPrivate=true` feed: skips iTunes ID fast path and uses feed URL via `add_feed_url`; successful resolution → subscribe; failed resolution → skipped-feeds OPML; mixed success (one resolved, one not); public feed failure → warning only, no OPML |
 | `provider_test.go` (~22 cases) | GetLibrary (podcasts + in-progress + history, dedup, deleted-episode handling), SetLibrary Phase A/A_sync/B (dry-run, played write, skip-from-destination, subscriptions, filter, already-subscribed, URL-mismatch Phase B, sync overlay, sync overlay fallback), `Capabilities`, `Name` |
 | `web_test.go` (~28 cases) | Login, `FetchSubscribedPodcasts`, `FetchInProgressEpisodes`, `FetchPlayedEpisodes`, `FetchPodcastEpisodes` (pagination), `UpdateEpisodeProgress` (played/in-progress, rate limit, transient error, bad request), `ResolveFeedToPodcastUUID` (immediate OK, poll-then-OK, error), `SubscribePodcast`, `FetchSyncUpdate` (including delta sync lastModified and server error) |
 
@@ -163,7 +203,13 @@ All utility functions extracted from `migrate.go` are tested:
 
 ## Coverage gaps
 
-The following areas lack test coverage. These are catalogued here for future test development.
+The following areas lack offline test coverage. These are catalogued here for future test development.
+
+### `internal/apple/private_feed.go` — `promptPrivateFeedChoice` *(untestable without TTY mock)*
+
+`promptPrivateFeedChoice` reads from `os.Stdin` and therefore cannot be tested in a standard `go test` run. It is exercised only when `--private-feed=custom` is used interactively. The remaining functions in `private_feed.go` are at 100% statement coverage.
+
+---
 
 ### `internal/apple/webapi.go` — WebAPIWriter *(high value, no tests)*
 

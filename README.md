@@ -168,7 +168,20 @@ The `Provider` interface makes adding new services straightforward:
 go test ./...
 ```
 
-All tests run offline — no live API credentials required. Coverage: `apple` ~90%, `overcast` 95%, `pocketcasts` ~95%, `sync` 99%, `model` 100%. See [Testing](https://tylertufano.github.io/podcast-migrate/testing) for a per-package breakdown and prioritised gap list.
+All tests run offline — no live API credentials required. Provider-to-API interactions use `httptest.NewServer` fake servers.
+
+| Package | Coverage | Notes |
+|---|---|---|
+| `internal/model` | 100% | |
+| `internal/sync` | ~93% | |
+| `internal/opml` | ~95% | |
+| `internal/migrate` | ~89% | |
+| `internal/itunes` | ~86% | |
+| `internal/pocketcasts` | ~65% | Web API write path partially live-only |
+| `internal/overcast` | ~53% | Web API write path partially live-only |
+| `internal/apple` | ~27% | `kvs.go` write path requires live credentials; offline-testable functions (`private_feed.go`, `rss.go`, `sqlite.go`) are individually at 85–100% |
+
+See [Testing](https://tylertufano.github.io/podcast-migrate/testing) for a per-file breakdown and prioritised gap list.
 
 ## Project structure
 

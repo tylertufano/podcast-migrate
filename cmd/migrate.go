@@ -53,6 +53,7 @@ func migrateCmd() *cobra.Command {
 		pocketcastsEmail        string   // --pocketcasts-email / POCKETCASTS_EMAIL
 		pocketcastsPassword     string   // --pocketcasts-password / POCKETCASTS_PASSWORD
 		pcIncludeUnsubscribed   bool     // --pc-include-unsubscribed
+		pcSkippedOPML           string   // --pc-skipped-opml
 		appleAllPlayState       bool     // --apple-all-play-state
 		applePrivateFeed        string   // --private-feed
 		feedMapPairs            []string // --feed-map (repeatable, "SRC_URL=DST_URL")
@@ -247,6 +248,13 @@ func migrateCmd() *cobra.Command {
 				}
 			}
 
+			// Wire destination-specific options into the Pocket Casts destination provider.
+			if pcProv, ok := dst.(*pocketcasts.Provider); ok {
+				if pcSkippedOPML != "" {
+					pcProv.SetSkippedOPMLPath(pcSkippedOPML)
+				}
+			}
+
 			// Configure write credentials for Apple Podcasts destination.
 			// Web API (bearer + media-user-token) is preferred: catalog episodes
 			// resolve immediately without needing local indexing. If those tokens
@@ -372,6 +380,11 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&pcIncludeUnsubscribed, "pc-include-unsubscribed", false,
 		"when --from pocketcasts: also export play history for podcasts no longer subscribed to;\n"+
 			"the feed URL is recovered via the Pocket Casts CDN or iTunes Search API")
+	cmd.Flags().StringVar(&pcSkippedOPML, "pc-skipped-opml", "",
+		"when --to pocketcasts: write an OPML file of podcasts that could not be auto-subscribed\n"+
+			"(private/subscriber feeds whose URL Pocket Casts could not index via add_feed_url).\n"+
+			"Defaults to skipped-private-feeds.opml in the current directory when omitted.\n"+
+			"(e.g. --pc-skipped-opml ~/Desktop/skipped.opml)")
 	cmd.Flags().BoolVar(&appleAllPlayState, "apple-all-play-state", false,
 		"when --from podcasts (KVS): include play state for all feeds with history, not just\n"+
 			"current subscriptions; useful when consolidating play data across feed URL changes")

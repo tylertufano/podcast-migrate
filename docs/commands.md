@@ -100,6 +100,7 @@ These flags apply when `--from podcasts` (KVS read path).
 | `--clear-source-opml-cache` | false | Discard the cached Overcast source OPML and force a fresh download. Effective whenever Overcast is the source or destination and no explicit `--overcast-source-opml` path is given. |
 | `--overcast-save-source-opml [path]` | — | Save a copy of the auto-fetched Overcast source OPML to this path. If given without a value, saves to `~/Downloads/overcast.opml`. |
 | `--overcast-skipped-opml [path]` | — | When `--to overcast`: write an OPML file of podcasts that could not be auto-subscribed (private/custom feeds with no iTunes ID). If given without a value, writes to `skipped-private-feeds.opml` in the current directory. Import via **Overcast → Settings → Import OPML**. |
+| `--pc-skipped-opml [path]` | — | When `--to pocketcasts`: write an OPML file of podcasts that could not be auto-subscribed (private/subscriber feeds whose URL the Pocket Casts `add_feed_url` API could not index). If given without a value, writes to `skipped-private-feeds.opml` in the current directory. Add each feed manually via **Add Podcast → Add via podcast URL**. |
 | `--feed-map SRC=DST` | — | Remap a source feed URL to a destination feed URL (repeatable) |
 | `--log-file /path` | — | Write per-episode CSV log (columns: status, podcast, episode, pub_date, source_state, target_state, note) |
 | `--pc-include-unsubscribed` | false | When `--from pocketcasts`: include play history for unsubscribed podcasts |

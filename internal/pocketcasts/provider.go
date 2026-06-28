@@ -12,6 +12,7 @@ import (
 	"github.com/tyler/podcast-migrate/internal/httputil"
 	"github.com/tyler/podcast-migrate/internal/migrate"
 	"github.com/tyler/podcast-migrate/internal/model"
+	"github.com/tyler/podcast-migrate/internal/opml"
 	"github.com/tyler/podcast-migrate/internal/provider"
 )
 
@@ -44,11 +45,52 @@ type Provider struct {
 	// default — unsubscribed podcasts are intentionally excluded because the
 	// user may have left them, and including them could clutter a migration.
 	IncludeUnsubscribed bool
+
+	// skippedOPMLPath is where the skipped-private-feeds OPML is written after
+	// a subscription run. Feeds with IsPrivate=true that could not be resolved
+	// via add_feed_url (e.g. auth-required subscriber URLs) are collected here.
+	// Defaults to "skipped-private-feeds.opml" in the working directory when empty.
+	skippedOPMLPath string
 }
 
 // NewProvider returns a Pocket Casts provider with the given credentials.
 func NewProvider(email, password string) *Provider {
 	return &Provider{email: email, password: password}
+}
+
+// SetSkippedOPMLPath configures the path where an OPML of skipped private feeds
+// is written after a subscription run.
+func (p *Provider) SetSkippedOPMLPath(path string) { p.skippedOPMLPath = path }
+
+// writeSkippedOPML writes an OPML file containing feeds that could not be
+// subscribed automatically (private/subscriber feeds whose URL could not be
+// resolved via the Pocket Casts add_feed_url API).
+func (p *Provider) writeSkippedOPML(pods []model.Podcast, dryRun bool) {
+	outPath := p.skippedOPMLPath
+	if outPath == "" {
+		outPath = "skipped-private-feeds.opml"
+	}
+	prefix := ""
+	if dryRun {
+		prefix = "[dry-run] "
+	}
+	fmt.Printf("\npocketcasts: %d podcast(s) could not be subscribed automatically:\n", len(pods))
+	for _, pod := range pods {
+		fmt.Printf("  • %s (%s)\n", pod.Title, pod.FeedURL)
+	}
+	if dryRun {
+		fmt.Printf("%sWould write skipped-feeds OPML to %s\n", prefix, outPath)
+		fmt.Printf("  To subscribe: Pocket Casts → Add Podcast → Add via podcast URL\n")
+		return
+	}
+	lib := &model.Library{Podcasts: pods}
+	w := &opml.Writer{}
+	if err := w.Write(lib, outPath); err != nil {
+		fmt.Printf("pocketcasts: warning: could not write skipped-feeds OPML: %v\n", err)
+		return
+	}
+	fmt.Printf("pocketcasts: skipped-feeds OPML written to %s\n", outPath)
+	fmt.Printf("  To subscribe: Pocket Casts → Add Podcast → Add via podcast URL\n")
 }
 
 func (p *Provider) Name() string { return "Pocket Casts" }
@@ -479,13 +521,18 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 			if title == "" {
 				title = pod.FeedURL
 			}
-			fmt.Printf("  [dry-run] would subscribe: %q\n", title)
+			if pod.IsPrivate {
+				fmt.Printf("  [dry-run] would attempt private feed: %q (%s)\n", title, pod.FeedURL)
+			} else {
+				fmt.Printf("  [dry-run] would subscribe: %q\n", title)
+			}
 		}
 		return len(toSubscribe), nil
 	}
 
 	subscribed := 0
 	failed := 0
+	var skippedPods []model.Podcast
 	for _, pod := range toSubscribe {
 		title := pod.Title
 		if title == "" {
@@ -494,9 +541,10 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 
 		// Resolve podcast to a Pocket Casts UUID.
 		// For private/subscriber feeds (IsPrivate=true) always try the feed URL
-		// first — the iTunes ID always resolves to the public canonical, which is
-		// wrong when the KVS subscriber URL is the intended subscription target.
-		// For public catalog feeds, try iTunes ID as a fast path first.
+		// first via add_feed_url — the iTunes ID always resolves to the public
+		// canonical, which is wrong when the KVS subscriber URL is the target.
+		// If add_feed_url also fails, collect in skipped-feeds OPML.
+		// For public catalog feeds, use iTunes ID as a fast path first.
 		var pcUUID string
 		if pod.ITunesID != "" && !pod.IsPrivate {
 			if itunesID, parseErr := strconv.ParseInt(pod.ITunesID, 10, 64); parseErr == nil {
@@ -509,8 +557,13 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 			var err error
 			pcUUID, err = ResolveFeedToPodcastUUID(ctx, pod.FeedURL)
 			if err != nil {
-				fmt.Printf("  warning: could not resolve %q: %v\n", title, err)
-				failed++
+				if pod.IsPrivate {
+					fmt.Printf("  note: %q is a private/subscriber feed — will include in skipped-feeds OPML for manual import\n", title)
+					skippedPods = append(skippedPods, pod)
+				} else {
+					fmt.Printf("  warning: could not resolve %q: %v\n", title, err)
+					failed++
+				}
 				continue
 			}
 		}
@@ -537,8 +590,12 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 		time.Sleep(requestDelay)
 	}
 
+	fmt.Printf("pocketcasts: subscriptions: %d added, %d private/skipped\n", subscribed, len(skippedPods))
 	if failed > 0 {
 		fmt.Printf("pocketcasts: %d subscription(s) failed (see warnings above)\n", failed)
+	}
+	if len(skippedPods) > 0 {
+		p.writeSkippedOPML(skippedPods, false)
 	}
 	return subscribed, nil
 }

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -98,6 +97,11 @@ func migrateCmd() *cobra.Command {
     --overcast-source-opml ~/Downloads/overcast.opml --play-state \
     --podcast "sistersinlaw" --dry-run`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return fmt.Errorf("unexpected argument(s): %v\n"+
+					"Hint: all options require a flag name — did you mean to pass a path to a flag like --overcast-out or --opml-out?", args)
+			}
+
 			// Resolve Overcast credentials from flags → env vars.
 			if overcastEmail == "" {
 				overcastEmail = os.Getenv("OVERCAST_EMAIL")
@@ -323,26 +327,20 @@ func migrateCmd() *cobra.Command {
 		"optional when Overcast credentials are set — the extended OPML is fetched automatically\n"+
 		"and cached for 24 h (see --clear-source-opml-cache)")
 	cmd.Flags().StringVar(&overcastMatchOPML, "overcast-match-opml", "", "path to Overcast OPML used for destination episode matching when writing play state (optional; if omitted and credentials are set, the live account library is fetched automatically)")
-	cmd.Flags().StringVar(&overcastOut, "overcast-out", "", "path for the generated Overcast import OPML file (default when flag is provided without a value: ~/Desktop/podcast-migrate-overcast.opml)")
-	if home, err := os.UserHomeDir(); err == nil {
-		cmd.Flags().Lookup("overcast-out").NoOptDefVal = filepath.Join(home, "Desktop", "podcast-migrate-overcast.opml")
-	} else {
-		cmd.Flags().Lookup("overcast-out").NoOptDefVal = "podcast-migrate-overcast.opml"
-	}
+	cmd.Flags().StringVar(&overcastOut, "overcast-out", "", "path for the generated Overcast import OPML file\n"+
+		"(e.g. --overcast-out ~/Desktop/import.opml)")
 	cmd.Flags().StringVar(&overcastEmail, "overcast-email", "", "Overcast account email (or set OVERCAST_EMAIL env var)")
 	cmd.Flags().StringVar(&overcastPassword, "overcast-password", "", "Overcast account password (or set OVERCAST_PASSWORD env var)")
 	cmd.Flags().BoolVar(&overcastClearSourceCache, "clear-source-opml-cache", false,
 		"discard the cached Overcast source OPML and force a fresh download;\n"+
 			"only effective when --from overcast without --overcast-source-opml")
 	cmd.Flags().StringVar(&overcastSaveSourceOPML, "overcast-save-source-opml", "",
-		"save a copy of the fetched Overcast source OPML to this path;\n"+
-			"if the flag is given without a value, ~/Downloads/overcast.opml is used")
+		"save a copy of the fetched Overcast source OPML to this path\n"+
+			"(e.g. --overcast-save-source-opml ~/Downloads/overcast.opml)")
 	cmd.Flags().StringVar(&overcastSkippedOPML, "overcast-skipped-opml", "",
 		"write an OPML file containing podcasts that could not be subscribed automatically\n"+
-			"(private/custom feeds with no iTunes ID); default path: skipped-private-feeds.opml\n"+
-			"(if the flag is given without a value, skipped-private-feeds.opml is used)")
-	cmd.Flags().Lookup("overcast-skipped-opml").NoOptDefVal = "skipped-private-feeds.opml"
-	cmd.Flags().Lookup("overcast-save-source-opml").NoOptDefVal = filepath.Join(os.Getenv("HOME"), "Downloads", "overcast.opml")
+			"(private/custom feeds with no iTunes ID)\n"+
+			"(e.g. --overcast-skipped-opml ~/Desktop/skipped.opml)")
 	cmd.Flags().StringVar(&conflictStrategy, "conflict", "furthest", "conflict resolution: furthest | source | target")
 	cmd.Flags().DurationVar(&requestDelay, "request-delay", 0, "delay between consecutive API requests to Overcast or Apple (default 1s; increase if you hit 429 rate limits)")
 	cmd.Flags().DurationVar(&titleMatchTolerance, "title-match-tolerance", 72*time.Hour,

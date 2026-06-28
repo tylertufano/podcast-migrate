@@ -493,10 +493,12 @@ func (p *Provider) doWriteSubscriptions(ctx context.Context, lib *model.Library,
 		}
 
 		// Resolve podcast to a Pocket Casts UUID.
-		// Fast path: iTunes ID → UUID via podcasts/show (no polling, synchronous).
-		// Fall back to add_feed_url polling for feeds not in the PC catalog.
+		// For private/subscriber feeds (IsPrivate=true) always try the feed URL
+		// first — the iTunes ID always resolves to the public canonical, which is
+		// wrong when the KVS subscriber URL is the intended subscription target.
+		// For public catalog feeds, try iTunes ID as a fast path first.
 		var pcUUID string
-		if pod.ITunesID != "" {
+		if pod.ITunesID != "" && !pod.IsPrivate {
 			if itunesID, parseErr := strconv.ParseInt(pod.ITunesID, 10, 64); parseErr == nil {
 				if uuid, lookupErr := FindPodcastByITunesID(ctx, itunesID); lookupErr == nil && uuid != "" {
 					pcUUID = uuid

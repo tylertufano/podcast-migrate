@@ -160,12 +160,14 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 	}
 
 	// Step 2.5: identify feeds where the KVS subscription URL differs from the
-	// iTunes canonical. For subscriber/custom modes we need RSS from both URLs
-	// to classify the feed; add KVS URLs to the fetch set now so the comparison
-	// data arrives in the single RSS fetch pass below.
+	// iTunes canonical. Collected unconditionally when detection is active so that
+	// classification runs even on subscriptions-only runs (--only-subscriptions,
+	// --overcast-out), where the correct feed URL still matters for the export.
 	var mismatches []mismatchedFeed
+	var classifyURLSet map[string]bool // RSS URLs needed solely for classification
 	needsDetection := r.privateFeedMode == PrivateFeedSubscriber || r.privateFeedMode == PrivateFeedCustom
-	if needsDetection && !r.skipRSSFetch {
+	if needsDetection {
+		classifyURLSet = make(map[string]bool)
 		seen := make(map[string]bool)
 		for _, sub := range kw.subscriptions {
 			if sub.Subscribed != 1 || sub.FeedURL == "" {
@@ -183,8 +185,8 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 				canonical: canonical,
 				title:     sub.Title,
 			})
-			feedURLSet[clean] = true      // KVS URL: needed for classification
-			feedURLSet[canonical] = true  // iTunes URL: also needed for comparison
+			classifyURLSet[clean] = true      // KVS URL: needed for classification
+			classifyURLSet[canonical] = true  // iTunes URL: also needed for comparison
 		}
 	}
 
@@ -238,15 +240,27 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 	}
 
 	// Fetch RSS feeds concurrently to get episode metadata (title, pubDate, duration).
-	// Skipped for subscriptions-only runs — iTunes lookup already provides Author
-	// and ImageURL, and episode metadata is not needed when play state is not migrated.
+	// For subscriptions-only runs (skipRSSFetch), episode metadata is not needed,
+	// but classification URLs are still fetched when detection is active so that
+	// --private-feed subscriber produces the correct feed URL in the export.
 	var rssFeeds map[string]rssFeed
 	if !r.skipRSSFetch {
+		// Full fetch: merge classification URLs into the main feed URL set.
+		for u := range classifyURLSet {
+			feedURLSet[u] = true
+		}
 		feedURLs := make([]string, 0, len(feedURLSet))
 		for u := range feedURLSet {
 			feedURLs = append(feedURLs, u)
 		}
 		rssFeeds = r.fetchRSSFeeds(ctx, feedURLs)
+	} else if needsDetection && len(mismatches) > 0 {
+		// Subscriptions-only: fetch only the two URLs per mismatched feed.
+		classifyURLs := make([]string, 0, len(classifyURLSet))
+		for u := range classifyURLSet {
+			classifyURLs = append(classifyURLs, u)
+		}
+		rssFeeds = r.fetchRSSFeeds(ctx, classifyURLs)
 	}
 
 	// Step 3.5: classify mismatched feeds using the fetched RSS and build
@@ -256,7 +270,7 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 	for clean, canonical := range cleanToCanonical {
 		resolvedCanonical[clean] = canonical // default: iTunes canonical
 	}
-	if needsDetection && !r.skipRSSFetch {
+	if needsDetection && rssFeeds != nil {
 		if r.privateFeedMode == PrivateFeedCustom {
 			fmt.Printf("\napple: --private-feed=custom — reviewing %d feed(s) where KVS URL differs from iTunes\n", len(mismatches))
 		}

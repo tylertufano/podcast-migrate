@@ -55,6 +55,7 @@ func migrateCmd() *cobra.Command {
 		pocketcastsPassword     string   // --pocketcasts-password / POCKETCASTS_PASSWORD
 		pcIncludeUnsubscribed   bool     // --pc-include-unsubscribed
 		appleAllPlayState       bool     // --apple-all-play-state
+		applePrivateFeed        string   // --private-feed
 		feedMapPairs            []string // --feed-map (repeatable, "SRC_URL=DST_URL")
 		opmlFile            string        // --opml-file (source OPML path when --from opml)
 		opmlOut             string        // --opml-out (output OPML path when --to opml)
@@ -191,6 +192,13 @@ func migrateCmd() *cobra.Command {
 				}
 				if appleAllPlayState {
 					ap.SetAllPlayState(true)
+				}
+				if applePrivateFeed != "" {
+					mode, err := apple.ParsePrivateFeedMode(applePrivateFeed)
+					if err != nil {
+						return err
+					}
+					ap.SetPrivateFeedMode(mode)
 				}
 			}
 
@@ -369,6 +377,14 @@ func migrateCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&appleAllPlayState, "apple-all-play-state", false,
 		"when --from podcasts (KVS): include play state for all feeds with history, not just\n"+
 			"current subscriptions; useful when consolidating play data across feed URL changes")
+	cmd.Flags().StringVar(&applePrivateFeed, "private-feed", "",
+		"when --from podcasts (KVS): strategy for feeds where the Apple subscription URL\n"+
+			"differs from the iTunes canonical URL (e.g. subscriber feeds with bonus episodes).\n"+
+			"  subscriber (default): keep KVS URL when it is auth-required or has content\n"+
+			"                        absent from the iTunes canonical; use iTunes otherwise\n"+
+			"  public:               always use the iTunes canonical URL\n"+
+			"  kvs:                  always use the KVS subscription URL as-is\n"+
+			"  custom:               prompt interactively for each mismatched feed (requires TTY)")
 	cmd.Flags().StringArrayVar(&feedMapPairs, "feed-map", nil,
 		"map a source subscriber feed URL to a destination analog feed URL\n"+
 			"(format: SRC_URL=DST_URL; repeatable). Use when you have already\n"+

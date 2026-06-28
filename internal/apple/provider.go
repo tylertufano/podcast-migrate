@@ -149,6 +149,15 @@ func (p *Provider) SetAllPlayState(all bool) {
 	}
 }
 
+// SetPrivateFeedMode sets the URL resolution strategy for feeds where the KVS
+// subscription URL differs from the iTunes canonical URL.
+// See PrivateFeedMode for the available options.
+func (p *Provider) SetPrivateFeedMode(mode PrivateFeedMode) {
+	if p.kvsOnlyReader != nil {
+		p.kvsOnlyReader.SetPrivateFeedMode(mode)
+	}
+}
+
 func (p *Provider) Name() string { return "Apple Podcasts" }
 
 func (p *Provider) Capabilities() provider.Capabilities {

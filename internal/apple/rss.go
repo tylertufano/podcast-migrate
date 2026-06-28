@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -151,12 +152,16 @@ func fetchRSSFeed(ctx context.Context, client *http.Client, feedURL string) (rss
 			return nil // auth-gated or gone — not retriable, treat as empty
 		}
 
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return httputil.NewTransientError(fmt.Errorf("rss read: %w", err))
 		}
 		if len(body) == 0 {
 			return nil // empty response — treat as empty, not retriable
+		}
+		if len(body) > 16*1024*1024 {
+			fmt.Fprintf(os.Stderr, "apple: rss: large feed (%.0fMB) %s\n",
+				float64(len(body))/(1024*1024), feedURL)
 		}
 
 		var raw rssFeedRaw

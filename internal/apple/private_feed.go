@@ -139,16 +139,19 @@ func resolveURL(mode PrivateFeedMode, m mismatchedFeed, class privateFeedClass, 
 		return m.kvsURL
 	case PrivateFeedSubscriber:
 		switch class {
-		case classPrivateAuth, classPublicSubscriber:
-			if class == classPublicSubscriber {
-				fmt.Printf("apple: %q — KVS URL has %d subscriber episode(s) not in iTunes canonical;\n"+
-					"  retaining KVS URL to preserve access (--private-feed=subscriber)\n"+
-					"  note: this URL is publicly accessible without authentication\n",
-					m.title, exclusiveEps)
-			}
-			return m.kvsURL
-		default:
+		case classPrivateAuth:
+			// KVS URL inaccessible — subscriber content unreachable via it.
 			return m.canonical
+		case classPublicSubscriber:
+			fmt.Printf("apple: %q — KVS URL has %d subscriber episode(s) not in iTunes canonical;\n"+
+				"  retaining KVS URL to preserve access (--private-feed=subscriber)\n"+
+				"  note: this URL is publicly accessible without authentication\n",
+				m.title, exclusiveEps)
+			return m.kvsURL
+		default: // classPublicArchive
+			// KVS URL is publicly accessible with the same episodes as iTunes
+			// but a longer archive — the extended archive is the subscriber benefit.
+			return m.kvsURL
 		}
 	}
 	return m.canonical

@@ -310,7 +310,8 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		if c, ok := resolvedCanonical[clean]; ok {
 			resolved = c
 		}
-		isPrivate := sub.StoreCollectionID == 0
+		canonical := cleanToCanonical[clean] // empty string if no iTunes entry
+		isPrivate := sub.StoreCollectionID == 0 || (canonical != "" && resolved != canonical)
 		var author, imageURL string
 		if result, ok := itunesResults[sub.StoreCollectionID]; ok {
 			author = result.Author

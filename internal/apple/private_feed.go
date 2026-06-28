@@ -54,10 +54,16 @@ const (
 	// The KVS URL surfaces subscriber content via an unauthenticated path.
 	classPublicSubscriber
 
-	// classPublicArchive: KVS URL is publicly accessible; all its episodes
-	// within the iTunes canonical's date window also appear in that feed.
-	// The difference is window depth only — no exclusive subscriber content.
+	// classPublicArchive: KVS URL is publicly accessible; all episodes in the
+	// iTunes canonical window also appear in the KVS feed, AND the KVS feed
+	// has older episodes beyond that window. The extended archive is the
+	// subscriber benefit.
 	classPublicArchive
+
+	// classPublicEquivalent: KVS URL is publicly accessible and functionally
+	// identical to the iTunes canonical — same episodes in the window and no
+	// older episodes in the KVS feed. No subscriber benefit over using canonical.
+	classPublicEquivalent
 )
 
 func (c privateFeedClass) String() string {
@@ -66,8 +72,10 @@ func (c privateFeedClass) String() string {
 		return "private-auth"
 	case classPublicSubscriber:
 		return "public-subscriber"
-	default:
+	case classPublicArchive:
 		return "public-archive"
+	default:
+		return "public-equivalent"
 	}
 }
 
@@ -122,7 +130,15 @@ func classifyMismatchedFeed(kvsRSS rssFeed, itunesRSS rssFeed) (privateFeedClass
 	if exclusive > 0 {
 		return classPublicSubscriber, exclusive
 	}
-	return classPublicArchive, 0
+
+	// No exclusive episodes in the window. Check whether KVS has older episodes
+	// that extend the archive beyond what iTunes carries.
+	for _, item := range kvsRSS.Items {
+		if !item.PubDate.IsZero() && item.PubDate.Before(windowFloor) {
+			return classPublicArchive, 0 // deeper archive — subscriber benefit
+		}
+	}
+	return classPublicEquivalent, 0 // same content and depth — no subscriber benefit
 }
 
 func normalizeEpTitle(s string) string {
@@ -139,8 +155,10 @@ func resolveURL(mode PrivateFeedMode, m mismatchedFeed, class privateFeedClass, 
 		return m.kvsURL
 	case PrivateFeedSubscriber:
 		switch class {
-		case classPrivateAuth:
-			// KVS URL inaccessible — subscriber content unreachable via it.
+		case classPrivateAuth, classPublicEquivalent:
+			// classPrivateAuth: KVS URL inaccessible — subscriber content unreachable.
+			// classPublicEquivalent: KVS and iTunes are identical in content and depth.
+			// In both cases the canonical is the better choice.
 			return m.canonical
 		case classPublicSubscriber:
 			fmt.Printf("apple: %q — KVS URL has %d subscriber episode(s) not in iTunes canonical;\n"+
@@ -149,8 +167,7 @@ func resolveURL(mode PrivateFeedMode, m mismatchedFeed, class privateFeedClass, 
 				m.title, exclusiveEps)
 			return m.kvsURL
 		default: // classPublicArchive
-			// KVS URL is publicly accessible with the same episodes as iTunes
-			// but a longer archive — the extended archive is the subscriber benefit.
+			// Extended archive beyond the iTunes window — the depth is the subscriber benefit.
 			return m.kvsURL
 		}
 	}
@@ -166,8 +183,10 @@ func promptPrivateFeedChoice(m mismatchedFeed, class privateFeedClass, exclusive
 		classLabel = "KVS URL not publicly accessible (auth-required or empty)"
 	case classPublicSubscriber:
 		classLabel = fmt.Sprintf("KVS URL publicly accessible, %d subscriber episode(s) absent from iTunes", exclusiveEps)
-	default:
-		classLabel = "KVS URL publicly accessible, same content as iTunes (longer window only)"
+	case classPublicArchive:
+		classLabel = "KVS URL publicly accessible, deeper archive than iTunes canonical"
+	default: // classPublicEquivalent
+		classLabel = "KVS URL publicly accessible, identical content and depth to iTunes canonical"
 	}
 
 	sc := bufio.NewScanner(os.Stdin)

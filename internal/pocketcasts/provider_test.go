@@ -783,6 +783,104 @@ func TestProvider_SetLibrary_PhaseBURLMismatch_FindsEpisodes(t *testing.T) {
 	}
 }
 
+// TestProvider_SetLibrary_PhaseB_NoDuplicateSubscribeForHistoricalEpisodeURL verifies
+// that Phase B does NOT auto-subscribe a podcast when the unmatched feed URL only
+// appears in lib.Episodes (historical KVS data) but is NOT in lib.Podcasts. In the
+// real bug, old subscriber JWT URLs stored in Apple KVS caused Phase B to subscribe
+// them as separate podcasts alongside the user's current subscription.
+func TestProvider_SetLibrary_PhaseB_NoDuplicateSubscribeForHistoricalEpisodeURL(t *testing.T) {
+	var subscribeCalls []string
+	var updateCalls []map[string]any
+
+	restore := newFullTestServer(t, testServerConfig{
+		subscribedPodcasts: []map[string]any{
+			// PC already has the CURRENT subscription URL.
+			{"uuid": "pod-current", "title": "My Show", "author": "AuthorX",
+				"url": "https://feeds.example.com/myshow-current"},
+		},
+		podcastEpisodes: map[string][]map[string]any{
+			"pod-current": {
+				{
+					"uuid":      "ep-current-1",
+					"title":     "Current Episode",
+					"url":       "https://cdn.example.com/current.mp3",
+					"duration":  1800,
+					"published": "2024-06-01T10:00:00Z",
+				},
+			},
+			// pod-old would be subscribed to if the bug was present.
+			"pod-old": {
+				{
+					"uuid":      "ep-old-1",
+					"title":     "Old Episode",
+					"url":       "https://cdn.example.com/old.mp3",
+					"duration":  1800,
+					"published": "2022-08-01T10:00:00Z",
+				},
+			},
+		},
+		feedURLToUUID: map[string]string{
+			// The current URL resolves to pod-current (already subscribed).
+			"https://feeds.example.com/myshow-current": "pod-current",
+			// The OLD URL resolves to a different UUID — this should NOT
+			// trigger an auto-subscribe because it is not in lib.Podcasts.
+			"https://feeds.example.com/myshow-old-jwt": "pod-old",
+		},
+		subscribeCalls: &subscribeCalls,
+		updateCalls:    &updateCalls,
+	})
+	defer restore()
+
+	lib := &model.Library{
+		// lib.Podcasts: only the CURRENT subscription URL.
+		Podcasts: []model.Podcast{
+			{FeedURL: "https://feeds.example.com/myshow-current", Title: "My Show"},
+		},
+		// lib.Episodes: episodes from BOTH the current and the OLD historical URL.
+		// The old URL is a prior subscriber JWT that is no longer a current subscription.
+		Episodes: []model.EpisodeState{
+			{
+				FeedURL:   "https://feeds.example.com/myshow-current",
+				Title:     "Current Episode",
+				PubDate:   time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC),
+				Duration:  1800 * time.Second,
+				PlayState: model.PlayStatePlayed,
+			},
+			{
+				FeedURL:   "https://feeds.example.com/myshow-old-jwt",
+				Title:     "Old Episode",
+				PubDate:   time.Date(2022, 8, 1, 10, 0, 0, 0, time.UTC),
+				Duration:  1800 * time.Second,
+				PlayState: model.PlayStatePlayed,
+			},
+		},
+	}
+
+	p := pocketcasts.NewProvider("user@example.com", "pass")
+	opts := provider.WriteOptions{RequestDelay: time.Millisecond}
+	if err := p.SetLibrary(context.Background(), lib, opts); err != nil {
+		t.Fatalf("SetLibrary: %v", err)
+	}
+
+	// Critical: pod-old must NOT have been subscribed to.
+	for _, uuid := range subscribeCalls {
+		if uuid == "pod-old" {
+			t.Errorf("Phase B auto-subscribed pod-old — duplicate subscription for historical episode URL")
+		}
+	}
+
+	// The current episode should still be updated (current URL resolves normally).
+	found := false
+	for _, call := range updateCalls {
+		if call["uuid"] == "ep-current-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected update call for ep-current-1 (current subscription episode), got: %v", updateCalls)
+	}
+}
+
 func TestProvider_SetLibrary_PodcastFilter_LimitsSubscriptions(t *testing.T) {
 	// Source has two unsubscribed podcasts (gamma, delta). --podcast "gamma"
 	// should subscribe only to gamma, not delta.

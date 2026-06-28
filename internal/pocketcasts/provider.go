@@ -626,6 +626,23 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 	}
 	writeLogHeader(opts.LogWriter)
 
+	// sourceSubscribedNormFeeds is the normalised-URL set of the source
+	// library's current subscriptions (lib.Podcasts). Phase B uses it to
+	// distinguish between two classes of unrecognised feed URLs:
+	//
+	//   (1) A feed that IS in the source subscription list but wasn't caught
+	//       by Phase A's subscription pass → auto-subscribe is correct.
+	//   (2) A feed that only appears in lib.Episodes (e.g. an expired
+	//       subscriber JWT URL from Apple KVS, a previously-unsubscribed
+	//       podcast) → auto-subscribing would create a duplicate subscription
+	//       alongside the current one; skip to Strategy 2 instead.
+	sourceSubscribedNormFeeds := make(map[string]bool, len(lib.Podcasts))
+	for _, pod := range lib.Podcasts {
+		if pod.FeedURL != "" {
+			sourceSubscribedNormFeeds[normalizeFeedURL(pod.FeedURL)] = true
+		}
+	}
+
 	if len(episodes) == 0 {
 		return 0, nil
 	}
@@ -875,28 +892,40 @@ func (p *Provider) doWritePlayState(ctx context.Context, lib *model.Library, opt
 						// the Apple episode's FeedURL, so addToIndex must match.
 						indexFeedURL = originalFeedURL
 						fmt.Printf("  resolved feed URL mismatch for %q — PC UUID matched via refresh API\n", podTitle)
-					} else if !opts.SubscribedOnly {
-						// (b) Found in catalog but not yet subscribed — auto-subscribe.
-						if subErr := SubscribePodcast(ctx, client, resolvedUUID); subErr != nil {
-							fmt.Printf("  warning: could not auto-subscribe to %q: %v\n", podTitle, subErr)
+					} else if sourceSubscribedNormFeeds[normalizeFeedURL(originalFeedURL)] {
+						// Feed URL is in the source subscription list. The resolved
+						// UUID is not yet in our local subscription map, meaning
+						// either Phase A missed this podcast or the subscription list
+						// API returned incomplete data.
+						if !opts.SubscribedOnly {
+							// (b) Auto-subscribe — Phase A missed this one.
+							if subErr := SubscribePodcast(ctx, client, resolvedUUID); subErr != nil {
+								fmt.Printf("  warning: could not auto-subscribe to %q: %v\n", podTitle, subErr)
+							} else {
+								podUUID = resolvedUUID
+								indexFeedURL = originalFeedURL
+								// Register in the local map so any later lookup for the
+								// same podcast doesn't try to subscribe a second time.
+								podUUIDToFeedURL[resolvedUUID] = originalFeedURL
+								fmt.Printf("  auto-subscribed %q (found in PC catalog, not in subscription list)\n", podTitle)
+								time.Sleep(requestDelay) // allow PC to process the subscription
+							}
 						} else {
+							// (c) --subscribed-only and UUID missing from local map.
+							// Proceed anyway: the subscription list API returned incomplete
+							// data and this podcast is almost certainly already subscribed
+							// (the refresh API only returns podcasts in PC's catalog).
 							podUUID = resolvedUUID
 							indexFeedURL = originalFeedURL
-							// Register in the local map so any later lookup for the
-							// same podcast doesn't try to subscribe a second time.
-							podUUIDToFeedURL[resolvedUUID] = originalFeedURL
-							fmt.Printf("  auto-subscribed %q (found in PC catalog, not in subscription list)\n", podTitle)
-							time.Sleep(requestDelay) // allow PC to process the subscription
+							fmt.Printf("  resolved %q via refresh API (not in subscription list — subscription API may be incomplete)\n", podTitle)
 						}
-					} else {
-						// (c) --subscribed-only and UUID missing from local map.
-						// Proceed anyway: the subscription list API returned incomplete
-						// data and this podcast is almost certainly already subscribed
-						// (the refresh API only knows about podcasts in PC's catalog).
-						podUUID = resolvedUUID
-						indexFeedURL = originalFeedURL
-						fmt.Printf("  resolved %q via refresh API (not in subscription list — subscription API may be incomplete)\n", podTitle)
 					}
+					// else: feed URL is not in the source subscription list —
+					// it only appears in episode history (e.g. an expired subscriber
+					// JWT URL stored in Apple KVS). Do NOT auto-subscribe: that would
+					// create a duplicate alongside the currently-subscribed version of
+					// the same podcast. Fall through to Strategy 2 (title-based match)
+					// so the episodes can still be matched without a new subscription.
 				}
 
 				// Strategy 2: title-based match.  Private/subscriber feeds (e.g.

@@ -120,7 +120,7 @@ Control this behaviour with `--private-feed`:
 - `subscriber` (default) — automatic detection as above
 - `public` — always use the iTunes canonical URL
 - `kvs` — always use the KVS URL as-is
-- `custom` — prompt interactively for each mismatched feed
+- `custom` — prompt interactively for each mismatched feed. Before the per-feed loop, a single upfront question asks whether to include or exclude all `private-auth` feeds (excluded feeds fall back to the iTunes canonical without individual prompting). The per-feed menu offers `[p]` public, `[k]` kvs, and `[u]` custom URL; a full URL pasted directly at the prompt is accepted without typing `u` first.
 
 When migrating *to* Apple Podcasts with KVS credentials set, private feeds are subscribed directly via KVS and can coexist alongside an existing public subscription with separate episode history. When migrating *to* Overcast, private feeds are collected in a skipped-feeds OPML for manual import via Add Feed → URL — Overcast has no programmatic subscribe path for non-iTunes feeds. When migrating *to* Pocket Casts, private and subscriber feeds are submitted via the `add_feed_url` API, which can index arbitrary RSS URLs; feeds that fail (typically auth-gated URLs PC's backend cannot reach) are collected in a skipped-feeds OPML for manual import via Add Podcast → Add via podcast URL. Without KVS credentials, private-feed subscriptions and Apple Podcasts episode writes are skipped.
 

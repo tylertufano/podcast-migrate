@@ -85,9 +85,7 @@ All tests use `httptest.NewServer` to serve fake iTunes Search API and amp-api r
 
 ### `internal/apple/private_feed.go` — subscriber feed URL resolution
 
-**File:** `private_feed_test.go` (32 test functions)
-
-New tests added for the four-class classification and URL resolution pipeline:
+**File:** `private_feed_test.go` (~45 test functions)
 
 | Area | Tests |
 |---|---|
@@ -96,14 +94,12 @@ New tests added for the four-class classification and URL resolution pipeline:
 | `classifyMismatchedFeed` — exclusive count, items-before-floor guard | `TestClassifyMismatchedFeed_MultipleExclusiveEpisodes_CountsCorrectly`, `_KVSItemBeforeFloor_NotCountedAsExclusive` |
 | `classifyMismatchedFeed` — iTunes undated items, HTML entity title matching | `TestClassifyMismatchedFeed_iTunesNoDatableItems_ReturnsPublicArchive`, `_TitleNormalizationMatchesHTMLEntities` |
 | `privateFeedClass.String` — all 4 string labels | `TestPrivateFeedClass_String` |
-| `resolveURL` — `public` mode always uses canonical | `TestResolveURL_PublicMode_AlwaysReturnsCanonical` |
-| `resolveURL` — `kvs` mode always uses KVS URL | `TestResolveURL_KVSMode_AlwaysReturnsKVSURL` |
-| `resolveURL` — `subscriber` mode × 4 class types | `TestResolveURL_SubscriberMode_PrivateAuth_ReturnsCanonical`, `_PublicEquivalent_ReturnsCanonical`, `_PublicSubscriber_ReturnsKVSURL`, `_PublicArchive_ReturnsKVSURL` |
-| `resolveURL` — unknown mode falls through to canonical | `TestResolveURL_UnknownMode_ReturnsCanonical` |
-| `ParsePrivateFeedMode` — all valid values, case-insensitive, trimmed | `TestParsePrivateFeedMode_ValidValues` |
-| `ParsePrivateFeedMode` — invalid values, error message content | `TestParsePrivateFeedMode_InvalidValue_ReturnsError`, `_ErrorMessageContainsValidOptions` |
+| `resolveURL` — all modes × all classes | `TestResolveURL_PublicMode_*`, `_KVSMode_*`, `_SubscriberMode_*` (6 cases), `_UnknownMode_*` |
+| `ParsePrivateFeedMode` — valid values, case-insensitive, trimmed; invalid values + error text | `TestParsePrivateFeedMode_*` (3 cases) |
+| `promptIncludePrivateAuthFrom` — upfront include/exclude for `private-auth` batch | `TestPromptIncludePrivateAuth_IncludeResponse_ReturnsTrue`, `_ExcludeResponse_ReturnsFalse`, `_EOF_ReturnsFalse` |
+| `promptPrivateFeedChoiceFrom` — `[p/k/u]` menu for all classes incl. `private-auth` | `TestPromptPrivateFeedChoice_PrivateAuth_*` (3 cases), `_PublicSubscriber_*` (3 cases), `_EOF*`, `_URLTypedDirectlyAtChoicePrompt` |
 
-All functions in `private_feed.go` except `promptPrivateFeedChoice` (requires a TTY) are now at 100% statement coverage.
+`promptPrivateFeedChoiceFrom` and `promptIncludePrivateAuthFrom` accept an `io.Reader`, so all interactive prompt paths are covered by offline tests. All functions in `private_feed.go` are at 100% statement coverage.
 
 ---
 
@@ -260,12 +256,6 @@ Pure Go helpers in `observe.go` tested without a real Podcasts database:
 ## Coverage gaps
 
 The following areas lack offline test coverage. These are catalogued here for future test development.
-
-### `internal/apple/private_feed.go` — `promptPrivateFeedChoice` *(untestable without TTY mock)*
-
-`promptPrivateFeedChoice` reads from `os.Stdin` and therefore cannot be tested in a standard `go test` run. It is exercised only when `--private-feed=custom` is used interactively. The remaining functions in `private_feed.go` are at 100% statement coverage.
-
----
 
 ### `internal/apple/webapi.go` — `WebAPIWriter.Write` end-to-end *(partially covered)*
 

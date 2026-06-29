@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"fmt"
 	"html"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -175,12 +176,43 @@ func resolveURL(mode PrivateFeedMode, m mismatchedFeed, class privateFeedClass, 
 }
 
 // promptPrivateFeedChoice interactively asks the user which URL to use for a
-// mismatched feed. Used only in PrivateFeedCustom mode.
+// mismatched feed. Used only in PrivateFeedCustom mode. Reads from os.Stdin.
 func promptPrivateFeedChoice(m mismatchedFeed, class privateFeedClass, exclusiveEps int) string {
+	return promptPrivateFeedChoiceFrom(os.Stdin, m, class, exclusiveEps)
+}
+
+// promptPrivateFeedChoiceFrom is the testable core of promptPrivateFeedChoice.
+//
+// For classPrivateAuth feeds the prompt is a simple include/exclude choice:
+// the KVS URL is auth-gated so retaining it requires manual import at
+// destinations that cannot reach it; excluding falls back to the iTunes
+// canonical. For all other classes the full p/k/u menu is shown.
+func promptPrivateFeedChoiceFrom(r io.Reader, m mismatchedFeed, class privateFeedClass, exclusiveEps int) string {
+	sc := bufio.NewScanner(r)
+
+	if class == classPrivateAuth {
+		fmt.Printf("\n  Feed: %q\n", m.title)
+		fmt.Printf("  Detection: private-auth (KVS URL not publicly accessible — auth-gated or empty)\n")
+		fmt.Printf("  KVS URL:    %s\n", m.kvsURL)
+		fmt.Printf("  iTunes URL: %s\n", m.canonical)
+		fmt.Println()
+		fmt.Println("  [i] include  — retain KVS URL (auth-gated; destinations that cannot reach it will")
+		fmt.Println("                 collect it in the skipped-feeds OPML for manual import)")
+		fmt.Println("  [e] exclude  — use iTunes URL (public episodes only, default for this class)")
+		fmt.Print("  Choice [i/e]: ")
+
+		if !sc.Scan() {
+			fmt.Println()
+			return m.canonical
+		}
+		if ch := strings.ToLower(strings.TrimSpace(sc.Text())); ch == "i" || ch == "include" {
+			return m.kvsURL
+		}
+		return m.canonical
+	}
+
 	var classLabel string
 	switch class {
-	case classPrivateAuth:
-		classLabel = "KVS URL not publicly accessible (auth-required or empty)"
 	case classPublicSubscriber:
 		classLabel = fmt.Sprintf("KVS URL publicly accessible, %d subscriber episode(s) absent from iTunes", exclusiveEps)
 	case classPublicArchive:
@@ -189,7 +221,6 @@ func promptPrivateFeedChoice(m mismatchedFeed, class privateFeedClass, exclusive
 		classLabel = "KVS URL publicly accessible, identical content and depth to iTunes canonical"
 	}
 
-	sc := bufio.NewScanner(os.Stdin)
 	fmt.Printf("\n  Feed: %q\n", m.title)
 	fmt.Printf("  Detection: %s\n", classLabel)
 	fmt.Printf("  KVS URL:    %s\n", m.kvsURL)

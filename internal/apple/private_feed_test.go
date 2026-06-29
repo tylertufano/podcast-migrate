@@ -6,6 +6,69 @@ import (
 	"time"
 )
 
+// ---- promptPrivateFeedChoiceFrom ----
+
+func TestPromptPrivateFeedChoice_PrivateAuth_IncludeReturnsKVSURL(t *testing.T) {
+	m := makeMismatch("https://kvs.example.com/private.rss", "https://itunes.example.com/canonical", "Secret Show")
+	for _, input := range []string{"i", "I", "include", "INCLUDE"} {
+		got := promptPrivateFeedChoiceFrom(strings.NewReader(input+"\n"), m, classPrivateAuth, 0)
+		if got != m.kvsURL {
+			t.Errorf("input %q: got %q, want KVS URL", input, got)
+		}
+	}
+}
+
+func TestPromptPrivateFeedChoice_PrivateAuth_ExcludeReturnsCanonical(t *testing.T) {
+	m := makeMismatch("https://kvs.example.com/private.rss", "https://itunes.example.com/canonical", "Secret Show")
+	for _, input := range []string{"e", "E", "exclude", "EXCLUDE", "p", "x", "anything-else"} {
+		got := promptPrivateFeedChoiceFrom(strings.NewReader(input+"\n"), m, classPrivateAuth, 0)
+		if got != m.canonical {
+			t.Errorf("input %q: got %q, want canonical", input, got)
+		}
+	}
+}
+
+func TestPromptPrivateFeedChoice_PrivateAuth_EOFReturnsCanonical(t *testing.T) {
+	m := makeMismatch("https://kvs.example.com/private.rss", "https://itunes.example.com/canonical", "Secret Show")
+	got := promptPrivateFeedChoiceFrom(strings.NewReader(""), m, classPrivateAuth, 0)
+	if got != m.canonical {
+		t.Errorf("EOF: got %q, want canonical", got)
+	}
+}
+
+func TestPromptPrivateFeedChoice_PublicSubscriber_KChoiceReturnsKVSURL(t *testing.T) {
+	m := makeMismatch("https://kvs.example.com/feed.rss", "https://itunes.example.com/canonical", "My Show")
+	got := promptPrivateFeedChoiceFrom(strings.NewReader("k\n"), m, classPublicSubscriber, 5)
+	if got != m.kvsURL {
+		t.Errorf("got %q, want KVS URL", got)
+	}
+}
+
+func TestPromptPrivateFeedChoice_PublicSubscriber_PChoiceReturnsCanonical(t *testing.T) {
+	m := makeMismatch("https://kvs.example.com/feed.rss", "https://itunes.example.com/canonical", "My Show")
+	got := promptPrivateFeedChoiceFrom(strings.NewReader("p\n"), m, classPublicSubscriber, 5)
+	if got != m.canonical {
+		t.Errorf("got %q, want canonical", got)
+	}
+}
+
+func TestPromptPrivateFeedChoice_PublicSubscriber_UChoiceReturnsCustomURL(t *testing.T) {
+	m := makeMismatch("https://kvs.example.com/feed.rss", "https://itunes.example.com/canonical", "My Show")
+	input := "u\nhttps://custom.example.com/feed.rss\n"
+	got := promptPrivateFeedChoiceFrom(strings.NewReader(input), m, classPublicSubscriber, 5)
+	if got != "https://custom.example.com/feed.rss" {
+		t.Errorf("got %q, want custom URL", got)
+	}
+}
+
+func TestPromptPrivateFeedChoice_PublicEquivalent_DefaultReturnsCanonical(t *testing.T) {
+	m := makeMismatch("https://kvs.example.com/feed.rss", "https://itunes.example.com/canonical", "Same Show")
+	got := promptPrivateFeedChoiceFrom(strings.NewReader("unrecognised\n"), m, classPublicEquivalent, 0)
+	if got != m.canonical {
+		t.Errorf("got %q, want canonical", got)
+	}
+}
+
 // ---- normalizeEpTitle ----
 
 func TestNormalizeEpTitle_LowercasesAndTrims(t *testing.T) {

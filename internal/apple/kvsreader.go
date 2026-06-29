@@ -271,22 +271,49 @@ func (r *KVSReader) Read(ctx context.Context) (*model.Library, error) {
 		resolvedCanonical[clean] = canonical // default: iTunes canonical
 	}
 	if needsDetection && rssFeeds != nil {
-		if r.privateFeedMode == PrivateFeedCustom {
-			fmt.Printf("\napple: --private-feed=custom — reviewing %d feed(s) where KVS URL differs from iTunes\n", len(mismatches))
+		type classifiedMismatch struct {
+			m         mismatchedFeed
+			class     privateFeedClass
+			exclusive int
 		}
-		for _, m := range mismatches {
-			kvsRSS := rssFeeds[m.kvsURL]
-			itunesRSS := rssFeeds[m.canonical]
-			class, exclusive := classifyMismatchedFeed(kvsRSS, itunesRSS)
+		classified := make([]classifiedMismatch, len(mismatches))
+		for i, m := range mismatches {
+			class, exclusive := classifyMismatchedFeed(rssFeeds[m.kvsURL], rssFeeds[m.canonical])
+			classified[i] = classifiedMismatch{m, class, exclusive}
+		}
+
+		includePrivateAuth := false
+		if r.privateFeedMode == PrivateFeedCustom {
+			privateAuthCount := 0
+			for _, c := range classified {
+				if c.class == classPrivateAuth {
+					privateAuthCount++
+				}
+			}
+			if privateAuthCount > 0 {
+				includePrivateAuth = promptIncludePrivateAuth(privateAuthCount)
+			}
+			reviewCount := len(mismatches) - privateAuthCount
+			if includePrivateAuth {
+				reviewCount = len(mismatches)
+			}
+			fmt.Printf("\napple: --private-feed=custom — reviewing %d feed(s) where KVS URL differs from iTunes\n", reviewCount)
+		}
+
+		for _, c := range classified {
 			var resolved string
 			if r.privateFeedMode == PrivateFeedCustom {
-				resolved = promptPrivateFeedChoice(m, class, exclusive)
+				if c.class == classPrivateAuth && !includePrivateAuth {
+					resolved = c.m.canonical
+				} else {
+					resolved = promptPrivateFeedChoice(c.m, c.class, c.exclusive)
+				}
 			} else {
-				resolved = resolveURL(r.privateFeedMode, m, class, exclusive)
+				resolved = resolveURL(r.privateFeedMode, c.m, c.class, c.exclusive)
 			}
-			resolvedCanonical[m.clean] = resolved
+			resolvedCanonical[c.m.clean] = resolved
 			// Ensure resolved URL RSS is in the cache (may be a custom URL).
-			if _, ok := rssFeeds[resolved]; !ok && resolved != m.kvsURL && resolved != m.canonical {
+			if _, ok := rssFeeds[resolved]; !ok && resolved != c.m.kvsURL && resolved != c.m.canonical {
 				if feed, err := fetchRSSFeed(ctx, r.httpClient, resolved); err == nil {
 					rssFeeds[resolved] = feed
 				}

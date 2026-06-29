@@ -175,6 +175,29 @@ func resolveURL(mode PrivateFeedMode, m mismatchedFeed, class privateFeedClass, 
 	return m.canonical
 }
 
+// promptIncludePrivateAuth asks the user once, before the per-feed loop,
+// whether private-auth class feeds should be included in the review.
+// Returns true if the user chooses to include them. Reads from os.Stdin.
+func promptIncludePrivateAuth(count int) bool {
+	return promptIncludePrivateAuthFrom(os.Stdin, count)
+}
+
+// promptIncludePrivateAuthFrom is the testable core of promptIncludePrivateAuth.
+func promptIncludePrivateAuthFrom(r io.Reader, count int) bool {
+	sc := bufio.NewScanner(r)
+	fmt.Printf("\n  %d feed(s) classified private-auth (KVS URL not publicly accessible — auth-gated or empty).\n", count)
+	fmt.Println("  [i] include  — review each feed below (destinations that cannot reach the URL will")
+	fmt.Println("                 collect it in the skipped-feeds OPML for manual import)")
+	fmt.Println("  [e] exclude  — use iTunes URL for all private-auth feeds (default)")
+	fmt.Print("  Choice [i/e]: ")
+	if !sc.Scan() {
+		fmt.Println()
+		return false
+	}
+	ch := strings.ToLower(strings.TrimSpace(sc.Text()))
+	return ch == "i" || ch == "include"
+}
+
 // promptPrivateFeedChoice interactively asks the user which URL to use for a
 // mismatched feed. Used only in PrivateFeedCustom mode. Reads from os.Stdin.
 func promptPrivateFeedChoice(m mismatchedFeed, class privateFeedClass, exclusiveEps int) string {
@@ -182,43 +205,21 @@ func promptPrivateFeedChoice(m mismatchedFeed, class privateFeedClass, exclusive
 }
 
 // promptPrivateFeedChoiceFrom is the testable core of promptPrivateFeedChoice.
-//
-// For classPrivateAuth feeds the prompt is a simple include/exclude choice:
-// the KVS URL is auth-gated so retaining it requires manual import at
-// destinations that cannot reach it; excluding falls back to the iTunes
-// canonical. For all other classes the full p/k/u menu is shown.
+// Shows the full [p/k/u] menu for all classes, including classPrivateAuth when
+// the user has already opted in via promptIncludePrivateAuth.
 func promptPrivateFeedChoiceFrom(r io.Reader, m mismatchedFeed, class privateFeedClass, exclusiveEps int) string {
 	sc := bufio.NewScanner(r)
 
-	if class == classPrivateAuth {
-		fmt.Printf("\n  Feed: %q\n", m.title)
-		fmt.Printf("  Detection: private-auth (KVS URL not publicly accessible — auth-gated or empty)\n")
-		fmt.Printf("  KVS URL:    %s\n", m.kvsURL)
-		fmt.Printf("  iTunes URL: %s\n", m.canonical)
-		fmt.Println()
-		fmt.Println("  [i] include  — retain KVS URL (auth-gated; destinations that cannot reach it will")
-		fmt.Println("                 collect it in the skipped-feeds OPML for manual import)")
-		fmt.Println("  [e] exclude  — use iTunes URL (public episodes only, default for this class)")
-		fmt.Print("  Choice [i/e]: ")
-
-		if !sc.Scan() {
-			fmt.Println()
-			return m.canonical
-		}
-		if ch := strings.ToLower(strings.TrimSpace(sc.Text())); ch == "i" || ch == "include" {
-			return m.kvsURL
-		}
-		return m.canonical
-	}
-
 	var classLabel string
 	switch class {
+	case classPrivateAuth:
+		classLabel = "private-auth (KVS URL not publicly accessible — auth-gated or empty)"
 	case classPublicSubscriber:
-		classLabel = fmt.Sprintf("KVS URL publicly accessible, %d subscriber episode(s) absent from iTunes", exclusiveEps)
+		classLabel = fmt.Sprintf("public-subscriber (%d episode(s) in KVS absent from iTunes)", exclusiveEps)
 	case classPublicArchive:
-		classLabel = "KVS URL publicly accessible, deeper archive than iTunes canonical"
+		classLabel = "public-archive (KVS URL has deeper archive than iTunes canonical)"
 	default: // classPublicEquivalent
-		classLabel = "KVS URL publicly accessible, identical content and depth to iTunes canonical"
+		classLabel = "public-equivalent (KVS URL identical in content and depth to iTunes canonical)"
 	}
 
 	fmt.Printf("\n  Feed: %q\n", m.title)

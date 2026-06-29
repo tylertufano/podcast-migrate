@@ -94,6 +94,19 @@ func TestPromptPrivateFeedChoice_EOFReturnsCanonical(t *testing.T) {
 	}
 }
 
+func TestPromptPrivateFeedChoice_URLTypedDirectlyAtChoicePrompt(t *testing.T) {
+	m := makeMismatch("https://kvs.example.com/feed.rss", "https://itunes.example.com/canonical", "My Show")
+	for _, u := range []string{
+		"https://feeds.supercast.com/feeds/hBkzfhw3fk29wFUCijcRezrq",
+		"http://example.com/feed.rss",
+	} {
+		got := promptPrivateFeedChoiceFrom(strings.NewReader(u+"\n"), m, classPublicSubscriber, 0)
+		if got != u {
+			t.Errorf("input %q: got %q, want the URL itself", u, got)
+		}
+	}
+}
+
 // ---- normalizeEpTitle ----
 
 func TestNormalizeEpTitle_LowercasesAndTrims(t *testing.T) {

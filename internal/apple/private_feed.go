@@ -236,7 +236,11 @@ func promptPrivateFeedChoiceFrom(r io.Reader, m mismatchedFeed, class privateFee
 		fmt.Println()
 		return m.canonical
 	}
-	switch strings.ToLower(strings.TrimSpace(sc.Text())) {
+	input := strings.TrimSpace(sc.Text())
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+		return input
+	}
+	switch strings.ToLower(input) {
 	case "k", "kvs":
 		return m.kvsURL
 	case "u", "url":

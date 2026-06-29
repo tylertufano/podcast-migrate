@@ -134,7 +134,7 @@ func (w *KVSWriter) initPodcastsDomain(ctx context.Context) error {
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
 	feeds, subs, subVer, err := parsePodcastsDomainGetAll(ctx, respBody)
 	if err != nil {
-		return fmt.Errorf("kvs podcasts domain parse: %w", err)
+		return fmt.Errorf("kvs podcasts domain parse: %w\n%s", err, kvsResponseDiag(respBody))
 	}
 
 	w.podcastsFeeds = feeds
@@ -697,6 +697,38 @@ func buildSubscriptionValue(subs []podcastSubscription) ([]byte, error) {
 // ---------------------------------------------------------------------------
 // Low-level utilities
 // ---------------------------------------------------------------------------
+
+// kvsResponseDiag returns a human-readable diagnostic string for an
+// unexpected KVS response body. It is appended to parse errors so that
+// the user (and bug reports) contain enough context to determine whether
+// the failure is due to expired credentials or an API format change.
+func kvsResponseDiag(body []byte) string {
+	if len(body) == 0 {
+		return "  [diagnostic: response body is empty]"
+	}
+	preview := body
+	if len(preview) > 64 {
+		preview = preview[:64]
+	}
+	hint := ""
+	switch {
+	case bytes.HasPrefix(body, []byte("bplist00")):
+		hint = "  (body starts with bplist00 — may be a KVS error plist or truncated response;\n" +
+			"  this can happen when APPLE_KVS_COOKIES have expired — try re-capturing them)"
+	case bytes.HasPrefix(body, []byte("bplist")):
+		hint = fmt.Sprintf("  (body starts with %q — unexpected binary plist version;\n"+
+			"  Apple may have updated the KVS format)", body[:8])
+	case bytes.HasPrefix(body, []byte("<?xml")), bytes.HasPrefix(body, []byte("<plist")):
+		hint = "  (body is XML/text plist — format may have changed)"
+	case bytes.HasPrefix(body, []byte("{")) || bytes.HasPrefix(body, []byte("[")):
+		hint = "  (body appears to be JSON — APPLE_KVS_COOKIES may have expired)"
+	case bytes.HasPrefix(body, []byte("<html")), bytes.HasPrefix(body, []byte("<!DOCTYPE")):
+		hint = "  (body is HTML — APPLE_KVS_COOKIES have likely expired; re-capture via Proxyman)"
+	default:
+		hint = "  (body has unrecognised format — APPLE_KVS_COOKIES may have expired)"
+	}
+	return fmt.Sprintf("  [diagnostic: %d-byte response, first 64 bytes: %x]\n%s", len(body), preview, hint)
+}
 
 // bplistToXML converts a binary plist to its XML string representation.
 // Uses howett.net/plist — pure Go, works on all platforms.

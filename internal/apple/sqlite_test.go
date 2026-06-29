@@ -3,6 +3,9 @@ package apple_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -887,6 +890,83 @@ func TestSQLiteReader_EpisodeFeedURL_CacheBusterStripped(t *testing.T) {
 	}
 	if ep.FeedURL != wantClean {
 		t.Errorf("episode FeedURL: got %q, want %q (cache-buster not stripped)", ep.FeedURL, wantClean)
+	}
+}
+
+// TestSQLiteReader_EpisodeFeedURL_RemappedAfterITunesLookup verifies that when
+// the iTunes batch lookup returns a canonical URL that differs from the SQLite
+// ZFEEDURL, episode FeedURLs are updated to match the new canonical URL.
+// Without this remap, the OPML writer (and other consumers of lib.Episodes)
+// would index episodes under the old URL while lib.Podcasts carries the new
+// URL, causing episodes to be silently dropped from the output.
+func TestSQLiteReader_EpisodeFeedURL_RemappedAfterITunesLookup(t *testing.T) {
+	// Fake iTunes lookup server: returns a different canonical URL for pid=42.
+	const (
+		oldFeedURL   = "https://old-host.example.com/feed.rss"
+		canonicalURL = "https://new-host.example.com/feed.rss"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"resultCount": 1,
+			"results": []map[string]any{{
+				"collectionId":   42,
+				"feedUrl":        canonicalURL,
+				"collectionName": "Moved Show",
+				"artistName":     "AuthorX",
+				"artworkUrl600":  "",
+			}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := json.Marshal(resp)
+		_, _ = w.Write(b)
+	}))
+	defer srv.Close()
+	apple.SetITunesLookupBaseForTest(srv.URL)
+	defer apple.SetITunesLookupBaseForTest("https://itunes.apple.com")
+
+	path := filepath.Join(t.TempDir(), "MTLibrary.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE ZMTPODCAST (Z_PK INTEGER PRIMARY KEY, ZSUBSCRIBED INTEGER, ZFEEDURL TEXT, ZTITLE TEXT, ZAUTHOR TEXT, ZIMAGEURL TEXT, ZSTORECOLLECTIONID INTEGER)`,
+		`CREATE TABLE ZMTEPISODE (Z_PK INTEGER PRIMARY KEY, Z_OPT INTEGER NOT NULL DEFAULT 1, ZPODCAST INTEGER, ZGUID TEXT, ZTITLE TEXT, ZPUBDATE REAL, ZDURATION REAL, ZPLAYSTATE INTEGER DEFAULT 0, ZPLAYCOUNT INTEGER DEFAULT 0, ZPLAYHEAD REAL DEFAULT 0.0, ZLASTDATEPLAYED REAL, ZPRICETYPE TEXT, ZUNPLAYEDTAB INTEGER DEFAULT 0, ZPLAYSTATESOURCE INTEGER DEFAULT 0, ZPLAYSTATEMANUALLYSET INTEGER DEFAULT 0, ZLASTUSERMARKEDASPLAYEDDATE REAL, ZPLAYSTATELASTMODIFIEDDATE REAL, ZSTORETRACKID INTEGER, ZMETADATAIDENTIFIER TEXT)`,
+		`CREATE TABLE ZMTUPPMETADATA (Z_PK INTEGER PRIMARY KEY, ZHASBEENPLAYED INTEGER, ZBOOKMARKTIME REAL, ZMETADATAIDENTIFIER TEXT)`,
+		// Podcast stored with the OLD feed URL but has a storeCollectionID so iTunes
+		// lookup will return the new canonical URL.
+		`INSERT INTO ZMTPODCAST VALUES (1, 1, '` + oldFeedURL + `', 'Moved Show', 'AuthorX', NULL, 42)`,
+		// Episode played under the OLD feed URL (via JOIN with ZMTPODCAST).
+		`INSERT INTO ZMTEPISODE (Z_PK, Z_OPT, ZPODCAST, ZGUID, ZTITLE, ZPUBDATE, ZDURATION, ZPLAYSTATE, ZPLAYCOUNT, ZPLAYHEAD) VALUES (1, 1, 1, 'ep-moved-1', 'Moved Episode', 700000000.0, 1800.0, 2, 1, 0.0)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("db setup: %v", err)
+		}
+	}
+	db.Close()
+
+	lib, err := apple.NewSQLiteReader(path).Read(context.Background())
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	// Podcast FeedURL must have been updated to the iTunes canonical URL.
+	if len(lib.Podcasts) != 1 {
+		t.Fatalf("podcasts: got %d, want 1", len(lib.Podcasts))
+	}
+	if lib.Podcasts[0].FeedURL != canonicalURL {
+		t.Errorf("podcast FeedURL: got %q, want %q (iTunes remap not applied)", lib.Podcasts[0].FeedURL, canonicalURL)
+	}
+
+	// Episode FeedURL must match the podcast FeedURL so that OPML and other
+	// writers can group episodes under their podcast correctly.
+	ep := findEpisode(lib, "ep-moved-1")
+	if ep == nil {
+		t.Fatal("ep-moved-1 not found in episodes")
+	}
+	if ep.FeedURL != canonicalURL {
+		t.Errorf("episode FeedURL: got %q, want canonical %q\n  (old URL was %q — episodes lost from OPML without this remap)",
+			ep.FeedURL, canonicalURL, oldFeedURL)
 	}
 }
 

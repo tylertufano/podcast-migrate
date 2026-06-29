@@ -81,7 +81,7 @@ func (r *SQLiteReader) Read(ctx context.Context) (*model.Library, error) {
 	}
 	defer db.Close()
 
-	podcasts, skippedPodcasts, err := r.readPodcasts(ctx, db)
+	podcasts, skippedPodcasts, feedURLRemap, err := r.readPodcasts(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +89,19 @@ func (r *SQLiteReader) Read(ctx context.Context) (*model.Library, error) {
 	episodes, skippedEpisodes, err := r.readEpisodes(ctx, db)
 	if err != nil {
 		return nil, err
+	}
+
+	// Apply the iTunes URL remap to episodes. readEpisodes reads p.ZFEEDURL
+	// via JOIN, so it carries the pre-lookup value for any podcast whose URL
+	// was updated by the iTunes batch lookup in readPodcasts. Without this
+	// remap, those episodes would be indexed under the old URL and never
+	// matched to their podcast (which now carries the canonical URL).
+	if len(feedURLRemap) > 0 {
+		for i := range episodes {
+			if newURL, ok := feedURLRemap[episodes[i].FeedURL]; ok {
+				episodes[i].FeedURL = newURL
+			}
+		}
 	}
 
 	return &model.Library{
@@ -101,7 +114,12 @@ func (r *SQLiteReader) Read(ctx context.Context) (*model.Library, error) {
 	}, nil
 }
 
-func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Podcast, int, error) {
+// readPodcasts returns the subscribed podcasts, the count of skipped internal
+// feeds, and a feedURLRemap map from the raw SQLite ZFEEDURL to the iTunes-
+// canonical URL for any podcast whose URL was updated by the batch iTunes
+// lookup. Callers must remap episode FeedURLs using this map so that episodes
+// remain grouped under their parent podcast after the URL rewrite.
+func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Podcast, int, map[string]string, error) {
 	// Restrict to http/https feeds. Excluded (counted in skippedPodcasts):
 	//   "internal://" — Apple-exclusive shows with no public RSS feed.
 	// Subscriber feeds with private JWT-authenticated URLs (e.g. NPR Plus via
@@ -116,7 +134,7 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
-		return nil, 0, fmt.Errorf("apple/sqlite: query podcasts: %w", err)
+		return nil, 0, nil, fmt.Errorf("apple/sqlite: query podcasts: %w", err)
 	}
 	defer rows.Close()
 
@@ -130,7 +148,7 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 		var imageURL sql.NullString
 		var collectionID int64
 		if err := rows.Scan(&p.FeedURL, &p.Title, &p.Author, &imageURL, &collectionID); err != nil {
-			return nil, 0, fmt.Errorf("apple/sqlite: scan podcast: %w", err)
+			return nil, 0, nil, fmt.Errorf("apple/sqlite: scan podcast: %w", err)
 		}
 		if imageURL.Valid {
 			p.ImageURL = imageURL.String
@@ -142,8 +160,14 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 		raw = append(raw, rawPodcast{pod: p, collectionID: collectionID})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
+
+	// feedURLRemap records SQLite ZFEEDURL → iTunes canonical URL for any
+	// podcast whose URL is updated below. readEpisodes reads p.ZFEEDURL via
+	// JOIN so episode FeedURLs still carry the old value; the caller must
+	// remap them so that episodes are grouped under their podcast's new URL.
+	feedURLRemap := make(map[string]string)
 
 	// Batch iTunes lookup: resolve current canonical feed URLs using
 	// ZSTORECOLLECTIONID. This corrects stale ZFEEDURL values for podcasts
@@ -168,7 +192,12 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 					continue
 				}
 				i := pidToIdx[pid]
-				raw[i].pod.FeedURL = cleanFeedURL(result.FeedURL)
+				oldURL := raw[i].pod.FeedURL
+				newURL := cleanFeedURL(result.FeedURL)
+				if oldURL != newURL {
+					feedURLRemap[oldURL] = newURL
+				}
+				raw[i].pod.FeedURL = newURL
 				raw[i].pod.ITunesID = strconv.FormatInt(pid, 10)
 			}
 		}
@@ -188,7 +217,7 @@ func (r *SQLiteReader) readPodcasts(ctx context.Context, db *sql.DB) ([]model.Po
 	var skipped int
 	_ = db.QueryRowContext(ctx, countSkipped).Scan(&skipped)
 
-	return out, skipped, nil
+	return out, skipped, feedURLRemap, nil
 }
 
 // cleanFeedURL removes Apple's transient "t" / "_t" cache-buster query

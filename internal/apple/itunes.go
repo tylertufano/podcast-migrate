@@ -10,6 +10,13 @@ import (
 	"strings"
 )
 
+// itunesLookupBase is the base URL for the iTunes lookup API. Overridden in
+// tests via SetITunesLookupBaseForTest.
+var itunesLookupBase = "https://itunes.apple.com"
+
+// SetITunesLookupBaseForTest overrides the iTunes lookup URL for offline tests.
+func SetITunesLookupBaseForTest(u string) { itunesLookupBase = u }
+
 // iTunesLookupResult holds metadata for one podcast returned by the iTunes
 // Store lookup API.
 type iTunesLookupResult struct {
@@ -40,7 +47,7 @@ func batchITunesLookup(ctx context.Context, client *http.Client, pids []int64) (
 		for i, pid := range batch {
 			ids[i] = strconv.FormatInt(pid, 10)
 		}
-		lookupURL := "https://itunes.apple.com/lookup?id=" + strings.Join(ids, ",") + "&media=podcast&entity=podcast"
+		lookupURL := itunesLookupBase + "/lookup?id=" + strings.Join(ids, ",") + "&media=podcast&entity=podcast"
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, lookupURL, nil)
 		if err != nil {
